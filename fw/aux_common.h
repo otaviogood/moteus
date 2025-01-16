@@ -245,7 +245,7 @@ struct I2C {
       kNone,
       kAs5048,
       kAs5600,
-
+      kLsm6dsv16x,
       kNumTypes,
     };
     Type type = kNone;
@@ -287,6 +287,10 @@ struct I2C {
     uint8_t ams_diag = 0;
     uint16_t ams_mag = 0;
 
+    uint16_t quat_x = 0;
+    uint16_t quat_y = 0;
+    uint16_t quat_z = 0;
+
     template <typename Archive>
     void Serialize(Archive* a) {
       a->Visit(MJ_NVP(active));
@@ -297,6 +301,10 @@ struct I2C {
       a->Visit(MJ_NVP(ams_agc));
       a->Visit(MJ_NVP(ams_diag));
       a->Visit(MJ_NVP(ams_mag));
+
+      a->Visit(MJ_NVP(quat_x));
+      a->Visit(MJ_NVP(quat_y));
+      a->Visit(MJ_NVP(quat_z));
     }
   };
 
@@ -503,6 +511,7 @@ struct IsEnum<moteus::aux::I2C::DeviceConfig::Type> {
         { T::kNone, "none" },
         { T::kAs5048, "as5048" },
         { T::kAs5600, "as5600" },
+        { T::kLsm6dsv16x, "lsm6dsv16x" },
       }};
   }
 };

@@ -627,6 +627,10 @@ class AuxPort {
         ISR_ParseAs5600(&status);
         break;
       }
+      case DC::kLsm6dsv16x: {
+        ISR_ParseLsm6dsv16x(&status);
+        break;
+      }
       case DC::kNone:
       case DC::kNumTypes: {
         // Ignore.
@@ -661,6 +665,18 @@ class AuxPort {
     status->ams_agc = 0;
     status->ams_diag = encoder_raw_data_[0];
     status->ams_mag = 0;
+  }
+
+  void ISR_ParseLsm6dsv16x(aux::I2C::DeviceStatus* status) {
+    status->active = i2c_startup_complete_;
+
+    status->nonce += 1;
+
+    // For the LSM6DSV16X, These numbers are actually in float16 format!!!
+    // (S: 1 sign bit; E: 5 exponent bits; F: 10 fraction bits).
+    status->quat_x = (quaternion_raw_data_[1] << 8) | quaternion_raw_data_[0];
+    status->quat_y = (quaternion_raw_data_[3] << 8) | quaternion_raw_data_[2];
+    status->quat_z = (quaternion_raw_data_[5] << 8) | quaternion_raw_data_[4];
   }
 
   void ISR_PollI2c() {
@@ -701,6 +717,17 @@ class AuxPort {
                                      encoder_raw_data_), 2));
             break;
           }
+          case DC::kLsm6dsv16x: {
+            // Initialize LSM6DSV16X if needed
+            // This init happens during an interrupt, and it takes almost 1ms,
+            // so that could be bad if you're expecting realtime from the start
+            if (!state.initialized) {
+              if (InitLsm6dsv16x(config)) state.initialized = true;
+              return;
+            }
+            
+            break;
+          }
           case DC::kNone:
           case DC::kNumTypes: {
             MJ_ASSERT(false);
@@ -728,6 +755,10 @@ class AuxPort {
             StartI2cRead<3>(config.address, AS5600_REG_STATUS);
             break;
           }
+          case DC::kLsm6dsv16x: {
+            ReadIMUData(config.address);
+            break;
+          }
           case DC::kNone:
           case DC::kNumTypes: {
             MJ_ASSERT(false);
@@ -741,6 +772,125 @@ class AuxPort {
     }
   }
 
+  bool InitLsm6dsv16x(const auto config) {
+    // Make sure I2C is in a clean state
+    while (i2c_->busy()) {
+        i2c_->Poll();
+    }
+
+    // // First read WHO_AM_I register (0x0F should return 0x70)
+    // StartI2cRead<1>(config.address, 0x0F);
+
+    // wait_i2c();
+
+    // if (encoder_raw_data_[0] != 0x70) {
+    //     // Device not responding correctly
+    //     DigitalOut db1_led(g_hw_pins.debug_led1, 0);
+    //     return;
+    // }
+
+    // We have to poll more than twice as fast as the IMU can produce data
+    // See comment at ReadIMUData() function.
+    const int hz = 240;
+    if (config.poll_rate_us >= 1000000 / 120 / 2 ) {
+      DigitalOut db1_led(g_hw_pins.debug_led1, 0);
+      return false;
+    }
+
+    // Set accelerometer output data rate
+    uint8_t ctrl1 = 0x06;  // 0x06->120Hz, 0x07->240Hz, 0x08->480Hz
+    switch (hz) {
+      case 240: ctrl1 = 0x07; break;
+      case 480: ctrl1 = 0x08; break;
+      default: break;  // remain at 0x06 for 120Hz
+    }
+    i2c_->StartWriteMemory(config.address, 0x10, std::string_view(
+        reinterpret_cast<const char*>(&ctrl1), 1));
+    wait_i2c();
+
+    // Set gyroscope ODR
+    uint8_t ctrl2 = ctrl1;  // 0x06->120Hz, 0x07->240Hz, 0x08->480Hz
+    i2c_->StartWriteMemory(config.address, 0x11, std::string_view(
+        reinterpret_cast<const char*>(&ctrl2), 1));
+    wait_i2c();
+
+    // Set gyro and accel full scale
+    uint8_t ctrl6 = 0x04;  // Gyro FS ±2000 dps
+    i2c_->StartWriteMemory(config.address, 0x15, std::string_view(
+        reinterpret_cast<const char*>(&ctrl6), 1));
+    wait_i2c();
+
+    uint8_t ctrl8 = 0x02;  // Accel FS ±8g
+    i2c_->StartWriteMemory(config.address, 0x17, std::string_view(
+        reinterpret_cast<const char*>(&ctrl8), 1));
+    wait_i2c();
+
+    // Switch to embedded functions bank of registers
+    uint8_t func_cfg = 0x80;
+    i2c_->StartWriteMemory(config.address, 0x01, std::string_view(
+        reinterpret_cast<const char*>(&func_cfg), 1));
+    wait_i2c();
+
+    // Enable SFLP game rotation vector (quaternion orientation data)
+    uint8_t emb_func_en = 0x02;
+    i2c_->StartWriteMemory(config.address, 0x04, std::string_view(
+        reinterpret_cast<const char*>(&emb_func_en), 1));
+    wait_i2c();
+
+    // Set SFLP data rate
+    uint8_t sflp_odr = 0x5B;  // 5B->120Hz, 63->240hz, 6B->480hz
+    switch (hz) {
+      case 240: sflp_odr = 0x63; break;
+      case 480: sflp_odr = 0x6B; break;
+      default: break;  // remain at 0x5B for 120Hz
+    }
+    i2c_->StartWriteMemory(config.address, 0x5E, std::string_view(
+        reinterpret_cast<const char*>(&sflp_odr), 1));
+    wait_i2c();
+
+    // Enable SFLP batching
+    uint8_t fifo_en = 0x02;
+    i2c_->StartWriteMemory(config.address, 0x44, std::string_view(
+        reinterpret_cast<const char*>(&fifo_en), 1));
+    wait_i2c();
+
+    // Switch back to main register bank
+    func_cfg = 0x00;
+    i2c_->StartWriteMemory(config.address, 0x01, std::string_view(
+        reinterpret_cast<const char*>(&func_cfg), 1));
+    wait_i2c();
+
+    // Set FIFO mode to RESET - this clears the FIFO
+    uint8_t fifo_ctrl4 = 0x00;
+    i2c_->StartWriteMemory(config.address, 0x0A, std::string_view(
+        reinterpret_cast<const char*>(&fifo_ctrl4), 1));
+    wait_i2c();
+
+    // Set FIFO mode to continuous
+    fifo_ctrl4 = 0x06;
+    i2c_->StartWriteMemory(config.address, 0x0A, std::string_view(
+        reinterpret_cast<const char*>(&fifo_ctrl4), 1));
+    wait_i2c();
+
+    return true;
+  }
+
+  void wait_i2c() {
+    // Wait for the I2C transaction to complete so we can send the next command
+    while (true) {
+      i2c_->Poll();  // moves the driver’s state machine forward
+      auto status = i2c_->CheckRead();
+      if (status == Stm32I2c::ReadStatus::kComplete) {
+        break;
+      } else if (status == Stm32I2c::ReadStatus::kError) {
+        // Re-initialize or handle error
+        DigitalOut db1_led(g_hw_pins.debug_led1, 0);
+        i2c_->Initialize();
+        return;
+      }
+    }
+  }
+
   template <size_t size>
   void StartI2cRead(uint8_t address, uint8_t reg) {
     static_assert(sizeof(encoder_raw_data_) >= size);
@@ -749,6 +899,64 @@ class AuxPort {
                               reinterpret_cast<char*>(&encoder_raw_data_[0]),
                               size));
   }
+
+  // Same as above, but writes to pointer variable, and has variable size.
+  void StartI2cRead(uint8_t address, uint8_t reg, uint8_t* data, size_t size) {
+    i2c_->StartReadMemory(address, reg,
+                          mjlib::base::string_span(
+                              reinterpret_cast<char*>(data),
+                              size));
+  }
+
+  // Reads the quaternion "game vector" from the LSM6DSV16X.
+  // This function is a bit weird. Since it is called from inside an interrupt,
+  // we can't take much time at all or we will ruin all the realtime things
+  // happening elsewhere. But I2C is slow *if we wait for it*. So we have to do
+  // one I2C operation per interrupt call, and don't wait for it to finish.
+  // With that, the whole interrupt takes around 3 microseconds. Good.
+  void ReadIMUData(uint8_t address) {
+    // Check how many FIFO samples the last I2C read reported.
+    uint16_t fifo_samples = (((FIFO_raw_data_[1] & 0x01) << 8) | FIFO_raw_data_[0]);
+
+    // If there are no samples, we need to read the FIFO status register, then
+    // return because we only get to do 1 I2C operation per interrupt.
+    if (fifo_samples == 0) {
+      // ReadFIFOStatus(address);
+      StartI2cRead(address, 0x1B, FIFO_raw_data_, 2);
+      return;
+    }
+
+    while (fifo_samples > 0) {
+      // If we did anything but game vector, we'd need to read the tag.
+      // But that would be too much I2C activity.
+      // uint8_t tag = ReadFIFOTag(address);
+      // case 0x13: { // TAG for SFLP quaternion data
+
+      // ReadFIFOData(address, &(quaternion_raw_data_[0]), length);
+      StartI2cRead(address, 0x79, &(quaternion_raw_data_[0]), 6);
+
+      // This is a big fail and I shouldn't let it happen.
+      // If this happens, it means the FIFO is getting filled faster than our
+      // polling rate, so we have to read more than one FIFO per interrupt.
+      // That is bad for realtimeness. I need some way to guarantee that we
+      // poll faster than the FIFO rate.
+      if (fifo_samples > 1) wait_i2c();
+
+      fifo_samples--;
+    }
+
+    // Set FIFO count to 0 since we just cleared it all.
+    FIFO_raw_data_[0] = 0;
+    FIFO_raw_data_[1] = 0;
+  }
+
+  uint8_t ReadFIFOTag(uint8_t address) {
+    uint8_t tag = 0x13;
+    StartI2cRead(address, 0x78, &tag, 1);
+    wait_i2c();
+    return tag >> 3;
+  }
+
 
   void StartTunnelRead() {
     tunnel_stream_->AsyncReadSome(
@@ -1344,6 +1552,8 @@ class AuxPort {
 
   std::array<I2cState, 3> i2c_state_;
   uint8_t encoder_raw_data_[6] = {};
+  uint8_t FIFO_raw_data_[2] = {};
+  uint8_t quaternion_raw_data_[6] = {};
   bool i2c_startup_complete_ = false;
 
   static constexpr size_t kTunnelBufSize = 64;
@@ -1366,6 +1576,7 @@ class AuxPort {
 
   std::array<SampleType, static_cast<int>(SampleType::kLastEntry)> start_sample_types_ = {};
   std::array<SampleType, static_cast<int>(SampleType::kLastEntry)> finish_sample_types_ = {};
+
 };
 
 }

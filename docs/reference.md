@@ -1364,6 +1364,15 @@ It can be entered from `tview` or the `--console` mode of
 This causes the controller to enter the "stopped" state, which
 disables the motor driver.
 
+### `d led` ###
+
+This turns on or off the LED.  Syntax:
+
+```
+d led <led> <state>
+```
+Where led is 0 or 1, for green and red, and state is 0 or 1, for off and on.
+
 ### `d raw` ###
 
 This enters the "raw" PWM mode.  Syntax:

@@ -196,7 +196,7 @@ class Stm32I2c {
           // Clear any NACKs
           i2c_->ICR |= I2C_ICR_NACKCF;
 
-          mode_ = Mode::kComplete;
+          // mode_ = Mode::kComplete;
         }
 
         break;
@@ -211,7 +211,7 @@ class Stm32I2c {
           // We are done.
           i2c_->ICR |= I2C_ICR_NACKCF;
 
-          mode_ = Mode::kComplete;
+          // mode_ = Mode::kComplete;
         } else {
           i2c_->TXDR = tx_data_[offset_];
           offset_++;
@@ -223,6 +223,19 @@ class Stm32I2c {
     if (i2c_->ISR & I2C_ISR_NACKF) {
       mode_ = Mode::kError;
       i2c_->ICR |= I2C_ICR_NACKCF;
+      return;
+    }
+
+    // NEW: Check if the hardware STOP condition is present.
+    // If we used I2C_CR2_AUTOEND, a STOP will come automatically
+    // after the last byte. Let's wait for that STOP before declaring complete.
+    if (i2c_->ISR & I2C_ISR_STOPF) {
+      // Clear STOPF
+      i2c_->ICR = I2C_ICR_STOPCF;
+      // Now we can safely declare done:
+      if (mode_ == Mode::kReadingData || mode_ == Mode::kWritingData) {
+        mode_ = Mode::kComplete;
+      }
       return;
     }
   }
