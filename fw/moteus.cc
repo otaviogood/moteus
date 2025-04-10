@@ -123,6 +123,7 @@ namespace moteus {
 volatile uint8_t g_measured_hw_family;
 volatile uint8_t g_measured_hw_rev;
 volatile uint8_t g_measured_hw_pins;
+volatile uint8_t g_otavio_flags;
 MoteusHwPins g_hw_pins;
 }
 
@@ -167,6 +168,7 @@ int main(void) {
   g_measured_hw_family = family_and_version.family;
   g_measured_hw_rev = family_and_version.hw_version;
   g_measured_hw_pins = family_and_version.hw_pins;
+  g_otavio_flags = family_and_version.otavio_flags;
 
   g_hw_pins = FindHardwarePins(family_and_version);
 
@@ -189,7 +191,7 @@ int main(void) {
 
   // Turn on our power light.
   DigitalOut power_led(g_hw_pins.power_led, 0);
-
+  
   micro::SizedPool<20000> pool;
 
   std::optional<HardwareUart> rs485;

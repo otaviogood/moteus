@@ -135,6 +135,7 @@ MOTEUS_SOURCES = [
     "uuid.h",
     "uuid.cc",
     "moteus.cc",
+    "otavio.h",
 ]
 
 MOTEUS_DEPS = [

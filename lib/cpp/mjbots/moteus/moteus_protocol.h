@@ -204,7 +204,11 @@ enum Register : uint16_t {
   kAux2Pwm2 = 0x07c,
   kAux2Pwm3 = 0x07d,
   kAux2Pwm4 = 0x07e,
-  kAux2Pwm5 = 0x07f,
+  kAux2Pwm5 = 0x07f,  
+
+  kAux2QuaternionX = 0x080,
+  kAux2QuaternionY = 0x081,
+  kAux2QuaternionZ = 0x082,
 
   kRegisterMapVersion = 0x102,
   kSerialNumber = 0x120,
@@ -678,6 +682,10 @@ struct Query {
       // { R::kAux2Pwm3, 1, MP::kPwm },
       // { R::kAux2Pwm4, 1, MP::kPwm },
       // { R::kAux2Pwm5, 1, MP::kPwm },
+
+      { R::kAux2QuaternionX, 1, MP::kInt, },
+      { R::kAux2QuaternionY, 1, MP::kInt, },
+      { R::kAux2QuaternionZ, 1, MP::kInt, },
 
       { R::kRegisterMapVersion, 1, MP::kInt, },
       { R::kSerialNumber1,  3, MP::kInt, },

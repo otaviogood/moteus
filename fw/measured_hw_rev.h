@@ -22,4 +22,6 @@ extern volatile uint8_t g_measured_hw_family;
 // The current board revision.
 extern volatile uint8_t g_measured_hw_rev;
 
+// Custom flags
+extern volatile uint8_t g_otavio_flags;
 }

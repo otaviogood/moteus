@@ -133,6 +133,7 @@ FamilyAndVersion DetectMoteusFamily(MillisecondTimer* timer) {
       // We check for family 1, "moteus n1", by seeing if we can find a
       // DRV8323 on a chip select that is different from that used on all
       // family 0 boards.
+      int32_t attempts = 10; // Otavio's hack to detect a board with no motor driver
       while (true) {
         timer->wait_ms(2);
         {
@@ -165,6 +166,10 @@ FamilyAndVersion DetectMoteusFamily(MillisecondTimer* timer) {
             // and try again after a while.  Maybe the input voltage is
             // just slewing up *really* slowly and our gate driver is not
             // at a voltage level where it will work yet.
+            if (--attempts == 0) {
+              result.otavio_flags = 1; // This is a sensor board without a motor driver
+              break;
+            }
             continue;
           }
           // Yes, we are on a r4.
@@ -288,8 +293,12 @@ MoteusHwPins FindHardwarePins(FamilyAndVersion fv) {
     result.drv8323_sck = PA_5;
     result.drv8323_fault = PB_6;
 
-    result.debug_led1 = PF_0;
-    result.power_led = PF_1;
+
+    result.debug_led1 = PF_0;  // red
+    result.debug_led2 = PC_13;  // yellow
+    result.power_led = PF_1;  // green
+    result.otavio_pin = PC_11; // I2C_SDA pin on side of board
+
 
     // We've picked these particular pins so that all 3 channels are
     // one of the "slow" channels so they will have similar analog

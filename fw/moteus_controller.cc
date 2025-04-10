@@ -327,6 +327,10 @@ enum class Register {
   kAux2Pwm4 = 0x07e,
   kAux2Pwm5 = 0x07f,
 
+  kAux2QuaternionX = 0x080,
+  kAux2QuaternionY = 0x081,
+  kAux2QuaternionZ = 0x082,
+
   kModelNumber = 0x100,
   kFirmwareVersion = 0x101,
   kRegisterMapVersion = 0x102,
@@ -358,18 +362,18 @@ enum class Register {
 aux::AuxHardwareConfig GetAux1HardwareConfig() {
   auto aux_options = aux::AuxExtraOptions();
 
-  if (g_measured_hw_family == 0) {
-    return aux::AuxHardwareConfig{
-      {{
-          //          ADC#  CHN    I2C      SPI      USART    TIMER
-          { 0, PC_13,  -1,   0,    nullptr, nullptr, nullptr, nullptr },
-          { 1, PB_13,   2,   5,    nullptr, SPI2,    nullptr, nullptr },
-          { 2, PB_14,   0,   5,    nullptr, SPI2,    nullptr, nullptr },
-          { 3, PB_15,   1,   15,   nullptr, SPI2,    nullptr, nullptr },
-          { -1, NC },
-              }},
-          aux_options,
-          };
+    if (g_measured_hw_family == 0) {
+      return aux::AuxHardwareConfig{
+        {{
+            //          ADC#  CHN    I2C      SPI      USART    TIMER
+            { 0, PC_13,  -1,   0,    nullptr, nullptr, nullptr, nullptr },
+            { 1, PB_13,   2,   5,    nullptr, SPI2,    nullptr, nullptr },
+            { 2, PB_14,   0,   5,    nullptr, SPI2,    nullptr, nullptr },
+            { 3, PB_15,   1,   15,   nullptr, SPI2,    nullptr, nullptr },
+            { -1, NC },
+                }},
+            aux_options,
+            };
   } else if (g_measured_hw_family == 1 ||
              g_measured_hw_family == 2) {
     // Family 2 has no I2C pullup on AUX1.
@@ -408,17 +412,17 @@ aux::AuxHardwareConfig GetAux2HardwareConfig() {
   auto aux_options = aux::AuxExtraOptions();
 
   if (g_measured_hw_family == 0) {
-    return aux::AuxHardwareConfig{
-      {{
-          //          ADC#  CHN    I2C      SPI      USART    TIMER
-          { 0, PB_8,   -1,   0,    I2C1,    nullptr, USART3,  nullptr },
-          { 1, PB_9,   -1,   0,    I2C1,    nullptr, USART3,  nullptr },
-          { 2, PC_14,  -1,   0,    nullptr, nullptr, nullptr, nullptr },
-          { 3, PC_15,  -1,   0,    nullptr, nullptr, nullptr, nullptr },
-          { -1, NC, },
-              }},
-          aux_options,
-          };
+      return aux::AuxHardwareConfig{
+        {{
+            //          ADC#  CHN    I2C      SPI      USART    TIMER
+            { 0, PB_8,   -1,   0,    I2C1,    nullptr, USART3,  nullptr },
+            { 1, PB_9,   -1,   0,    I2C1,    nullptr, USART3,  nullptr },
+            { 2, PC_14,  -1,   0,    nullptr, nullptr, nullptr, nullptr },
+            { 3, PC_15,  -1,   0,    nullptr, nullptr, nullptr, nullptr },
+            { -1, NC, },
+                }},
+            aux_options,
+            };
   } else if (g_measured_hw_family == 1 ||
              g_measured_hw_family == 2) {
     aux_options.i2c_pullup = PA_12;
@@ -514,14 +518,14 @@ class MoteusController::Impl : public multiplex::MicroServer::Server {
         uuid_(uuid) {}
 
   void Start() {
-    bldc_.Start();
+      bldc_.Start();
   }
 
   void Poll() {
-    // Check to see if we have a command to send out.
-    if (command_valid_) {
-      command_valid_ = false;
-      bldc_.Command(command_);
+      // Check to see if we have a command to send out.
+      if (command_valid_) {
+        command_valid_ = false;
+        bldc_.Command(command_);
     }
     aux1_port_.Poll();
     aux2_port_.Poll();
@@ -530,9 +534,9 @@ class MoteusController::Impl : public multiplex::MicroServer::Server {
   void PollMillisecond() {
     aux1_port_.PollMillisecond();
     aux2_port_.PollMillisecond();
-    drv8323_.PollMillisecond();
-    bldc_.PollMillisecond();
-    motor_position_.PollMillisecond();
+      drv8323_.PollMillisecond();
+      bldc_.PollMillisecond();
+      motor_position_.PollMillisecond();
   }
 
   void StartFrame() override {
@@ -796,6 +800,9 @@ class MoteusController::Impl : public multiplex::MicroServer::Server {
       case Register::kAux2AnalogIn3:
       case Register::kAux2AnalogIn4:
       case Register::kAux2AnalogIn5:
+      case Register::kAux2QuaternionX:
+      case Register::kAux2QuaternionY:
+      case Register::kAux2QuaternionZ:
       case Register::kMillisecondCounter:
       case Register::kModelNumber:
       case Register::kSerialNumber1:
@@ -1102,6 +1109,22 @@ class MoteusController::Impl : public multiplex::MicroServer::Server {
         const int pin =
             static_cast<int>(reg) - static_cast<int>(Register::kAux2Pwm1);
         return ScalePwm(bldc_.aux2().pwm[pin], type);
+      }
+
+      case Register::kAux2QuaternionX: {
+        auto* status = const_cast<AuxPort&>(aux2_port_).status();
+        // status has quat_x, quat_y, quat_z, that are 16 bit uints.
+        return Value(static_cast<uint16_t>(status->i2c.devices[0].quat_x));
+      }
+      case Register::kAux2QuaternionY: {
+        auto* status = const_cast<AuxPort&>(aux2_port_).status();
+        // status has quat_x, quat_y, quat_z, that are 16 bit uints.
+        return Value(static_cast<uint16_t>(status->i2c.devices[0].quat_y));
+      }
+      case Register::kAux2QuaternionZ: {
+        auto* status = const_cast<AuxPort&>(aux2_port_).status();
+        // status has quat_x, quat_y, quat_z, that are 16 bit uints.
+        return Value(static_cast<uint16_t>(status->i2c.devices[0].quat_z));
       }
 
       case Register::kModelNumber: {

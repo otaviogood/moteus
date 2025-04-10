@@ -262,6 +262,9 @@ class Register(enum.IntEnum):
     AUX2_PWM3 = 0x07d,
     AUX2_PWM4 = 0x07e,
     AUX2_PWM5 = 0x07f,
+    AUX2_QUATERNIONX = 0x080,
+    AUX2_QUATERNIONY = 0x081,
+    AUX2_QUATERNIONZ = 0x082,
 
     REGISTER_MAP_VERSION = 0x102
     SERIAL_NUMBER = 0x120
@@ -525,6 +528,12 @@ def parse_register(parser, register, resolution):
     elif register == Register.AUX1_GPIO_STATUS:
         return parser.read_int(resolution)
     elif register == Register.AUX2_GPIO_STATUS:
+        return parser.read_int(resolution)
+    elif register == Register.AUX2_QUATERNIONX:
+        return parser.read_int(resolution)
+    elif register == Register.AUX2_QUATERNIONY:
+        return parser.read_int(resolution)
+    elif register == Register.AUX2_QUATERNIONZ:
         return parser.read_int(resolution)
     elif (register == Register.AUX1_ANALOG_IN1 or
           register == Register.AUX1_ANALOG_IN2 or

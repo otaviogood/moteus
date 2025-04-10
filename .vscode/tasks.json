@@ -1,0 +1,13 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+      {
+        "label": "build-firmware",
+        "type": "shell",
+        "command": "./tools/bazel",
+        "args": ["build", "--config=target", "//:target"],
+        "group": "build",
+        "problemMatcher": ["$gcc"]
+      }
+    ]
+  }

@@ -48,6 +48,7 @@ struct MoteusHwPins {
   PinName drv8323_fault = NC;
 
   PinName debug_led1 = NC;
+  PinName debug_led2 = NC;
   PinName power_led = NC;
 
   PinName current1 = NC;
@@ -73,6 +74,7 @@ struct MoteusHwPins {
   PinName debug1 = NC;
   PinName debug2 = NC;
   PinName debug_dac = PA_4;
+  PinName otavio_pin = NC;
 
   uint32_t model_number = 0;
 
@@ -84,6 +86,7 @@ struct FamilyAndVersion {
   int family = 0;
   int hw_version = 0;
   int hw_pins = 0;
+  int otavio_flags = 0;
 };
 
 // Return what family we are executing on.

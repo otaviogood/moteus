@@ -13,7 +13,11 @@ test --test_output=errors
 
 build --workspace_status_command=tools/workspace_status.sh
 
+# Modified optimization settings for better debugging while keeping size small
 build -c opt
+# build --copt=-O1        # Use -O1 instead of -O2/-O3 for better debugging
+# build --copt=-fno-omit-frame-pointer  # Keep stack frames for better debugging
+# build --copt=-fno-inline-functions    # Reduce function inlining
 
 build --stamp
 

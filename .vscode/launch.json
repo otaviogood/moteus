@@ -1,0 +1,27 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+      {
+        "name": "Debug moteus",
+        "type": "cortex-debug",
+        "request": "launch",
+        "servertype": "openocd",
+        "cwd": "${workspaceRoot}",
+        "executable": "${workspaceRoot}/bazel-out/stm32g4-opt/bin/fw/moteus.elf",
+        "device": "STM32G4",
+        "configFiles": [
+          "interface/stlink.cfg",
+          "target/stm32g4x.cfg"
+        ],
+        "svdFile": "${workspaceRoot}/STM32G4xx.svd",
+        "runToEntryPoint": "main",
+        "preLaunchTask": "build-firmware",
+        "postLaunchCommands": [
+          "monitor reset halt",
+          "monitor arm semihosting enable"
+        ],
+        "showDevDebugOutput": "raw",
+        "gdbPath": "/opt/arm-gnu-toolchain-14.2.rel1-x86_64-arm-none-eabi/bin/arm-none-eabi-gdb"
+      }
+    ]
+  }

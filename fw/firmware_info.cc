@@ -26,6 +26,7 @@ struct Info {
   uint32_t model = 0;
   uint8_t family = g_measured_hw_family;
   uint8_t hwrev = g_measured_hw_rev;
+  uint8_t otavio_flags = g_otavio_flags;
 
   template <typename Archive>
   void Serialize(Archive* a) {
@@ -34,6 +35,7 @@ struct Info {
     a->Visit(MJ_NVP(model));
     a->Visit(MJ_NVP(family));
     a->Visit(MJ_NVP(hwrev));
+    a->Visit(MJ_NVP(otavio_flags));
   }
 };
 }
