@@ -66,3 +66,9 @@ https://www.apache.org/licenses/LICENSE-2.0
 mjbots Robotic Systems LLC owns and protects the "mjbots" and "moteus" trademarks in many jurisdictions.
 
 If you want to use these names in your project or product, please read the [Trademark Policy](https://mjbots.com/trademark-policy)
+
+# Otavio notes for using IMU #
+- Use 'lsusb' to figure out name of CAN device. (my fdcanusb device is ttyACM0)
+- target is CAN address
+
+`python3 lib/python/examples/read_quaternion.py --force-transport=fdcanusb --fdcanusb=/dev/ttyACM0 --target=12`

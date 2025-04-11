@@ -195,6 +195,10 @@ enum Register : uint16_t {
   kMillisecondCounter = 0x070,
   kClockTrim = 0x071,
 
+  kAux2QuaternionX = 0x072,
+  kAux2QuaternionY = 0x073,
+  kAux2QuaternionZ = 0x074,
+
   kAux1Pwm1 = 0x076,
   kAux1Pwm2 = 0x077,
   kAux1Pwm3 = 0x078,
@@ -206,9 +210,6 @@ enum Register : uint16_t {
   kAux2Pwm4 = 0x07e,
   kAux2Pwm5 = 0x07f,  
 
-  kAux2QuaternionX = 0x080,
-  kAux2QuaternionY = 0x081,
-  kAux2QuaternionZ = 0x082,
 
   kRegisterMapVersion = 0x102,
   kSerialNumber = 0x120,
@@ -683,9 +684,9 @@ struct Query {
       // { R::kAux2Pwm4, 1, MP::kPwm },
       // { R::kAux2Pwm5, 1, MP::kPwm },
 
-      { R::kAux2QuaternionX, 1, MP::kInt, },
-      { R::kAux2QuaternionY, 1, MP::kInt, },
-      { R::kAux2QuaternionZ, 1, MP::kInt, },
+      { R::kAux2QuaternionX, 3, MP::kInt, },
+      // { R::kAux2QuaternionY, 1, MP::kInt, },
+      // { R::kAux2QuaternionZ, 1, MP::kInt, },
 
       { R::kRegisterMapVersion, 1, MP::kInt, },
       { R::kSerialNumber1,  3, MP::kInt, },
@@ -1433,6 +1434,39 @@ struct AuxPwmWrite {
     }
 
     return 0;
+  }
+};
+
+struct QuaternionRead {
+  struct Command {
+  };
+
+  struct Format {
+    Resolution quaternion_x = kInt16;
+    Resolution quaternion_y = kInt16;
+    Resolution quaternion_z = kInt16;
+  };
+
+  static uint8_t Make(WriteCanData* frame,
+                      const Command&,
+                      const Format& format) {
+    uint8_t reply_size = 0;
+
+    const Resolution kResolutions[] = {
+      format.quaternion_x,
+      format.quaternion_y,
+      format.quaternion_z,
+    };
+    const uint16_t kResolutionsSize = sizeof(kResolutions) / sizeof(*kResolutions);
+    WriteCombiner combiner(
+        frame, 0x10, Register::kAux2QuaternionX,
+        kResolutions, kResolutionsSize);
+    for (uint16_t i = 0; i < kResolutionsSize; i++) {
+      combiner.MaybeWrite();
+    }
+
+    reply_size += combiner.reply_size();
+    return reply_size;
   }
 };
 

@@ -674,9 +674,10 @@ class AuxPort {
 
     // For the LSM6DSV16X, These numbers are actually in float16 format!!!
     // (S: 1 sign bit; E: 5 exponent bits; F: 10 fraction bits).
-    status->quat_x = (quaternion_raw_data_[1] << 8) | quaternion_raw_data_[0];
-    status->quat_y = (quaternion_raw_data_[3] << 8) | quaternion_raw_data_[2];
-    status->quat_z = (quaternion_raw_data_[5] << 8) | quaternion_raw_data_[4];
+    // The data comes in as X_low, X_high, Y_low, Y_high, Z_low, Z_high
+    status->quat_x = (quaternion_raw_data_[1] << 8) | quaternion_raw_data_[0]; // Bytes 0, 1
+    status->quat_y = (quaternion_raw_data_[3] << 8) | quaternion_raw_data_[2]; // Bytes 2, 3
+    status->quat_z = (quaternion_raw_data_[5] << 8) | quaternion_raw_data_[4]; // Bytes 4, 5
   }
 
   void ISR_PollI2c() {
@@ -878,7 +879,7 @@ class AuxPort {
   void wait_i2c() {
     // Wait for the I2C transaction to complete so we can send the next command
     while (true) {
-      i2c_->Poll();  // moves the driver’s state machine forward
+      i2c_->Poll();  // moves the driver's state machine forward
       auto status = i2c_->CheckRead();
       if (status == Stm32I2c::ReadStatus::kComplete) {
         break;

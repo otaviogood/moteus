@@ -11,17 +11,33 @@
 namespace moteus {
 
 inline void CpuDelay(uint32_t cycles) {
-  for (volatile uint32_t i = 0; i < cycles; i++) {
-    __NOP();
+  const uint32_t start_cycle = DWT->CYCCNT;
+  const uint32_t target_cycle = start_cycle + cycles;
+
+  // // Handle potential counter overflow, although unlikely for short delays
+  // if (target_cycle < start_cycle) {
+  //   // Wait for the counter to wrap around
+  //   while (DWT->CYCCNT > start_cycle) {
+  //     __NOP(); // Small delay to prevent hard spinning
+  //   }
+  // }
+  // Wait until the target cycle count is reached
+  while (DWT->CYCCNT < target_cycle) {
+     __NOP(); // Small delay to prevent hard spinning
   }
 }
 
 inline void SendDebug(const char* str) {
   // At 115200 baud, calibrate CPU_CYCLES to match your CPU frequency
   // For example, at 170MHz, you'd need ~145 cycles for 8.68us
-  constexpr uint32_t CPU_CYCLES = 145;
+  constexpr uint32_t CPU_CYCLES = 145*5;//10; // Why do i have to multiply by 10?
 
-  DigitalOut db2(g_hw_pins.otavio_pin, 1);
+  // Temporarily disable interrupts for bit-banging
+  uint32_t primask = __get_PRIMASK();
+  __disable_irq();
+
+  DigitalOut db2(g_hw_pins.debug2, 1);
+  // DigitalOut db2(g_hw_pins.otavio_pin, 1);
 
   while (*str) {
     // Start bit (0)
@@ -43,6 +59,11 @@ inline void SendDebug(const char* str) {
 
   // Return to idle state
   db2.write(1);
+
+  // Re-enable interrupts
+  if (!primask) {
+    __enable_irq();
+  }
 }
 
 template<typename... Args>

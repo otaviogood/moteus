@@ -316,6 +316,10 @@ enum class Register {
   kMillisecondCounter = 0x070,
   kClockTrim = 0x071,
 
+  kAux2QuaternionX = 0x072,
+  kAux2QuaternionY = 0x073,
+  kAux2QuaternionZ = 0x074,
+
   kAux1Pwm1 = 0x076,
   kAux1Pwm2 = 0x077,
   kAux1Pwm3 = 0x078,
@@ -326,10 +330,6 @@ enum class Register {
   kAux2Pwm3 = 0x07d,
   kAux2Pwm4 = 0x07e,
   kAux2Pwm5 = 0x07f,
-
-  kAux2QuaternionX = 0x080,
-  kAux2QuaternionY = 0x081,
-  kAux2QuaternionZ = 0x082,
 
   kModelNumber = 0x100,
   kFirmwareVersion = 0x101,
@@ -1113,18 +1113,16 @@ class MoteusController::Impl : public multiplex::MicroServer::Server {
 
       case Register::kAux2QuaternionX: {
         auto* status = const_cast<AuxPort&>(aux2_port_).status();
-        // status has quat_x, quat_y, quat_z, that are 16 bit uints.
-        return Value(static_cast<uint16_t>(status->i2c.devices[0].quat_x));
+        // Do this as a *signed* int, so things don't get cast wrong and mess up the CAN comms
+        return Value(static_cast<int16_t>(status->i2c.devices[0].quat_x));
       }
       case Register::kAux2QuaternionY: {
         auto* status = const_cast<AuxPort&>(aux2_port_).status();
-        // status has quat_x, quat_y, quat_z, that are 16 bit uints.
-        return Value(static_cast<uint16_t>(status->i2c.devices[0].quat_y));
+        return Value(static_cast<int16_t>(status->i2c.devices[0].quat_y));
       }
       case Register::kAux2QuaternionZ: {
         auto* status = const_cast<AuxPort&>(aux2_port_).status();
-        // status has quat_x, quat_y, quat_z, that are 16 bit uints.
-        return Value(static_cast<uint16_t>(status->i2c.devices[0].quat_z));
+        return Value(static_cast<int16_t>(status->i2c.devices[0].quat_z));
       }
 
       case Register::kModelNumber: {

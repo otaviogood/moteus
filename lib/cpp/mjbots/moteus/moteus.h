@@ -702,6 +702,31 @@ class Controller {
   }
 
   /////////////////////////////////////////
+  // Quaternion Read
+
+  CanFdFrame MakeQuaternionRead(const QuaternionRead::Format* command_override = nullptr,
+                               const Query::Format* query_override = nullptr) {
+    return MakeFrame(QuaternionRead(), QuaternionRead::Command(),
+                     (command_override == nullptr ?
+                      QuaternionRead::Format() : *command_override),
+                     query_override);
+  }
+
+  Optional<Result> ReadQuaternion(const QuaternionRead::Format* command_override = nullptr,
+                            const Query::Format* query_override = nullptr) {
+    return ExecuteSingleCommand(
+        MakeQuaternionRead(command_override, query_override));
+  }
+
+  void AsyncReadQuaternion(Result* result, CompletionCallback callback,
+                          const QuaternionRead::Format* command_override = nullptr,
+                          const Query::Format* query_override = nullptr) {
+    AsyncStartSingleCommand(
+        MakeQuaternionRead(command_override, query_override),
+        result, callback);
+  }
+
+  /////////////////////////////////////////
   // Schema version checking
 
   CanFdFrame MakeSchemaVersionQuery() {
