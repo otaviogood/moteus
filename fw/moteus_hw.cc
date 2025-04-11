@@ -293,11 +293,18 @@ MoteusHwPins FindHardwarePins(FamilyAndVersion fv) {
     result.drv8323_sck = PA_5;
     result.drv8323_fault = PB_6;
 
+    if (fv.otavio_flags & 1) {
+      result.debug_led1 = PF_1;  // red
+      result.debug_led2 = PC_13;  // yellow
+      result.power_led = PF_0;  // green
+      result.otavio_pin = PC_11; // I2C_SDA pin on side of board
+    } else {
+      result.debug_led1 = PF_0;  // red
+      // result.debug_led2 = PC_13;  // yellow
+      result.power_led = PF_1;  // green
+      // result.otavio_pin = PC_11; // I2C_SDA pin on side of board
+    }
 
-    result.debug_led1 = PF_0;  // red
-    result.debug_led2 = PC_13;  // yellow
-    result.power_led = PF_1;  // green
-    result.otavio_pin = PC_11; // I2C_SDA pin on side of board
 
 
     // We've picked these particular pins so that all 3 channels are
