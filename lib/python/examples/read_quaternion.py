@@ -26,7 +26,7 @@ import moteus
 import struct
 
 # Import the resolution types from the multiplex module
-from moteus.multiplex import INT16
+from moteus.multiplex import INT16, F32
 
 # Helper function to convert the 16-bit values into float16 format
 def float16_to_float32(value):
@@ -79,6 +79,8 @@ async def main():
             0x073: INT16,  # Register.AUX2_QUATERNIONY
             0x074: INT16,  # Register.AUX2_QUATERNIONZ
         }
+    # Also query the absolute position from the Aux1 SPI encoder
+    qr._extra[0x006] = F32  # Register.ABS_POSITION
 
     # Create a controller with our specific query resolution and target ID
     transport = moteus.get_singleton_transport(args)
@@ -96,6 +98,9 @@ async def main():
             quat_x = result.values.get(0x072, 0) if args.component in ['all', 'x'] else 0
             quat_y = result.values.get(0x073, 0) if args.component in ['all', 'y'] else 0
             quat_z = result.values.get(0x074, 0) if args.component in ['all', 'z'] else 0
+            
+            # Extract the absolute position value
+            abs_pos = result.values.get(0x006, 0.0)
 
             # Print raw values for debugging
             if args.component in ['all', 'x']:
@@ -139,6 +144,10 @@ async def main():
                 # print in the order (w,x,y,z).
                 print(f"Quaternion: [{w:.4f}, {x:.4f}, {y:.4f}, {z:.4f}]")
                 print("")
+            
+            # Print the absolute position
+            print(f"Absolute Position (Aux1 SPI): {abs_pos:.4f} revolutions")
+            print("")
             
             # Wait before the next reading
             await asyncio.sleep(0.1)
