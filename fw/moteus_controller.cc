@@ -266,6 +266,8 @@ enum class Register {
   kCommandAccelLimit = 0x029,
   kCommandFixedVoltageOverride = 0x02a,
   kCommandIlimitScale = 0x02b,
+  kCommandFixedCurrentOverride = 0x02c,
+  kCommandIgnorePositionBounds = 0x02d,
 
   kPositionKp = 0x030,
   kPositionKi = 0x031,
@@ -288,6 +290,7 @@ enum class Register {
   kStayWithinMaxTorque = 0x045,
   kStayWithinTimeout = 0x046,
   kStayWithinIlimitScale = 0x047,
+  kStayWithinIgnorePositionBounds = 0x048,
 
   kEncoder0Position = 0x050,
   kEncoder0Velocity = 0x051,
@@ -362,29 +365,30 @@ enum class Register {
 aux::AuxHardwareConfig GetAux1HardwareConfig() {
   auto aux_options = aux::AuxExtraOptions();
 
-    if (g_measured_hw_family == 0) {
-      return aux::AuxHardwareConfig{
-        {{
-            //          ADC#  CHN    I2C      SPI      USART    TIMER
-            { 0, PC_13,  -1,   0,    nullptr, nullptr, nullptr, nullptr },
-            { 1, PB_13,   2,   5,    nullptr, SPI2,    nullptr, nullptr },
-            { 2, PB_14,   0,   5,    nullptr, SPI2,    nullptr, nullptr },
-            { 3, PB_15,   1,   15,   nullptr, SPI2,    nullptr, nullptr },
-            { -1, NC },
-                }},
-            aux_options,
-            };
+  if (g_measured_hw_family == 0) {
+    return aux::AuxHardwareConfig{
+      {{
+          //          ADC#  CHN    I2C      SPI      USART    TIMER
+          { 0, PC_13,  -1,   0,    nullptr, nullptr, nullptr, nullptr },
+          { 1, PB_13,   2,   5,    nullptr, SPI2,    nullptr, nullptr },
+          { 2, PB_14,   0,   5,    nullptr, SPI2,    nullptr, nullptr },
+          { 3, PB_15,   1,   15,   nullptr, SPI2,    nullptr, nullptr },
+          { -1, NC },
+              }},
+          aux_options,
+          };
   } else if (g_measured_hw_family == 1 ||
-             g_measured_hw_family == 2) {
+             g_measured_hw_family == 2 ||
+             g_measured_hw_family == 3) {
     // Family 2 has no I2C pullup on AUX1.
     aux_options.i2c_pullup =
-        g_measured_hw_family == 1 ? PB_8 : NC;
+        g_measured_hw_family == 2 ? NC : PB_8;
 
     // Family 2 has no RS422.
     aux_options.rs422_re =
-        g_measured_hw_family == 1 ? PB_10 : NC;
+        g_measured_hw_family == 2 ? NC : PB_10;
     aux_options.rs422_de =
-        g_measured_hw_family == 1 ? PB_11 : NC;
+        g_measured_hw_family == 2 ? NC : PB_11;
     return aux::AuxHardwareConfig{
       {{
           //          ADC#  CHN    I2C      SPI      USART    TIMER
@@ -412,19 +416,20 @@ aux::AuxHardwareConfig GetAux2HardwareConfig() {
   auto aux_options = aux::AuxExtraOptions();
 
   if (g_measured_hw_family == 0) {
-      return aux::AuxHardwareConfig{
-        {{
-            //          ADC#  CHN    I2C      SPI      USART    TIMER
-            { 0, PB_8,   -1,   0,    I2C1,    nullptr, USART3,  nullptr },
-            { 1, PB_9,   -1,   0,    I2C1,    nullptr, USART3,  nullptr },
-            { 2, PC_14,  -1,   0,    nullptr, nullptr, nullptr, nullptr },
-            { 3, PC_15,  -1,   0,    nullptr, nullptr, nullptr, nullptr },
-            { -1, NC, },
-                }},
-            aux_options,
-            };
+    return aux::AuxHardwareConfig{
+      {{
+          //          ADC#  CHN    I2C      SPI      USART    TIMER
+          { 0, PB_8,   -1,   0,    I2C1,    nullptr, USART3,  nullptr },
+          { 1, PB_9,   -1,   0,    I2C1,    nullptr, USART3,  nullptr },
+          { 2, PC_14,  -1,   0,    nullptr, nullptr, nullptr, nullptr },
+          { 3, PC_15,  -1,   0,    nullptr, nullptr, nullptr, nullptr },
+          { -1, NC, },
+              }},
+          aux_options,
+          };
   } else if (g_measured_hw_family == 1 ||
-             g_measured_hw_family == 2) {
+             g_measured_hw_family == 2 ||
+             g_measured_hw_family == 3) {
     aux_options.i2c_pullup = PA_12;
     return aux::AuxHardwareConfig{
       {{
@@ -464,7 +469,9 @@ class MoteusController::Impl : public multiplex::MicroServer::Server {
                    persistent_config, command_manager, telemetry_manager,
                    multiplex_protocol->MakeTunnel(2),
                    timer,
-                   AuxPort::kDefaultOnboardSpi,
+                   g_measured_hw_family != 3 ?
+                   AuxPort::kDefaultOnboardSpi :
+                   AuxPort::kDefaultOnboardMa600,
                    {DMA1_Channel3, DMA1_Channel4, DMA1_Channel5, DMA1_Channel6}),
         aux2_port_("aux2", "ic_pz2", GetAux2HardwareConfig(),
                    &aux_adc_.aux_info[1],
@@ -518,14 +525,14 @@ class MoteusController::Impl : public multiplex::MicroServer::Server {
         uuid_(uuid) {}
 
   void Start() {
-      bldc_.Start();
+    bldc_.Start();
   }
 
   void Poll() {
-      // Check to see if we have a command to send out.
-      if (command_valid_) {
-        command_valid_ = false;
-        bldc_.Command(command_);
+    // Check to see if we have a command to send out.
+    if (command_valid_) {
+      command_valid_ = false;
+      bldc_.Command(command_);
     }
     aux1_port_.Poll();
     aux2_port_.Poll();
@@ -534,9 +541,9 @@ class MoteusController::Impl : public multiplex::MicroServer::Server {
   void PollMillisecond() {
     aux1_port_.PollMillisecond();
     aux2_port_.PollMillisecond();
-      drv8323_.PollMillisecond();
-      bldc_.PollMillisecond();
-      motor_position_.PollMillisecond();
+    drv8323_.PollMillisecond();
+    bldc_.PollMillisecond();
+    motor_position_.PollMillisecond();
   }
 
   void StartFrame() override {
@@ -674,6 +681,15 @@ class MoteusController::Impl : public multiplex::MicroServer::Server {
       case Register::kCommandIlimitScale:
       case Register::kStayWithinIlimitScale: {
         command_.ilimit_scale = ReadPwm(value);
+        return 0;
+      }
+      case Register::kCommandFixedCurrentOverride: {
+        command_.fixed_current_override = ReadCurrent(value);
+        return 0;
+      }
+      case Register::kCommandIgnorePositionBounds:
+      case Register::kStayWithinIgnorePositionBounds: {
+        command_.ignore_position_bounds = ReadIntMapping(value);
         return 0;
       }
       case Register::kStayWithinLower: {
@@ -955,6 +971,13 @@ class MoteusController::Impl : public multiplex::MicroServer::Server {
       }
       case Register::kCommandFixedVoltageOverride: {
         return ScaleVoltage(command_.fixed_voltage_override, type);
+      }
+      case Register::kCommandFixedCurrentOverride: {
+        return ScaleCurrent(command_.fixed_current_override, type);
+      }
+      case Register::kCommandIgnorePositionBounds:
+      case Register::kStayWithinIgnorePositionBounds: {
+        return IntMapping(command_.ignore_position_bounds ? 1 : 0, type);
       }
       case Register::kCommandFeedforwardTorque:
       case Register::kStayWithinFeedforward: {

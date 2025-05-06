@@ -175,10 +175,14 @@ used for various functions.
 ELECTRICAL NOTES:
  * The 3.3V supply pins can power external peripherals:
    * r4.5/c1: 50mA
-   * r4.8/r4.11/n1: 100mA
+   * r4.8/r4.11/n1/x1: 100mA
  * The 5V supply pins can power external peripherals:
    * r4: not present
-   * n1/c1: 100mA
+   * c1: 100mA
+   * n1/x1: 200mA
+ * The 12V supply pins can power external peripherals:
+   * r4/c1/n1: not present
+   * x1: 150mA
  * Some pins are 5V tolerant.  Those not marked as such in the pin
    option table are 3.3V only.
 
@@ -264,10 +268,11 @@ Pins: select
 A variety of asynchronous serial encoders and debugging facilities are
 supported.
 
-The moteus-n1 additionally has a hardware RS422 transceiver connected
-to aux1's pins D and E which can be enabled through configuration.
-RS485 devices like the CUI AMT21x can be used if the RS422 pin Y is
-connected to A and RS422 pin Z is connected to B.
+The moteus-n1 and moteus-x1 additionally have a hardware RS422
+transceiver connected to aux1's pins D and E which can be enabled
+through configuration.  RS485 devices like the CUI AMT21x can be used
+if the RS422 pin Y is connected to A and RS422 pin Z is connected to
+B.
 
 ### Pin Options ###
 
@@ -284,7 +289,7 @@ The following table shows which pins can be used for the unique capabilities:
 | I                | 5   | 2   | MISO | X           |     |             |      |     |
 | O                | 6   | 3   | MOSI | X           |     |             |      |     |
 
-| moteus n1/c1     | Con | AUX | SPI  | ADC/Sin/Cos | I2C | HW Quad/PWM | UART | 5VT |
+| moteus c1/n1/x1  | Con | AUX | SPI  | ADC/Sin/Cos | I2C | HW Quad/PWM | UART | 5VT |
 |------------------|-----|-----|------|-------------|-----|-------------|------|-----|
 | 5V (5)           | 1   |     |      |             |     |             |      |     |
 | 3.3V (3)         | 2   |     |      |             |     |             |      |     |
@@ -314,7 +319,7 @@ pullups are not available on moteus-c1 for aux1.
 | DBG 1            |     | 2   |      |             |     |             |      | X   |
 | DBG 2            |     | 3   |      |             |     |             |      | X   |
 
-| moteus n1/c1     | Con | AUX | SPI  | ADC/Sin/Cos | I2C | HW Quad/PWM | UART | 5VT |
+| moteus c1/n1/x1  | Con | AUX | SPI  | ADC/Sin/Cos | I2C | HW Quad/PWM | UART | 5VT |
 |------------------|-----|-----|------|-------------|-----|-------------|------|-----|
 | 5V (5)           | 1   |     |      |             |     |             |      |     |
 | 3.3V (3)         | 2   |     |      |             |     |             |      |     |
@@ -924,6 +929,21 @@ When in Position mode, shrink the integral term's windup limit by the
 given factor.  Integral types are applied as for PWM.  If unspecified,
 1.0 is used.
 
+#### 0x02c - Fixed current override ####
+
+Mode: Read/write
+
+If specified, then the control mode will temporarily be in the "fixed
+current" mode.  This is parallel to "fixed voltage" mode, but instead
+of a fixed voltage, a fixed D axis current is controlled.
+
+#### 0x02d - Ignore position bounds ####
+
+Mode: Read/write
+
+If specified and non-zero, `servopos.position_min` and
+`servopos.position_max` will be ignore.
+
 #### 0x030 - Proportional torque ####
 
 Mode: Read
@@ -1049,6 +1069,10 @@ A shadow of the 0x027 register.
 
 A shadow of the 0x02b register.
 
+#### 0x048 - Ignore position bounds ####
+
+A shadow of the 0x02d register.
+
 #### 0x050 - Encoder 0 Position ####
 
 Mode: Read only
@@ -1097,6 +1121,15 @@ Mode: Read only
 
 Returns a bitfield, where bit 0 indicates whether encoder 0 is active,
 bit 1 indicates whether encoder 1 is active, etc.
+
+| Bit | Value             |
+|-----|-------------------|
+| 0   | Source 0 Theta    |
+| 1   | Source 0 Velocity |
+| 2   | Source 1 Theta    |
+| 3   | Source 1 Velocity |
+| 4   | Source 2 Theta    |
+| 5   | Source 2 Velocity |
 
 #### 0x05c - Aux1 GPIO Command ####
 
@@ -1430,6 +1463,9 @@ Each optional element consists of a prefix character followed by a value.  Permi
   acceleration limit for the duration of this command.
 - `o` - fixed voltage override: while in affect, treat the control as
   if `fixed_voltage_mode` were enabled with the given voltage
+- `c` - fixed current override: while in affect, treat the control
+  like `fixed_voltage_mode`, but instead commanding a fixed current.
+- `b` - if non-zero, then ignore all `servopos` position bounds
 
 The position, velocity, maximum torque, and all optional fields have
 the same semantics as for the register protocol documented above.
@@ -1468,8 +1504,12 @@ d within <lowbound> <highbound> <max_torque> [options...]
 ```
 
 The fields have the same semantics as for the register protocol
-documented above.  The options are the same as for `d pos`, with the
-exception of stop position which is not supported.
+documented above.  The options are largely the same as for `d pos`.
+Unsupported options include:
+
+ * `s` - stop position
+ * `o` - fixed voltage override
+ * `c` - fixed current override
 
 ### `d brake` ###
 
@@ -1892,9 +1932,13 @@ torque is stopped.
 
 ## `servo.max_power_W` ##
 
-The controller will limit the output power to this value.  The value
-is defined relative to a PWM rate of 40kHz and is scaled linearly with
-respect to the PWM rate.
+If set, set the allowable maximum power to the lower of this and the
+factory board power profile.
+
+## `servo.override_board_max_power` ##
+
+If true, then `servo.max_power_W` is used as the power limit even if
+it is larger than the factory board power profile.
 
 ## `servo.pwm_rate_hz` ##
 
@@ -1925,10 +1969,12 @@ Torque begins to be limited when the motor temperature reaches this value.
 If the motor temperature reaches this value, a fault is triggered and
 all torque is stopped.
 
-## `servo.flux_brake_min_voltage` ##
+## `servo.flux_brake_margin_voltage` ##
 
-When the input voltage is above this value, the controller causes the
-motor to act as a "virtual resistor" with resistance
+Selects the flux braking point relative to the currently configured `servo.max_voltage`.  `flux braking point = max_voltage - flux_brake_margin_voltage`.
+
+When the input voltage is above the braking point, the controller
+causes the motor to act as a "virtual resistor" with resistance
 `servo.flux_brake_resistance_ohm`.  All extra energy is dumped into
 the D phase of the motor.  This can be used to handle excess
 regenerative energy if the input DC link is incapable of accepting
@@ -2430,7 +2476,31 @@ The current mechanical drawing for the controller can be found at:
 The current mechanical drawing for the qdd100 servo can be found at:
 [20200315-qdd100-mechanical.pdf](https://drive.google.com/file/d/1KUQyR853e2uw8WOVrQHaeskWYHGSm3nI/view?usp=sharing)
 
-## Electrical / Pinout ##
+## Power ##
+
+The allowable maximum power for each moteus controller depends upon
+the input voltage and PWM switching frequency.  The below table gives
+the maximum allowable power at `servo.pwm_rate_hz=30000`.
+
+| Name       | Peak power   |                | High input power |
+|------------|--------------|----------------|------------------|
+| moteus-r4  | <= 30V 900W  | linear derated | >= 38V 400W      |
+| moteus-c1  | <= 28V 250W  | linear derated | >= 41V 150W      |
+| moteus-n1  | <= 36V 2000W | linear derated | >= 44V 1000W     |
+
+For other values of `servo.pwm_rate_hz`, the allowable maximum power
+changes linearly with the PWM rate, so that at 15000, the maximum
+power is half of that in the above table and at 60000 it is double
+that.  Note however, that efficiency of the controller goes down
+significantly at higher PWM rates.
+
+The current power limit is reported in `servo_stats.max_power_W`.  The
+controller will attempt to limit output phase current so as to stay
+within this reported power limit in either direction, i.e. applying
+power or regenerating energy.
+
+
+## Pinout ##
 
 ### JST PH-3 CAN ###
 
@@ -2473,7 +2543,7 @@ Pin 1 is closest to the ABS label.  They are assigned as follows:
  - 3 - SDA
  - 4 - GND
 
-### moteus n1 - J3 - JST GH-6 ###
+### moteus n1/x1 - J3 - JST GH-6 ###
 
 RS422, configured by AUX1 D/E to USART and enabling RS422 on AUX1.
 
@@ -2484,7 +2554,7 @@ RS422, configured by AUX1 D/E to USART and enabling RS422 on AUX1.
  - 5 - Z
  - 6 - GND
 
-### moteus n1 - AUX1 - JST GH-8 ###
+### moteus n1/x1 - AUX1 - JST GH-8 ###
 
  - 1 - 5V
  - 2 - 3.3V
@@ -2495,7 +2565,7 @@ RS422, configured by AUX1 D/E to USART and enabling RS422 on AUX1.
  - 7 - E
  - 8 - GND
 
-### moteus n1/c1 - AUX2 - JST GH-7 ###
+### moteus c1/n1/x1 - AUX2 - JST GH-7 ###
 
  - 1 - 5V
  - 2 - 3.3V
@@ -2698,19 +2768,17 @@ Here's what you should know about the facilities moteus has to deal with this, a
 
 ### Flux braking ###
 
-The feature within moteus itself to deal with this is "flux braking".  The flux braking implementation will dissipate extra power in the windings of the motor when the bus voltage gets above a certain threshold.  This is controlled by the `servo.flux_brake_min_voltage` and `servo.flux_brake_resistance_ohm` parameters documented above.
+The feature within moteus itself to deal with this is "flux braking".  The flux braking implementation will dissipate extra power in the windings of the motor when the bus voltage gets above a certain threshold.  This is controlled by the `servo.flux_brake_margin_voltage` and `servo.flux_brake_resistance_ohm` parameters documented above.
 
 ### Design considerations for regenerative braking ###
 
 The following design considerations can be used to minimize the risk of damage to hardware in the event of overvoltage.  These are not a substitute for validation in progressively more demanding situations, but they can help you start off in a good place.
 
-- *Configure Flux Braking*: To have optimal effect, the flux braking minimum voltage should be approximately only 1.5V above the maximum voltage you expect your supply to provide.  Additionally, the resistance may need to be lowered.  When adjusting the resistance, it is wise to test for stability by gradually increasing the voltage with the drivers engaged using a programmable supply and monitoring for instability in the voltage bus.  This can be identified either with an oscilloscope or audibly.  The default values are set to provide a baseline of protection without compromising the maximum voltage rating of the controller, but more aggressive parameters can be useful when your system voltage is lower and you are able to validate stability.
+- *Tightly scope the over-voltage fault / flux braking*: The configuration parameter `servo.max_voltage` can be lowered for all devices on the bus.  This will both cause a fault if the voltage exceeds this value and in conjuction with `servo.flux_brake_margin_voltage`, select the point at which moteus will attempt to dissipate energy to prevent an overvoltage scenario.  It is recommended to set this to no less than 5V above the maximum expected supply voltage.
 
 - *Power from a battery, not a PSU*: When not charged, batteries are capable of sinking current to minimize over-voltage transients.  However, if the battery is fully charged, most battery management systems drastically reduce the allowable charging current.  Thus, a battery is only useful as a mitigation if it is never charged above say 75 or 80% state of charge.
 
 - *Decrease overall system voltage*: If you run the moteus controller with say a 10S battery, the peak input voltage can be as high as 42V.  That does not leave very much margin for regenerative loads.  For applications that experience sharp regenerative loads and do not have a battery capable of charging always attached, it is recommended not to exceed 8S (33.6V peak).
-
-- *Lower the over-voltage fault*: The configuration parameter `servo.max_voltage` can be lowered for all devices on the bus.  If set above the highest expected transient, this can reduce the likelihood of severe transients causing damage.
 
 - *Use a supply which can sink as well as source*: Powering from an inexpensive lab supply is the most dangerous, as they typically have no ability to sink current, only source it.  A "two quadrant" supply is the necessary device.
 

@@ -210,7 +210,6 @@ enum Register : uint16_t {
   kAux2Pwm4 = 0x07e,
   kAux2Pwm5 = 0x07f,  
 
-
   kRegisterMapVersion = 0x102,
   kSerialNumber = 0x120,
   kSerialNumber1 = 0x120,

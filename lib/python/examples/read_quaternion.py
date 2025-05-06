@@ -1,20 +1,5 @@
 #!/usr/bin/python3 -B
 
-# Copyright 2023 mjbots Robotic Systems, LLC.  info@mjbots.com
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
-
 """
 This example reads the quaternion values from a LSM6DSV16X IMU connected
 to the Aux2 port of a moteus controller with ID #1.
@@ -34,7 +19,7 @@ def float16_to_float32(value):
     sign = (value & 0x8000) >> 15
     exponent = (value & 0x7C00) >> 10
     mantissa = value & 0x03FF
-    
+
     # Handle special cases
     if exponent == 0:
         if mantissa == 0:
@@ -47,7 +32,7 @@ def float16_to_float32(value):
             return float('-inf') if sign else float('inf')
         else:
             return float('nan')
-    
+
     # Normalized number
     result = (-1.0 if sign else 1.0) * (1.0 + mantissa / 1024.0) * (2.0 ** (exponent - 15))
     return result
@@ -61,11 +46,11 @@ async def main():
                       help='Which quaternion component to query (to diagnose I2C issues)')
     moteus.make_transport_args(parser)
     args = parser.parse_args()
-    
+
     # Create a query resolution that specifies which quaternion registers to read
     qr = moteus.QueryResolution()
     qr._extra = {}
-    
+
     # Configure which components to query based on command-line options
     if args.component == 'x':
         qr._extra[0x072] = INT16  # Register.AUX2_QUATERNIONX
@@ -98,7 +83,7 @@ async def main():
             quat_x = result.values.get(0x072, 0) if args.component in ['all', 'x'] else 0
             quat_y = result.values.get(0x073, 0) if args.component in ['all', 'y'] else 0
             quat_z = result.values.get(0x074, 0) if args.component in ['all', 'z'] else 0
-            
+
             # Extract the absolute position value
             abs_pos = result.values.get(0x006, 0.0)
 
@@ -114,7 +99,7 @@ async def main():
             x = float16_to_float32(quat_x) if args.component in ['all', 'x'] else 0.0
             y = float16_to_float32(quat_y) if args.component in ['all', 'y'] else 0.0
             z = float16_to_float32(quat_z) if args.component in ['all', 'z'] else 0.0
-            
+
             # Print the individual components
             if args.component in ['all', 'x']:
                 print(f"Converted X: {x:.6f}")
@@ -128,7 +113,7 @@ async def main():
                 # Check if the quaternion is valid (w² + x² + y² + z² = 1)
                 square_sum = x*x + y*y + z*z
                 print(f"Sum of squares (x² + y² + z²): {square_sum:.6f}")
-                
+
                 # Make sure the value inside sqrt is not negative
                 w_squared = 1.0 - square_sum
                 if w_squared < 0:
@@ -138,20 +123,20 @@ async def main():
                     # Calculate w component: In a proper quaternion, x² + y² + z² + w² = 1
                     # So w = sqrt(1 - (x² + y² + z²))
                     w = math.sqrt(w_squared)
-                
+
                 # The LSM6DSV16X "Game Rotation Vector" outputs quaternion in the order (x,y,z)
                 # with w calculated as above. For consistency with typical quaternion notation,
                 # print in the order (w,x,y,z).
                 print(f"Quaternion: [{w:.4f}, {x:.4f}, {y:.4f}, {z:.4f}]")
                 print("")
-            
+
             # Print the absolute position
             print(f"Absolute Position (Aux1 SPI): {abs_pos:.4f} revolutions")
             print("")
-            
+
             # Wait before the next reading
             await asyncio.sleep(0.1)
-            
+
     except KeyboardInterrupt:
         print("\nExiting...")
 

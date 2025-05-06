@@ -28,6 +28,11 @@ class PythonCan:
         global can
         if not can:
             import can
+            try:
+                can.rc = can.util.load_config()
+            except can.CanInterfaceNotImplementedError as e:
+                if 'Unknown interface type "None"' not in str(e):
+                    raise
 
         # We provide some defaults if they are not already
         # provided... this makes it more likely to just work out of
@@ -44,6 +49,16 @@ class PythonCan:
         if 'disable_brs' in kwargs:
             self._disable_brs = kwargs['disable_brs']
             del kwargs['disable_brs']
+
+        if ('timing' not in kwargs and
+            kwargs.get('interface', can.rc['interface']) == 'pcan'):
+            # We default to the timing that works with moteus and assume
+            # an 80MHz base clock, which seems pretty typical for PCAN
+            # interfaces.
+            kwargs['timing'] = can.BitTimingFd.from_sample_point(
+                nom_bitrate=1000000, data_bitrate=5000000,
+                nom_sample_point=66, data_sample_point=66,
+                f_clock=80000000)
 
         self._can = can.Bus(*args, **kwargs)
         self._setup = False

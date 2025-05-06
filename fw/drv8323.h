@@ -70,6 +70,14 @@ class Drv8323 : public MotorDriver {
 
   void PollMillisecond();
 
+  // The maximum voltage that can be observed at the sense resistor
+  // while remaining within the range of the device (and its
+  // configured gains).
+  float max_sense_V() override;
+
+  // The current configured sense amplifier gain.
+  float i_gain() override;
+
   struct Status {
     // Fault Status Register 1
     bool fault = false;
@@ -203,6 +211,7 @@ class Drv8323 : public MotorDriver {
           100) :
         g_measured_hw_family == 1 ? 150 :
         g_measured_hw_family == 2 ? 80 :
+        g_measured_hw_family == 3 ? 300 :
         invalid_int();
     uint16_t idriven_hs_ma =
         g_measured_hw_family == 0 ?
@@ -211,6 +220,7 @@ class Drv8323 : public MotorDriver {
           200) :
         g_measured_hw_family == 1 ? 300 :
         g_measured_hw_family == 2 ? 60 :
+        g_measured_hw_family == 3 ? 200 :
         invalid_int();
 
 
@@ -224,6 +234,7 @@ class Drv8323 : public MotorDriver {
           100) :
         g_measured_hw_family == 1 ? 150 :
         g_measured_hw_family == 2 ? 60 :
+        g_measured_hw_family == 3 ? 850 :
         invalid_int();
     uint16_t idriven_ls_ma =
         g_measured_hw_family == 0 ?
@@ -232,6 +243,7 @@ class Drv8323 : public MotorDriver {
           200) :
         g_measured_hw_family == 1 ? 300 :
         g_measured_hw_family == 2 ? 20 :
+        g_measured_hw_family == 3 ? 600 :
         invalid_int();
 
 
@@ -244,6 +256,7 @@ class Drv8323 : public MotorDriver {
           50) :
         g_measured_hw_family == 1 ? 50 :
         g_measured_hw_family == 2 ? 50 :
+        g_measured_hw_family == 3 ? 50 :
         invalid_int();
     OcpMode ocp_mode = OcpMode::kLatchedFault;
     uint8_t ocp_deg_us = 4;  // valid options of 2, 4, 6, 8
@@ -258,6 +271,7 @@ class Drv8323 : public MotorDriver {
           700) :
         g_measured_hw_family == 1 ? 700 :
         g_measured_hw_family == 2 ? 700 :
+        g_measured_hw_family == 3 ? 700 :
         invalid_int();
 
 

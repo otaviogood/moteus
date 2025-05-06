@@ -127,6 +127,10 @@ FamilyAndVersion DetectMoteusFamily(MillisecondTimer* timer) {
     // PB10 and PB11 being floating.
     if (family_code == 0x02) {
       result.family = 2;
+    } else if (family_code == 0x01) {
+      // Family 3 boards can be identified by the external pull down
+      // on PB11 and PB10 being floating.
+      result.family = 3;
     } else if (family_code == 0x03) {
       // If both are floating, then we are family 0 or 1.
 
@@ -206,7 +210,7 @@ FamilyAndVersion DetectMoteusFamily(MillisecondTimer* timer) {
           return -1;
         }();
     result.hw_version = measured_hw_rev;
-  } else if (result.family == 1 || result.family == 2) {
+  } else if (result.family == 1 || result.family == 2 || result.family == 3) {
     __HAL_RCC_ADC12_CLK_ENABLE();
 
     DisableAdc(ADC2);
@@ -242,6 +246,8 @@ FamilyAndVersion DetectMoteusFamily(MillisecondTimer* timer) {
       }
     } else if (result.family == 2) {
       // We don't have any uniformly specified versions yet.
+      result.hw_version = 0;
+    } else if (result.family == 3) {
       result.hw_version = 0;
     }
   } else {
@@ -300,7 +306,6 @@ MoteusHwPins FindHardwarePins(FamilyAndVersion fv) {
       result.otavio_pin = PC_11; // I2C_SDA pin on side of board
     } else {
       result.debug_led1 = PF_0;  // red
-      // result.debug_led2 = PC_13;  // yellow
       result.power_led = PF_1;  // green
       // result.otavio_pin = PC_11; // I2C_SDA pin on side of board
     }
@@ -321,7 +326,13 @@ MoteusHwPins FindHardwarePins(FamilyAndVersion fv) {
 
     result.debug1 = PC_14;
     result.debug2 = PC_15;
-  } else if (fv.family == 1 || fv.family == 2) {
+
+    result.power_P_l_W = 900.0f;
+    result.power_V_l = 30.0f;
+
+    result.power_P_h_W = 400.0f;
+    result.power_V_h = 38.0f;
+  } else if (fv.family == 1 || fv.family == 2 || fv.family == 3) {
     result.drv8323_enable = PC_14;
     result.drv8323_hiz = PC_15;
     result.drv8323_cs = PB_0;
@@ -357,6 +368,34 @@ MoteusHwPins FindHardwarePins(FamilyAndVersion fv) {
 
     result.debug1 = NC;
     result.debug2 = NC;
+
+    if (fv.family == 1) {
+      // moteus-n1
+
+      result.power_P_l_W = 2000.0f;
+      result.power_V_l = 36.0f;
+
+      result.power_P_h_W = 1000.0f;
+      result.power_V_h = 44.0f;
+    } else if (fv.family == 2) {
+      // moteus-c1
+
+      result.power_P_l_W = 250.0f;
+      result.power_V_l = 28.0f;
+
+      result.power_P_h_W = 150.0f;
+      result.power_V_h = 41.0f;
+    } else if (fv.family == 3) {
+      // moteus-x1
+
+      result.power_P_l_W = 2000.0f;
+      result.power_V_l = 36.0f;
+
+      result.power_P_h_W = 1000.0f;
+      result.power_V_h = 44.0f;
+    } else {
+      MJ_ASSERT(false);
+    }
   } else {
     MJ_ASSERT(false);
   }

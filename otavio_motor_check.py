@@ -22,7 +22,7 @@ def float16_to_float32(value):
     sign = (value & 0x8000) >> 15
     exponent = (value & 0x7C00) >> 10
     mantissa = value & 0x03FF
-    
+
     # Handle special cases
     if exponent == 0:
         if mantissa == 0:
@@ -35,7 +35,7 @@ def float16_to_float32(value):
             return float('-inf') if sign else float('inf')
         else:
             return float('nan')
-    
+
     # Normalized number
     result = (-1.0 if sign else 1.0) * (1.0 + mantissa / 1024.0) * (2.0 ** (exponent - 15))
     return result
@@ -45,9 +45,10 @@ async def main():
     import argparse
     parser = argparse.ArgumentParser(description='Health check for moteus controller')
     parser.add_argument('--target', type=int, default=1, help='ID of the target controller')
+    parser.add_argument('--nomotor', action='store_true', help='Skip motor related checks for sensor boards with no motor driver')
     moteus.make_transport_args(parser)
     args = parser.parse_args()
-    
+
     # Create a query resolution that specifies which registers to read
     qr = moteus.QueryResolution()
     qr._extra = {
@@ -55,10 +56,10 @@ async def main():
         0x072: INT16,  # Register.AUX2_QUATERNIONX
         0x073: INT16,  # Register.AUX2_QUATERNIONY
         0x074: INT16,  # Register.AUX2_QUATERNIONZ
-        
+
         # Encoder position (position source 0)
         0x050: F32,    # Register.ENCODER_0_POSITION
-        
+
         # Temperatures
         0x00e: F32,    # Register.TEMPERATURE (FET/board temperature)
         0x00a: F32,    # Register.MOTOR_TEMPERATURE
@@ -69,40 +70,40 @@ async def main():
     controller = moteus.Controller(id=args.target, query_resolution=qr, transport=transport)
 
     print(f"Performing health check on moteus controller (ID: {args.target})...")
-    
+
     # Query the controller for the registers
     result = await controller.query()
-    
+
     all_passed = True
-    
+
     # Check quaternion values
     quat_x = result.values.get(0x072, 0)
     quat_y = result.values.get(0x073, 0)
     quat_z = result.values.get(0x074, 0)
-    
+
     # Convert from int16 to float16
     x = float16_to_float32(quat_x)
     y = float16_to_float32(quat_y)
     z = float16_to_float32(quat_z)
-    
+
     # Calculate the magnitude of the quaternion components
     quat_magnitude = math.sqrt(x*x + y*y + z*z)
-    
+
     print(f"Quaternion X: {x:.6f}")
     print(f"Quaternion Y: {y:.6f}")
     print(f"Quaternion Z: {z:.6f}")
     print(f"Quaternion magnitude: {quat_magnitude:.6f}")
-    
+
     if quat_magnitude == 0:
         print("ERROR: Quaternion values are all zero!")
         all_passed = False
     else:
         print("PASS: Quaternion values are non-zero.")
-    
+
     # Check encoder value
     encoder_pos = result.values.get(0x050, float('nan'))
     print(f"Encoder position: {encoder_pos:.6f} revolutions")
-    
+
     if math.isnan(encoder_pos):
         print("ERROR: Encoder position reading not available!")
         all_passed = False
@@ -112,34 +113,35 @@ async def main():
     else:
         print("PASS: Encoder position is non-zero.")
 
-    # Check FET temperature
-    fet_temp = result.values.get(0x00e, float('nan'))
+    if not args.nomotor:
+        # Check FET temperature
+        fet_temp = result.values.get(0x00e, float('nan'))
 
-    if math.isnan(fet_temp):
-        print("ERROR: FET temperature reading not available!")
-        all_passed = False
-    else:
-        print(f"FET temperature: {fet_temp:.1f}°C")
-        if 20.0 <= fet_temp <= 40.0:
-            print("PASS: FET temperature is within normal range (20-40°C).")
-        else:
-            print(f"ERROR: FET temperature {fet_temp:.1f}°C is outside normal range (20-40°C)!")
+        if math.isnan(fet_temp):
+            print("ERROR: FET temperature reading not available!")
             all_passed = False
-    
-    # Check motor temperature
-    motor_temp = result.values.get(0x00a, float('nan'))
-    
-    if math.isnan(motor_temp):
-        print("ERROR: Motor temperature reading not available! Make sure thermistor is connected and configured.")
-        all_passed = False
-    else:
-        print(f"Motor temperature: {motor_temp:.1f}°C")
-        if 20.0 <= motor_temp <= 40.0:
-            print("PASS: Motor temperature is within normal range (20-40°C).")
         else:
-            print(f"ERROR: Motor temperature {motor_temp:.1f}°C is outside normal range (20-40°C)!")
+            print(f"FET temperature: {fet_temp:.1f}°C")
+            if 18.0 <= fet_temp <= 34.0:
+                print("PASS: FET temperature is within normal range (18-34°C).")
+            else:
+                print(f"ERROR: FET temperature {fet_temp:.1f}°C is outside normal range (18-34°C)!")
+                all_passed = False
+
+        # Check motor temperature
+        motor_temp = result.values.get(0x00a, float('nan'))
+
+        if math.isnan(motor_temp):
+            print("ERROR: Motor temperature reading not available! Make sure thermistor is connected and configured.")
             all_passed = False
-    
+        else:
+            print(f"Motor temperature: {motor_temp:.1f}°C")
+            if 18.0 <= motor_temp <= 34.0:
+                print("PASS: Motor temperature is within normal range (18-34°C).")
+            else:
+                print(f"ERROR: Motor temperature {motor_temp:.1f}°C is outside normal range (18-34°C)!")
+                all_passed = False
+
     # Overall status
     print("\nOverall health check:")
     if all_passed:

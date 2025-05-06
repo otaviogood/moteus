@@ -289,7 +289,7 @@ int main(void) {
 
         FDCan::Filter filters[1] = {};
         filters[0].id1 = can_config.prefix << 16;
-        filters[0].id2 = 0x1fff0000u;
+        filters[0].id2 = 0x1fff8000u;
         filters[0].mode = FDCan::FilterMode::kMask;
         filters[0].action = FDCan::FilterAction::kAccept;
         filters[0].type = FDCan::FilterType::kExtended;

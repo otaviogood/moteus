@@ -100,7 +100,13 @@ class FDCanMicroServer : public mjlib::multiplex::MicroDatagramServer {
     // wasn't working.
 
     current_read_header_->destination = fdcan_header_.Identifier & 0xff;
-    current_read_header_->source = (fdcan_header_.Identifier >> 8) & 0xff;
+    if (current_read_header_->destination == 0) {
+      // 0 on the CAN bus corresponds to broadcast.  The multiplex layer
+      // uses 0x7f, so translate here so the higher layers see the expected
+      // value and will generate a response.
+      current_read_header_->destination = 0x7f;
+    }
+     current_read_header_->source = (fdcan_header_.Identifier >> 8) & 0xff;
     current_read_header_->size = FDCan::ParseDlc(fdcan_header_.DataLength);
     current_read_header_->flags = 0
         | ((fdcan_header_.BitRateSwitch == FDCAN_BRS_ON) ? kBrsFlag : 0)

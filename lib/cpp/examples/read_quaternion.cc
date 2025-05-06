@@ -1,16 +1,4 @@
 // Copyright 2023 mjbots Robotic Systems, LLC.  info@mjbots.com
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
 
 #include <iostream>
 #include <cmath>
@@ -27,7 +15,7 @@ float float16_to_float32(uint16_t value) {
   const int sign = ((value & 0x8000) >> 15);
   const int exponent = ((value & 0x7C00) >> 10);
   const int mantissa = (value & 0x03FF);
-  
+
   // Handle special cases
   if (exponent == 0) {
     // Subnormal or zero
@@ -53,7 +41,7 @@ float float16_to_float32(uint16_t value) {
 int main(int argc, char** argv) {
   // Process command line arguments
   Controller::DefaultArgProcess(argc, argv);
-  
+
   // Create a controller, default to ID 1
   Controller c;
 
@@ -68,7 +56,7 @@ int main(int argc, char** argv) {
   qf.voltage = Resolution::kIgnore;
   qf.temperature = Resolution::kIgnore;
   qf.fault = Resolution::kIgnore;
-  
+
   // Set up the quaternion values to query
   qf.extra[0].register_number = Register::kAux2QuaternionX;
   qf.extra[0].resolution = Resolution::kInt16;
@@ -76,26 +64,26 @@ int main(int argc, char** argv) {
   qf.extra[1].resolution = Resolution::kInt16;
   qf.extra[2].register_number = Register::kAux2QuaternionZ;
   qf.extra[2].resolution = Resolution::kInt16;
-  
+
   std::cout << "Reading quaternion values from LSM6DSV16X IMU on Aux2. Press Ctrl+C to exit." << std::endl;
   std::cout << std::endl;
-  
+
   try {
     while (true) {
       // Query the controller
       auto maybe_result = c.ReadQuaternion();
-      
+
       if (!maybe_result) {
         std::cerr << "Failed to get quaternion data" << std::endl;
         continue;
       }
-      
+
       // Extract the quaternion values
       const auto& values = maybe_result->values;
-      
+
       // Find the quaternion values in the result
       int16_t quat_x = 0, quat_y = 0, quat_z = 0;
-      
+
       for (int i = 0; i < Query::kMaxExtra; i++) {
         const auto& value = values.extra[i];
         if (value.register_number == Register::kAux2QuaternionX) {
@@ -106,23 +94,23 @@ int main(int argc, char** argv) {
           quat_z = static_cast<int16_t>(value.value);
         }
       }
-      
+
       // Convert to float16
       float x = float16_to_float32(quat_x);
       float y = float16_to_float32(quat_y);
       float z = float16_to_float32(quat_z);
-      
+
       // Calculate w component: In a proper quaternion, x² + y² + z² + w² = 1
       // So w = sqrt(1 - (x² + y² + z²))
       float w = std::sqrt(1.0f - (x*x + y*y + z*z));
-      
+
       // Display the quaternion values
       std::cout << "Quaternion: [" 
                 << w << ", " 
                 << x << ", " 
                 << y << ", " 
                 << z << "]" << std::endl;
-      
+
       // Sleep for a bit
       std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
@@ -130,6 +118,6 @@ int main(int argc, char** argv) {
     std::cerr << "Error: " << e.what() << std::endl;
     return 1;
   }
-  
+
   return 0;
-} 
+}
