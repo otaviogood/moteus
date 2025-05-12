@@ -1428,8 +1428,6 @@ class Stream:
     async def calibrate_encoder_mapping_absolute(
             self, encoder_cal_voltage, encoder_cal_current, current_noise,
             unwrapped_position_scale):
-        await self.ensure_valid_theta(encoder_cal_voltage)
-
         current_quality_factor = encoder_cal_current / current_noise
         use_current_for_quality = (
             current_quality_factor > CURRENT_QUALITY_MIN or
@@ -1437,23 +1435,30 @@ class Stream:
         use_current_for_firmware_version = self.firmware.version >= 0x010a
 
         use_current_calibration = (
-            use_current_for_quality and use_current_for_firmware_version)
+            not self.args.cal_never_encoder_current_mode and (
+                use_current_for_quality and use_current_for_firmware_version))
 
         if use_current_for_firmware_version and not use_current_for_quality:
             print(f"Using voltage mode calibration, current quality factor {current_quality_factor:.1f} < {CURRENT_QUALITY_MIN:.1f}")
-
 
         old_motor_poles = None
 
         if use_current_calibration:
             old_motor_poles = await self.read_config_int("motor.poles")
             await self.command("conf set motor.poles 2")
+
+            # We have to check for a valid there here, because setting
+            # the motor pole count will invalidate it.
+            await self.ensure_valid_theta(encoder_cal_voltage)
+
             await self.command(f"d pos nan 0 nan c{encoder_cal_current} b1")
             await asyncio.sleep(3.0)
 
             await self.write_message(
                 (f"d cali i{encoder_cal_current} s{self.args.cal_ll_encoder_speed * unwrapped_position_scale}"))
         else:
+            await self.ensure_valid_theta(encoder_cal_voltage)
+
             await self.command(f"d pwm 0 {encoder_cal_voltage}")
             await asyncio.sleep(3.0)
 
@@ -1717,6 +1722,10 @@ class Stream:
                     # current on low resistance / low inductance motors.
                     break
             await self.command("d stop")
+
+            # Give a little bit of wait in case we had an error that
+            # the above stop should clear.
+            await asyncio.sleep(0.1)
         except moteus.CommandError as e:
             # It is possible this is an old firmware that does not
             # support inductance measurement.
@@ -1831,7 +1840,7 @@ class Stream:
 
         return kp, ki, w_3db / twopi
 
-    async def find_speed(self, voltage, sleep_time=0.5):
+    async def find_speed(self, voltage, unwrapped_position_scale, sleep_time=0.5):
         assert voltage < 20.0
         assert voltage >= 0.0
 
@@ -1864,7 +1873,7 @@ class Stream:
             if len(power_samples) > AVERAGE_COUNT:
                 del power_samples[0]
 
-            velocity_samples.append(data.velocity)
+            velocity_samples.append(data.velocity / unwrapped_position_scale)
 
             if len(velocity_samples) > (3 * AVERAGE_COUNT):
                 del velocity_samples[0]
@@ -1909,8 +1918,8 @@ class Stream:
 
         return velocity
 
-    async def find_speed_and_print(self, voltage, **kwargs):
-        result = await self.find_speed(voltage, **kwargs)
+    async def find_speed_and_print(self, voltage, unwrapped_position_scale, **kwargs):
+        result = await self.find_speed(voltage, unwrapped_position_scale, **kwargs)
         print(f"{voltage:.3f}V - {result:.3f}Hz")
         return result
 
@@ -1930,7 +1939,7 @@ class Stream:
             if maybe_result > (0.2 * input_V):
                 return maybe_result
 
-            this_speed = await self.find_speed(maybe_result) / unwrapped_position_scale
+            this_speed = await self.find_speed(maybe_result, unwrapped_position_scale)
 
             if (abs(this_speed) > (0.1 * self.args.cal_motor_speed) and
                 first_nonzero_speed_voltage is None):
@@ -1968,7 +1977,8 @@ class Stream:
             voltages = [x * kv_cal_voltage for x in [
                 0.0, 0.25, 0.5, 0.75, 1.0 ]]
             voltage_speed_hzs = list(zip(
-                voltages, [ await self.find_speed_and_print(voltage, sleep_time=2)
+                voltages, [ await self.find_speed_and_print(
+                    voltage, unwrapped_position_scale, sleep_time=2)
                             for voltage in voltages]))
 
             await self.stop_and_idle()
@@ -1986,12 +1996,10 @@ class Stream:
             voltage_speed_hzs = [(v, s) for v, s in voltage_speed_hzs
                                  if abs(s) > speed_threshold]
 
-            geared_v_per_hz = 1.0 / _calculate_slope(
+            v_per_hz = 1.0 / _calculate_slope(
                 [x[0] for x in voltage_speed_hzs],
                 [x[1] for x in voltage_speed_hzs])
 
-            v_per_hz = (geared_v_per_hz *
-                        unwrapped_position_scale)
             if self.firmware.version <= 0x0106:
                 v_per_hz *= motor_output_sign
 
@@ -2338,6 +2346,8 @@ async def async_main():
                         help='write raw calibration data')
     parser.add_argument('--cal-force-encoder-current-mode', action='store_true',
                         help='always use encoder current mode calibration if supported')
+    parser.add_argument('--cal-never-encoder-current-mode', action='store_true',
+                        help='never use current mode calibration')
 
     args = parser.parse_args()
 
