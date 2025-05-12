@@ -1202,6 +1202,26 @@ WARNING: Changing the speed affects all processes driven by the
 microcontroller, including CAN communication.  Thus setting this to a
 non-zero value may prevent future CAN communications.
 
+#### 0x072 - Aux2 Quaternion X ####
+
+Mode: Read only
+
+The X component of the quaternion from the LSM6DSV16X IMU on Aux2. This value is stored as an INT16 that represents a float16 (IEEE 754 half-precision) format. When used with a proper IMU configuration, this provides orientation data of the controller.
+
+#### 0x073 - Aux2 Quaternion Y ####
+
+Mode: Read only
+
+The Y component of the quaternion from the LSM6DSV16X IMU on Aux2. This value is stored as an INT16 that represents a float16 (IEEE 754 half-precision) format.
+
+#### 0x074 - Aux2 Quaternion Z ####
+
+Mode: Read only
+
+The Z component of the quaternion from the LSM6DSV16X IMU on Aux2. This value is stored as an INT16 that represents a float16 (IEEE 754 half-precision) format.
+
+Note: To calculate the W component of the quaternion, use the formula: W = sqrt(1 - (X² + Y² + Z²)). The quaternion represents the rotation of the controller in 3D space, with components in the order [W, X, Y, Z].
+
 #### 0x076/0x07a - Aux1 PWM Outputs ####
 
 Mode: Read/write
