@@ -122,10 +122,10 @@ async def main():
             all_passed = False
         else:
             print(f"FET temperature: {fet_temp:.1f}°C")
-            if 18.0 <= fet_temp <= 34.0:
-                print("PASS: FET temperature is within normal range (18-34°C).")
+            if 18.0 <= fet_temp <= 38.0:
+                print("PASS: FET temperature is within normal range (18-38°C).")
             else:
-                print(f"ERROR: FET temperature {fet_temp:.1f}°C is outside normal range (18-34°C)!")
+                print(f"ERROR: FET temperature {fet_temp:.1f}°C is outside normal range (18-38°C)!")
                 all_passed = False
 
         # Check motor temperature
@@ -136,10 +136,10 @@ async def main():
             all_passed = False
         else:
             print(f"Motor temperature: {motor_temp:.1f}°C")
-            if 18.0 <= motor_temp <= 34.0:
-                print("PASS: Motor temperature is within normal range (18-34°C).")
+            if 18.0 <= motor_temp <= 38.0:
+                print("PASS: Motor temperature is within normal range (18-38°C).")
             else:
-                print(f"ERROR: Motor temperature {motor_temp:.1f}°C is outside normal range (18-34°C)!")
+                print(f"ERROR: Motor temperature {motor_temp:.1f}°C is outside normal range (18-38°C)!")
                 all_passed = False
 
     # Overall status

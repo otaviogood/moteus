@@ -854,6 +854,9 @@ class MoteusController::Impl : public multiplex::MicroServer::Server {
       multiplex::MicroServer::Register reg,
       size_t type) const override
       __attribute__ ((optimize("O3"))) {
+    
+    // Clear any cached values at the start of a new read
+    quaternion_cache_valid_ = false;
 
     if (discard_all_) {
       // report unknown register for anything else
@@ -1066,7 +1069,7 @@ class MoteusController::Impl : public multiplex::MicroServer::Server {
             ((status.sources[0].active_velocity ? 1 : 0) << 1) |
             ((status.sources[1].active_theta ? 1 : 0) << 2) |
             ((status.sources[1].active_velocity ? 1 : 0) << 3) |
-            ((status.sources[2].active_theta ? 1 : 0) << 4);
+            ((status.sources[2].active_theta ? 1 : 0) << 4) |
             ((status.sources[2].active_velocity ? 1 : 0) << 5);
         return IntMapping(validity, type);
       }
@@ -1135,17 +1138,29 @@ class MoteusController::Impl : public multiplex::MicroServer::Server {
       }
 
       case Register::kAux2QuaternionX: {
-        auto* status = const_cast<AuxPort&>(aux2_port_).status();
-        // Do this as a *signed* int, so things don't get cast wrong and mess up the CAN comms
-        return Value(static_cast<int16_t>(status->i2c.devices[0].quat_x));
+        // For any quaternion read, get all values atomically
+        // The cache is valid for all component reads within a single CAN frame request
+        if (!quaternion_cache_valid_) {
+          quaternion_cache_ = ReadQuaternionAtomic();
+          quaternion_cache_valid_ = true;
+        }
+        return quaternion_cache_.x;
       }
       case Register::kAux2QuaternionY: {
-        auto* status = const_cast<AuxPort&>(aux2_port_).status();
-        return Value(static_cast<int16_t>(status->i2c.devices[0].quat_y));
+        // Reuse cached value if another quaternion component was already read in this frame
+        if (!quaternion_cache_valid_) {
+          quaternion_cache_ = ReadQuaternionAtomic();
+          quaternion_cache_valid_ = true;
+        }
+        return quaternion_cache_.y;
       }
       case Register::kAux2QuaternionZ: {
-        auto* status = const_cast<AuxPort&>(aux2_port_).status();
-        return Value(static_cast<int16_t>(status->i2c.devices[0].quat_z));
+        // Reuse cached value if another quaternion component was already read in this frame
+        if (!quaternion_cache_valid_) {
+          quaternion_cache_ = ReadQuaternionAtomic();
+          quaternion_cache_valid_ = true;
+        }
+        return quaternion_cache_.z;
       }
 
       case Register::kModelNumber: {
@@ -1225,6 +1240,34 @@ class MoteusController::Impl : public multiplex::MicroServer::Server {
   bool command_valid_ = false;
   bool discard_all_ = false;
   BldcServo::CommandData command_;
+
+  struct QuaternionValues {
+    Value x;
+    Value y;
+    Value z;
+  };
+
+  // Cache for atomic quaternion reads
+  // This cache is valid only within a single Read method call (one CAN frame)
+  // and is automatically invalidated at the start of each new Read
+  mutable QuaternionValues quaternion_cache_;
+  mutable bool quaternion_cache_valid_ = false;
+
+  QuaternionValues ReadQuaternionAtomic() const {
+    QuaternionValues result;
+    
+    __disable_irq();  // Disable interrupts to ensure atomic reads
+    auto* status = const_cast<AuxPort&>(aux2_port_).status();
+    
+    // The LSM6DSV16X provides quaternion values in float16 format
+    // We use signed int16_t casting to ensure proper interpretation of the data
+    result.x = Value(static_cast<int16_t>(status->i2c.devices[0].quat_x));
+    result.y = Value(static_cast<int16_t>(status->i2c.devices[0].quat_y));
+    result.z = Value(static_cast<int16_t>(status->i2c.devices[0].quat_z));
+    
+    __enable_irq();  // Re-enable interrupts
+    return result;
+  }
 };
 
 MoteusController::MoteusController(micro::Pool* pool,

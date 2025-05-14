@@ -508,6 +508,51 @@ be set to NOP (0x50).
 
 *0x50* - no operation
 
+#### A.1.f Tunneled Stream ####
+
+These subframes are used for sending and receiving arbitrary data streams, typically ASCII commands and responses, over a logical channel. This is the mechanism used by the diagnostic command set. The channel number and length fields are defined as `varuint` in the protocol, allowing for variable-length encoding. However, for typical tunnel stream usage, these values are small and are usually transmitted as single bytes (which is a valid single-byte `varuint` representation if the value is < 128).
+
+***0x40 kClientToServer*** - Client sends data to server
+
+Structure:
+- `0x40` - Subframe ID (1 byte).
+- `varuint` => channel number. Typically a small integer like 1, 2, or 3, sent as a single byte (e.g., `0x01` for channel 1).
+- `varuint` => number of bytes in the data payload. For a single CAN frame segment, this is also typically a small value (e.g., up to ~60 bytes for the payload), sent as a single byte.
+- N x `uint8` => data payload. This is the raw data, like an ASCII command string. If newlines (e.g., `\r\n`) are part of the command, they are included here and counted in the "number of bytes" field.
+
+This subframe is used by the host system (client) to send data to the moteus controller (server) over a specific logical channel.
+
+Example: Sending the command `"conf write\r\n"` (12 bytes: 'c','o','n','f',' ','w','r','i','t','e','\r','\n') to channel 1.
+The CAN data payload (excluding CAN ID and other CAN-level headers) would look like:
+`[0x40, 0x01, 0x0C, 0x63, 0x6F, 0x6E, 0x66, 0x20, 0x77, 0x72, 0x69, 0x74, 0x65, 0x0D, 0x0A]`
+(Where `0x0C` is 12, `0x63` is 'c', ..., `0x0D` is CR, `0x0A` is LF).
+
+***0x41 kServerToClient*** - Server sends data to client
+
+Structure:
+- `0x41` - Subframe ID (1 byte).
+- `varuint` => channel number (typically a single byte).
+- `varuint` => number of bytes in the data payload (typically a single byte).
+- N x `uint8` => data payload (e.g., ASCII response like "OK\r\n", "ERR ...\r\n", or streamed telemetry data). Newlines are part of this payload and included in its length.
+
+This subframe is used by the moteus controller (server) to send data back to the host system (client) on a specific channel.
+
+Example: Server sending the response `"OK\r\n"` (4 bytes) on channel 1.
+The CAN data payload would be:
+`[0x41, 0x01, 0x04, 0x4F, 0x4B, 0x0D, 0x0A]` (Where `0x4F` is 'O', `0x4B` is 'K').
+
+***0x42 kClientPollServer*** - Client polls server for data
+
+Structure:
+- `0x42` - Subframe ID (1 byte).
+- `varuint` => channel number (typically a single byte).
+- `varuint` => maximum number of bytes the client is prepared to receive in the next server-to-client frame for this poll (typically a single byte, e.g., `0x30` for 48 bytes).
+
+This subframe allows the client to ask the server if it has any pending data for the specified channel. The server responds with a `0x41 kServerToClient` frame if data is available.
+
+Example: Client polling channel 1, indicating it's prepared to receive up to 48 (0x30) bytes.
+The CAN data payload would be:
+`[0x42, 0x01, 0x30]`
 
 ## A.2 Register Usage ##
 
@@ -2632,7 +2677,6 @@ python3 -m moteus.moteus_tool --fdcanusb /path/to/fdcanusb
 
 To force a particular python-can method, you can use:
 
-```
 python3 -m moteus.moteus_tool --can-iface socketcan --can-chan can0
 ```
 
