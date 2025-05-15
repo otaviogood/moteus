@@ -15,6 +15,7 @@
 #include "fw/fdcan.h"
 
 #include "PeripheralPins.h"
+#include "fw/moteus_hw.h"
 
 extern const PinMap PinMap_CAN_TD[];
 extern const PinMap PinMap_CAN_RD[];
@@ -316,6 +317,16 @@ void FDCan::Send(uint32_t dest_id,
     HAL_FDCAN_AbortTxRequest(&hfdcan1_, last_tx_request_);
   }
 
+  // LED Toggling - only toggle if the debug_led2 pin is valid
+  bool toggle_led = g_hw_pins.debug_led2 != NC;
+  
+  // Turn on LED before sending (1 = ON)
+  if (toggle_led) {
+    gpio_t led_pin;
+    gpio_init_out(&led_pin, g_hw_pins.debug_led2);
+    gpio_write(&led_pin, 1); // Turn LED ON
+  }
+
   FDCAN_TxHeaderTypeDef tx_header;
   tx_header.Identifier = dest_id;
   tx_header.IdType = ApplyOverride(
@@ -342,9 +353,22 @@ void FDCan::Send(uint32_t dest_id,
           &hfdcan1_, &tx_header,
           const_cast<uint8_t*>(
               reinterpret_cast<const uint8_t*>(data.data()))) != HAL_OK) {
+    // If we failed to send, still turn off the LED if it was turned on
+    if (toggle_led) {
+      gpio_t led_pin;
+      gpio_init_out(&led_pin, g_hw_pins.debug_led2);
+      gpio_write(&led_pin, 0); // Turn LED OFF
+    }
     mbed_die();
   }
   last_tx_request_ = HAL_FDCAN_GetLatestTxFifoQRequestBuffer(&hfdcan1_);
+
+  // Turn off LED after successful send
+  if (toggle_led) {
+    gpio_t led_pin;
+    gpio_init_out(&led_pin, g_hw_pins.debug_led2);
+    gpio_write(&led_pin, 0); // Turn LED OFF
+  }
 }
 
 bool FDCan::Poll(FDCAN_RxHeaderTypeDef* header,

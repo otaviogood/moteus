@@ -408,9 +408,14 @@ class BoardDebug::Impl {
         return;
       }
 
-      DigitalOut* const led = (which_led == "1") ? &led1_ : &led2_;
+      DigitalOut* led = (which_led == "1") ? &led1_ : &led2_;
+      // swap LEDs if this is one of my boards where otavio messed up the LED hardware
+      if (g_hw_pins.debug_led2 != NC) led = (which_led == "1") ? &led2_ : &led1_;
       bool* const led_state = (which_led == "1") ? &data_.led1 : &data_.led2;
-      const bool value = (state != "0");
+      bool value = (state != "0");
+
+      // Invert the LED if this is one of my boards where otavio messed up the on/off hardware
+      if (g_hw_pins.debug_led2 != NC) value = !value;
 
       *led = !value;  // Our LEDs are active low.
       *led_state = value;
