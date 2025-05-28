@@ -10,6 +10,5 @@ openocd \
     -c "init" \
     -c "reset halt" \
     -c "stm32l4x option_write 0 0x20 0x00000000 0x04000000" \
-    -c "stm32l4x option_load 0" \
-    -c "reset" \
-    -c "exit"
+    -c "reset run" \
+    -c "shutdown"
