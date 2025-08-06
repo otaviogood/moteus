@@ -248,6 +248,7 @@ struct I2C {
       kAs5048,
       kAs5600,
       kLsm6dsv16x,
+      kLsm6dsv16xAccel,
       kNumTypes,
     };
     Type type = kNone;
@@ -516,6 +517,7 @@ struct IsEnum<moteus::aux::I2C::DeviceConfig::Type> {
         { T::kAs5048, "as5048" },
         { T::kAs5600, "as5600" },
         { T::kLsm6dsv16x, "lsm6dsv16x" },
+        { T::kLsm6dsv16xAccel, "lsm6dsv16xAccel" },
       }};
   }
 };

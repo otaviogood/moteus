@@ -618,7 +618,8 @@ class AuxPort {
         ISR_ParseAs5600(&status);
         break;
       }
-      case DC::kLsm6dsv16x: {
+      case DC::kLsm6dsv16x:
+      case DC::kLsm6dsv16xAccel: {
         ISR_ParseLsm6dsv16x(&status);
         break;
       }
@@ -663,9 +664,10 @@ class AuxPort {
 
     status->nonce += 1;
 
-    // For the LSM6DSV16X, These numbers are actually in float16 format!!!
+    // For the LSM6DSV16X quaternions, the numbers are actually in float16 format!!!
     // (S: 1 sign bit; E: 5 exponent bits; F: 10 fraction bits).
     // The data comes in as X_low, X_high, Y_low, Y_high, Z_low, Z_high
+    // *** Accelerometer data can also be put in these vars, but that's not float16.
     status->quat_x = (quaternion_raw_data_[1] << 8) | quaternion_raw_data_[0]; // Bytes 0, 1
     status->quat_y = (quaternion_raw_data_[3] << 8) | quaternion_raw_data_[2]; // Bytes 2, 3
     status->quat_z = (quaternion_raw_data_[5] << 8) | quaternion_raw_data_[4]; // Bytes 4, 5
@@ -709,7 +711,8 @@ class AuxPort {
                                      encoder_raw_data_), 2));
             break;
           }
-          case DC::kLsm6dsv16x: {
+          case DC::kLsm6dsv16x:
+          case DC::kLsm6dsv16xAccel: {
             // Initialize LSM6DSV16X if needed
             // This init happens during an interrupt, and it takes almost 1ms,
             // so that could be bad if you're expecting realtime from the start
@@ -747,7 +750,8 @@ class AuxPort {
             StartI2cRead<3>(config.address, AS5600_REG_STATUS);
             break;
           }
-          case DC::kLsm6dsv16x: {
+          case DC::kLsm6dsv16x:
+          case DC::kLsm6dsv16xAccel: {
             ReadIMUData(config.address);
             break;
           }
@@ -781,6 +785,9 @@ class AuxPort {
     //     return;
     // }
 
+    // Either gyro or accel can be enabled, but not both.
+    bool gyro_enabled = config.type != aux::I2C::DeviceConfig::kLsm6dsv16xAccel;
+
     // We have to poll more than twice as fast as the IMU can produce data
     // See comment at ReadIMUData() function.
     const int hz = 240;
@@ -789,68 +796,83 @@ class AuxPort {
       return false;
     }
 
-    // Set accelerometer output data rate
     uint8_t ctrl1 = 0x06;  // 0x06->120Hz, 0x07->240Hz, 0x08->480Hz
     switch (hz) {
       case 240: ctrl1 = 0x07; break;
       case 480: ctrl1 = 0x08; break;
       default: break;  // remain at 0x06 for 120Hz
     }
+    // Set accelerometer output data rate
     i2c_->StartWriteMemory(config.address, 0x10, std::string_view(
         reinterpret_cast<const char*>(&ctrl1), 1));
     wait_i2c();
 
-    // Set gyroscope ODR
-    uint8_t ctrl2 = ctrl1;  // 0x06->120Hz, 0x07->240Hz, 0x08->480Hz
-    i2c_->StartWriteMemory(config.address, 0x11, std::string_view(
-        reinterpret_cast<const char*>(&ctrl2), 1));
-    wait_i2c();
+    if (!gyro_enabled) {
 
-    // Set gyro and accel full scale
-    uint8_t ctrl6 = 0x04;  // Gyro FS ±2000 dps
-    i2c_->StartWriteMemory(config.address, 0x15, std::string_view(
-        reinterpret_cast<const char*>(&ctrl6), 1));
-    wait_i2c();
+      // Enable accelerometer FIFO
+      uint8_t fifo_ctrl3 = ctrl1;  // 0x06->120Hz, 0x07->240Hz, 0x08->480Hz
+      i2c_->StartWriteMemory(config.address, 0x09, std::string_view(
+          reinterpret_cast<const char*>(&fifo_ctrl3), 1));
+      wait_i2c();
 
-    uint8_t ctrl8 = 0x02;  // Accel FS ±8g
-    i2c_->StartWriteMemory(config.address, 0x17, std::string_view(
-        reinterpret_cast<const char*>(&ctrl8), 1));
-    wait_i2c();
+      uint8_t ctrl8 = 0x03;  // Accel FS ±16g
+      i2c_->StartWriteMemory(config.address, 0x17, std::string_view(
+          reinterpret_cast<const char*>(&ctrl8), 1));
+      wait_i2c();
 
-    // Switch to embedded functions bank of registers
-    uint8_t func_cfg = 0x80;
-    i2c_->StartWriteMemory(config.address, 0x01, std::string_view(
-        reinterpret_cast<const char*>(&func_cfg), 1));
-    wait_i2c();
+      // Explicitly disable gyroscope
+      uint8_t ctrl2 = 0;  // 0x06->120Hz, 0x07->240Hz, 0x08->480Hz
+      i2c_->StartWriteMemory(config.address, 0x11, std::string_view(
+          reinterpret_cast<const char*>(&ctrl2), 1));
+      wait_i2c();
+    } else {
 
-    // Enable SFLP game rotation vector (quaternion orientation data)
-    uint8_t emb_func_en = 0x02;
-    i2c_->StartWriteMemory(config.address, 0x04, std::string_view(
-        reinterpret_cast<const char*>(&emb_func_en), 1));
-    wait_i2c();
+      // Set gyroscope ODR
+      uint8_t ctrl2 = ctrl1;  // 0x06->120Hz, 0x07->240Hz, 0x08->480Hz
+      i2c_->StartWriteMemory(config.address, 0x11, std::string_view(
+          reinterpret_cast<const char*>(&ctrl2), 1));
+      wait_i2c();
 
-    // Set SFLP data rate
-    uint8_t sflp_odr = 0x5B;  // 5B->120Hz, 63->240hz, 6B->480hz
-    switch (hz) {
-      case 240: sflp_odr = 0x63; break;
-      case 480: sflp_odr = 0x6B; break;
-      default: break;  // remain at 0x5B for 120Hz
+      uint8_t ctrl6 = 0x04;  // Gyro FS ±2000 dps
+      i2c_->StartWriteMemory(config.address, 0x15, std::string_view(
+          reinterpret_cast<const char*>(&ctrl6), 1));
+      wait_i2c();
+
+      // Switch to embedded functions bank of registers
+      uint8_t func_cfg = 0x80;
+      i2c_->StartWriteMemory(config.address, 0x01, std::string_view(
+          reinterpret_cast<const char*>(&func_cfg), 1));
+      wait_i2c();
+
+      // Enable SFLP game rotation vector (quaternion orientation data)
+      uint8_t emb_func_en = 0x02;
+      i2c_->StartWriteMemory(config.address, 0x04, std::string_view(
+          reinterpret_cast<const char*>(&emb_func_en), 1));
+      wait_i2c();
+
+      // Set SFLP data rate
+      uint8_t sflp_odr = 0x5B;  // 5B->120Hz, 63->240hz, 6B->480hz
+      switch (hz) {
+        case 240: sflp_odr = 0x63; break;
+        case 480: sflp_odr = 0x6B; break;
+        default: break;  // remain at 0x5B for 120Hz
+      }
+      i2c_->StartWriteMemory(config.address, 0x5E, std::string_view(
+          reinterpret_cast<const char*>(&sflp_odr), 1));
+      wait_i2c();
+
+      // Enable SFLP batching
+      uint8_t fifo_en = 0x02;
+      i2c_->StartWriteMemory(config.address, 0x44, std::string_view(
+          reinterpret_cast<const char*>(&fifo_en), 1));
+      wait_i2c();
+
+      // Switch back to main register bank
+      func_cfg = 0x00;
+      i2c_->StartWriteMemory(config.address, 0x01, std::string_view(
+          reinterpret_cast<const char*>(&func_cfg), 1));
+      wait_i2c();
     }
-    i2c_->StartWriteMemory(config.address, 0x5E, std::string_view(
-        reinterpret_cast<const char*>(&sflp_odr), 1));
-    wait_i2c();
-
-    // Enable SFLP batching
-    uint8_t fifo_en = 0x02;
-    i2c_->StartWriteMemory(config.address, 0x44, std::string_view(
-        reinterpret_cast<const char*>(&fifo_en), 1));
-    wait_i2c();
-
-    // Switch back to main register bank
-    func_cfg = 0x00;
-    i2c_->StartWriteMemory(config.address, 0x01, std::string_view(
-        reinterpret_cast<const char*>(&func_cfg), 1));
-    wait_i2c();
 
     // Set FIFO mode to RESET - this clears the FIFO
     uint8_t fifo_ctrl4 = 0x00;

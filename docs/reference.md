@@ -148,6 +148,7 @@ functions.  Currently supported options include:
 | AS5047x         | SPI              | 14 bits        | on-axis     | $         |
 | AS5048B         | I2C              | 14 bits        | on-axis     | $         |
 | AS5600          | I2C              | 12 bits        | on-axis     | $         |
+| LSM6DSV16X      | I2C              | 16 bits        | off-axis    | $         |
 | AksIM-2         | RS422 w/ 5V      | 20 bits        | off-axis    | $$$       |
 | CUI AMT21x      | RS422 w/ 5V      | 14 bits        | shaft       | $$        |
 | MA600           | SPI              | 16 bits        | on/off-axis | $         |
@@ -1251,19 +1252,19 @@ non-zero value may prevent future CAN communications.
 
 Mode: Read only
 
-The X component of the quaternion from the LSM6DSV16X IMU on Aux2. This value is stored as an INT16 that represents a float16 (IEEE 754 half-precision) format. When used with a proper IMU configuration, this provides orientation data of the controller.
+The X component of the quaternion from the LSM6DSV16X IMU on Aux2. This value is stored as an INT16 that represents a float16 (IEEE 754 half-precision) format. When used with a proper IMU configuration, this provides orientation data of the controller. If the config has aux[1,2]->i2c->devices->0->type set to lsm6dsv16xAccel, the these 3 values will be int16 accelerometer data.
 
 #### 0x073 - Aux2 Quaternion Y ####
 
 Mode: Read only
 
-The Y component of the quaternion from the LSM6DSV16X IMU on Aux2. This value is stored as an INT16 that represents a float16 (IEEE 754 half-precision) format.
+The Y component of the quaternion from the LSM6DSV16X IMU on Aux2. This value is stored as an INT16 that represents a float16 (IEEE 754 half-precision) format. See 0x072 about accelerometer data.
 
 #### 0x074 - Aux2 Quaternion Z ####
 
 Mode: Read only
 
-The Z component of the quaternion from the LSM6DSV16X IMU on Aux2. This value is stored as an INT16 that represents a float16 (IEEE 754 half-precision) format.
+The Z component of the quaternion from the LSM6DSV16X IMU on Aux2. This value is stored as an INT16 that represents a float16 (IEEE 754 half-precision) format. See 0x072 about accelerometer data.
 
 Note: To calculate the W component of the quaternion, use the formula: W = sqrt(1 - (X² + Y² + Z²)). The quaternion represents the rotation of the controller in 3D space, with components in the order [W, X, Y, Z].
 
@@ -2170,6 +2171,8 @@ What I2C device to expect.
 * 0 - disabled
 * 1 - AS5048
 * 2 - AS5600
+* 3 - LSM6DSV16X gyroscope quaternion orientation
+* 4 - LSM6DSV16XAccel accelerometer-only mode
 
 ## `aux[12].i2c.devices.X.address` ##
 
