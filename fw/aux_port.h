@@ -19,6 +19,7 @@
 #include "mbed.h"
 #include "PeripheralPins.h"
 
+#include "mjlib/base/inplace_function.h"
 #include "mjlib/base/tokenizer.h"
 #include "mjlib/base/visitor.h"
 #include "mjlib/micro/async_stream.h"
@@ -31,15 +32,20 @@
 #include "fw/aux_adc.h"
 #include "fw/aux_common.h"
 #include "fw/aux_mbed.h"
+#include "fw/bissc.h"
 #include "fw/ccm.h"
 #include "fw/cui_amt21.h"
+#include "fw/cui_amt22.h"
 #include "fw/ic_pz.h"
 #include "fw/math.h"
+#include "fw/orbis.h"
 #include "fw/ma732.h"
+#include "fw/mbed_util.h"
 #include "fw/millisecond_timer.h"
 #include "fw/moteus_hw.h"
 #include "fw/stm32_i2c.h"
 #include "fw/strtof.h"
+#include "fw/uart_fdcanusb_micro_server.h"
 
 namespace moteus {
 
@@ -48,10 +54,21 @@ class AuxPort {
   using Config = aux::AuxConfig;
   using Status = aux::AuxStatus;
 
+  // Callback invoked when uart_micro_server changes.
+  // Called with nullptr when server is about to be destroyed.
+  // Called with new pointer after server is created.
+  using UartServerChangedCallback =
+      mjlib::base::inplace_function<void(UartFdcanusbMicroServer*)>;
+
   enum SpiDefault {
     kNoDefaultSpi,
     kDefaultOnboardSpi,
     kDefaultOnboardMa600,
+  };
+
+  enum UartDefault {
+    kDefaultUartDisabled,
+    kDefaultUartSerial,
   };
 
   AuxPort(const char* aux_name,
@@ -64,13 +81,19 @@ class AuxPort {
           mjlib::micro::AsyncStream* tunnel_stream,
           MillisecondTimer* timer,
           SpiDefault spi_default,
-          std::array<DMA_Channel_TypeDef*, 4> dma_channels)
-      : tunnel_stream_(tunnel_stream),
+          UartDefault uart_default,
+          std::array<DMA_Channel_TypeDef*, 5> dma_channels)
+      : pin_count_(std::max_element(
+                       hw_config.pins.begin(), hw_config.pins.end(),
+                       [](const auto& a, const auto& b) {
+                         return a.number < b.number; })->number + 1),
+        tunnel_stream_(tunnel_stream),
         timer_(timer),
         adc_info_(*adc_info),
         hw_config_(hw_config),
         dma_channels_(dma_channels),
-        spi_default_(spi_default) {
+        spi_default_(spi_default),
+        uart_default_(uart_default) {
     persistent_config->Register(aux_name, &config_,
                                 std::bind(&AuxPort::HandleConfigUpdate, this));
     telemetry_manager->Register(aux_name, &status_);
@@ -161,47 +184,29 @@ class AuxPort {
           }
           break;
         }
+        case SampleType::kBissC: {
+          bissc_->ISR_Update();
+          break;
+        }
         case SampleType::kGpio: {
-          for (size_t i = 0; i < config_.pins.size(); i++) {
+          for (size_t i = 0; i < pin_count_; i++) {
             if (config_.pins[i].mode == aux::Pin::Mode::kDigitalInput) {
               status_.pins[i] = digital_inputs_[i]->read() ? true : false;
             } else if (config_.pins[i].mode == aux::Pin::Mode::kDigitalOutput) {
               digital_outputs_[i]->write(status_.pins[i]);
-            } else if (config_.pins[i].mode == aux::Pin::Mode::kPwmOut) {
+            } else if (config_.pins[i].mode == aux::Pin::Mode::kPwmOutput) {
               pwm_[i]->write(status_.pwm[i]);
             }
           }
           break;
         }
         case SampleType::kHall: {
-          status_.hall.active = true;
-          const auto old_bits = status_.hall.bits;
-          status_.hall.bits =
+          const uint8_t raw_bits =
               ((halla_->read() ? 1 : 0) << 0) |
               ((hallb_->read() ? 1 : 0) << 1) |
               ((hallc_->read() ? 1 : 0) << 2);
-          const auto delta = status_.hall.bits ^ old_bits;
-          const auto numbits_changed =
-              (delta & 0x01) ? 1 : 0 +
-              (delta & 0x02) ? 1 : 0 +
-              (delta & 0x04) ? 1 : 0;
-
-          if (numbits_changed > 1) {
-            status_.hall.error++;
-          }
-
-          static constexpr uint8_t kHallMapping[] = {
-            0,  // invalid
-            0,  // 0b001 => 0
-            2,  // 0b010 => 2
-            1,  // 0b011 => 1
-            4,  // 0b100 => 4
-            5,  // 0b101 => 5
-            3,  // 0b110 => 3
-            0,  // invalid
-          };
-          status_.hall.count =
-              kHallMapping[status_.hall.bits ^ config_.hall.polarity];
+          aux::Hall::ApplyHallReading(
+              raw_bits, config_.hall.polarity, &status_.hall);
           break;
         }
         case SampleType::kQuad: {
@@ -220,8 +225,20 @@ class AuxPort {
           cui_amt21_->ISR_Update(&status_.uart);
           break;
         }
+        case SampleType::kCuiAmt22: {
+          cui_amt22_->ISR_Update(&status_.spi);
+          break;
+        }
+        case SampleType::kOrbis: {
+          orbis_->ISR_Update(&status_.spi);
+          break;
+        }
         case SampleType::kI2c: {
           ISR_I2C_Update();
+          break;
+        }
+        case SampleType::kPwmInput: {
+          pwm_input_->ISR_Update(&status_.pwm_input);
           break;
         }
         case SampleType::kNone: {
@@ -270,7 +287,7 @@ class AuxPort {
   void ISR_EndAnalogSample() MOTEUS_CCM_ATTRIBUTE {
     if (!any_adc_) { return; }
 
-    for (size_t i = 0; i < config_.pins.size(); i++) {
+    for (size_t i = 0; i < pin_count_; i++) {
       if (analog_input_active_[i]) {
         status_.analog_inputs[i] =
             static_cast<float>(adc_info_.value[i]) / 4096.0f;
@@ -308,7 +325,6 @@ class AuxPort {
         // We could be operating from an ISR context, so we disable
         // interrupts before updating it.
         __disable_irq();
-        status_.error = aux::AuxError::kNone;
 
         as5047_.emplace(*as5047_options_);
         AddSampleType(SampleType::kAs5047, true, true);
@@ -322,6 +338,16 @@ class AuxPort {
       }
     }
 
+    if (!cui_amt22_ && cui_amt22_options_) {
+      if (timer_->ms_since_boot() > 200) {
+        __disable_irq();
+        cui_amt22_.emplace(*cui_amt22_options_);
+        AddSampleType(SampleType::kCuiAmt22, true, true);
+
+        __enable_irq();
+      }
+    }
+
     if (!ma732_ && ma732_options_) {
       // The worst case startup time for the MA732 is 260ms, however
       // we can't current measure that long from startup.  So we'll
@@ -329,7 +355,6 @@ class AuxPort {
       // deal with it if it has configured a longer filter period.
       if (timer_->read_ms() > 10) {
         __disable_irq();
-        status_.error = aux::AuxError::kNone;
         ma732_.emplace(timer_, *ma732_options_);
         if (ma732_->error()) {
           status_.error = aux::AuxError::kMaXXXConfigError;
@@ -377,7 +402,7 @@ class AuxPort {
 
 
   void WriteDigitalOut(uint32_t value) {
-    for (size_t i = 0; i < config_.pins.size(); i++) {
+    for (size_t i = 0; i < pin_count_; i++) {
       if (config_.pins[i].mode == aux::Pin::Mode::kDigitalOutput) {
         status_.pins[i] = (value & (1 << i)) ? true : false;
       }
@@ -385,7 +410,7 @@ class AuxPort {
   }
 
   void WritePwmOut(int pin, float value) {
-    pin = std::max<int>(0, std::min<int>(config_.pins.size() - 1, pin));
+    pin = std::max<int>(0, std::min<int>(pin_count_ - 1, pin));
     status_.pwm[pin] = std::max(0.0f, std::min(1.0f, value));
   }
 
@@ -398,6 +423,16 @@ class AuxPort {
 
   Status* status() { return &status_; }
   const Config* config() const { return &config_; }
+
+  // Returns the UART micro server if kSerial mode is configured, nullptr otherwise.
+  UartFdcanusbMicroServer* uart_micro_server() {
+    return uart_micro_server_ ? &*uart_micro_server_ : nullptr;
+  }
+
+  // Set callback to be notified when uart_micro_server changes.
+  void SetUartServerChangedCallback(UartServerChangedCallback callback) {
+    uart_server_changed_callback_ = callback;
+  }
 
  private:
   enum class SampleType {
@@ -415,6 +450,10 @@ class AuxPort {
     kAksim2 = 8,
     kCuiAmt21 = 9,
     kI2c = 10,
+    kCuiAmt22 = 11,
+    kPwmInput = 12,
+    kBissC = 13,
+    kOrbis = 14,
 
     kLastEntry,
   };
@@ -676,7 +715,7 @@ class AuxPort {
   void ISR_PollI2c() {
     using DC = aux::I2C::DeviceConfig;
 
-    // If our periperhal is currently busy, nothing we can do.
+    // If our peripheral is currently busy, nothing we can do.
     if (i2c_->busy()) { return; }
 
     const auto now_us = timer_->read_us();
@@ -997,6 +1036,15 @@ class AuxPort {
   }
 
 
+  // Returns true for UART encoder modes that share a single RS485
+  // differential pair (TX+/RX+ and TX-/RX- tied together).  These are
+  // half-duplex: the transmit driver must be released after each command
+  // so the encoder can drive its reply onto the shared pair.  4-wire
+  // RS422 encoders (e.g. the AksIM-2) keep the driver enabled statically.
+  static bool IsHalfDuplexUart(aux::UartEncoder::Config::Mode mode) {
+    return mode == aux::UartEncoder::Config::kCuiAmt21;
+  }
+
   void HandleConfigUpdate() {
     // Disable our ISR before changing any config.
     any_isr_enabled_ = false;
@@ -1023,6 +1071,8 @@ class AuxPort {
     ma732_.reset();
     ma732_options_.reset();
     onboard_cs_.reset();
+    cui_amt22_.reset();
+    cui_amt22_options_.reset();
 
     bool updated_any_isr = false;
 
@@ -1036,9 +1086,18 @@ class AuxPort {
 
     quad_.reset();
     index_.reset();
+    pwm_input_.reset();
+    bissc_.reset();
     ic_pz_.reset();
+    orbis_.reset();
+
+    // Notify that uart_micro_server is about to go away.
+    if (uart_server_changed_callback_) {
+      uart_server_changed_callback_(nullptr);
+    }
 
     uart_.reset();
+    uart_micro_server_.reset();
 
     start_sample_types_ = {};
     finish_sample_types_ = {};
@@ -1102,6 +1161,29 @@ class AuxPort {
       }
     }
 
+    if (config_.uart.mode == aux::UartEncoder::Config::kBoardDefault) {
+      switch (uart_default_) {
+        case kDefaultUartDisabled: {
+          config_.uart.mode = aux::UartEncoder::Config::Mode::kDisabled;
+          break;
+        }
+        case kDefaultUartSerial: {
+          config_.uart.mode = aux::UartEncoder::Config::Mode::kSerial;
+
+          // Figure out which pins to use.
+          SetDefaultUartPins();
+          break;
+        }
+      }
+    }
+
+    // Any remaining pins that are set to board default, flip them to NC.
+    for (auto& pin : config_.pins) {
+      if (pin.mode == aux::Pin::Mode::kBoardDefault) {
+        pin.mode = aux::Pin::Mode::kNC;
+      }
+    }
+
     ////////////////////////////////////////////
     // Validate our config, one option at a time.
 
@@ -1118,7 +1200,7 @@ class AuxPort {
     if (any_i2c) {
       PinName sda = NC;
       PinName scl = NC;
-      for (size_t i = 0; i < config_.pins.size(); i++) {
+      for (size_t i = 0; i < pin_count_; i++) {
         if (config_.pins[i].mode != aux::Pin::Mode::kI2C) { continue; }
 
         for (const auto& pin : hw_config_.pins) {
@@ -1164,14 +1246,20 @@ class AuxPort {
             options.scl = scl;
             options.frequency = config_.i2c.i2c_hz;
             options.i2c_mode = static_cast<I2cMode>(config_.i2c.i2c_mode);
+            options.timer = timer_;
             return options;
           }());
       updated_any_isr = true;
     }
 
-    if ((config_.spi.mode == aux::Spi::Config::kOnboardAs5047 ||
-         config_.spi.mode == aux::Spi::Config::kOnboardMa600) &&
-        !onboard_spi_available_) {
+    if (config_.spi.mode == aux::Spi::Config::kOnboardAs5047 &&
+        spi_default_ != kDefaultOnboardSpi) {
+      status_.error = aux::AuxError::kSpiPinError;
+      return;
+    }
+
+    if (config_.spi.mode == aux::Spi::Config::kOnboardMa600 &&
+        spi_default_ != kDefaultOnboardMa600) {
       status_.error = aux::AuxError::kSpiPinError;
       return;
     }
@@ -1187,7 +1275,7 @@ class AuxPort {
     // Default to the onboard encoder for SPI.
     if (config_.spi.mode != aux::Spi::Config::kDisabled) {
       const auto maybe_spi = aux::FindSpiOption(
-          config_.pins, hw_config_,
+          config_.pins, pin_count_, hw_config_,
           ((config_.spi.mode == aux::Spi::Config::kOnboardAs5047 ||
             config_.spi.mode == aux::Spi::Config::kOnboardMa600) ?
            aux::kDoNotRequireCs : aux::kRequireCs));
@@ -1216,12 +1304,39 @@ class AuxPort {
 
           break;
         }
+        case aux::Spi::Config::kCuiAmt22: {
+          CuiAmt22::Options options = spi_options;
+          // The max limit is 2Mbps per the datasheet.  The minimum limit is set to ensure
+          // there is sufficient setup time between each of:
+          // Tclk: CS_low -> SPI: 2.5us
+          // Tb: between bytes: 2.5us
+          // Tr: SPI -> CS_high: 3us
+          // Tcs: CS_low -> CS_low: 40us
+          // assuming that each step is taken once per ISR and the maximum ISR rate is 30kHz.
+          if (options.frequency > 2000000) { options.frequency = 2000000; }
+          if (options.frequency < 600000) { options.frequency = 600000; }
+          options.timeout = 2000;
+          cui_amt22_options_ = options;
+
+          break;
+        }
         case aux::Spi::Config::kIcPz: {
           IcPz::Options options{spi_options};
           options.timeout = 2000;
           options.rx_dma = dma_channels_[0];
           options.tx_dma = dma_channels_[1];
           ic_pz_.emplace(options, timer_);
+          break;
+        }
+        case aux::Spi::Config::kOrbis: {
+          Orbis::Options options{spi_options};
+          // Orbis recommends 1-2 MHz clock frequency
+          if (options.frequency > 2000000) { options.frequency = 2000000; }
+          if (options.frequency < 500000) { options.frequency = 500000; }
+          options.timeout = 2000;
+          options.rx_dma = dma_channels_[0];
+          options.tx_dma = dma_channels_[1];
+          orbis_.emplace(options);
           break;
         }
         case aux::Spi::Config::kMa732: {
@@ -1267,28 +1382,27 @@ class AuxPort {
     if (config_.hall.enabled) {
       // We need exactly 3 hall sensors.
       int count = 0;
-      for (const auto& pin : config_.pins) {
-        if (pin.mode == aux::Pin::Mode::kHall) { count++; }
+      for (size_t i = 0; i < pin_count_; i++) {
+        if (config_.pins[i].mode == aux::Pin::Mode::kHall) { count++; }
       }
       if (count != 3) {
         status_.error = aux::AuxError::kHallPinError;
       }
-      for (size_t i = 0; i < config_.pins.size(); i++) {
+      for (size_t i = 0; i < pin_count_; i++) {
         const auto cfg = config_.pins[i];
         if (cfg.mode != aux::Pin::Mode::kHall) { continue; }
         const auto mbed = [&]() {
             for (const auto& pin : hw_config_.pins) {
               if (pin.number == static_cast<int>(i)) { return pin.mbed; }
             }
-            mbed_die();
             return NC;
         }();
         if (!halla_) {
-          halla_.emplace(mbed, aux::MbedMapPull(cfg.pull));
+          halla_.emplace(mbed, MbedMapPull(cfg.pull));
         } else if (!hallb_) {
-          hallb_.emplace(mbed, aux::MbedMapPull(cfg.pull));
+          hallb_.emplace(mbed, MbedMapPull(cfg.pull));
         } else if (!hallc_) {
-          hallc_.emplace(mbed, aux::MbedMapPull(cfg.pull));
+          hallc_.emplace(mbed, MbedMapPull(cfg.pull));
         }
       }
       updated_any_isr = true;
@@ -1296,7 +1410,7 @@ class AuxPort {
 
     if (config_.quadrature.enabled) {
       quad_.emplace(config_.quadrature, &status_.quadrature,
-                    config_.pins, hw_config_);
+                    config_.pins, pin_count_, hw_config_);
       if (quad_->error() != aux::AuxError::kNone) {
         status_.error = quad_->error();
         quad_.reset();
@@ -1306,7 +1420,7 @@ class AuxPort {
     }
 
     if (config_.index.enabled) {
-      index_.emplace(config_.index, config_.pins, hw_config_);
+      index_.emplace(config_.index, config_.pins, pin_count_, hw_config_);
       if (index_->error() != aux::AuxError::kNone) {
         status_.error = index_->error();
         index_.reset();
@@ -1315,9 +1429,23 @@ class AuxPort {
       }
     }
 
+    if (config_.bissc.enabled) {
+      bissc_.emplace(config_.bissc, &status_.bissc,
+                     config_.pins, pin_count_, hw_config_, dma_channels_[4],
+                     timer_);
+
+      if (bissc_->error() != aux::AuxError::kNone) {
+        status_.error = bissc_->error();
+        bissc_.reset();
+        return;
+      } else {
+        updated_any_isr = true;
+      }
+    }
+
     if (config_.sine_cosine.enabled) {
       // We need exactly 1 each of a kSine and a kCosine.
-      for (size_t i = 0; i < config_.pins.size(); i++) {
+      for (size_t i = 0; i < pin_count_; i++) {
         const auto cfg = config_.pins[i];
         if (cfg.mode == aux::Pin::Mode::kSine) {
           if (sine_pin_ != -1) {
@@ -1341,20 +1469,29 @@ class AuxPort {
       updated_any_isr = true;
     }
 
+    if (config_.uart.mode != aux::UartEncoder::Config::kDisabled ||
+        config_.bissc.enabled) {
+      if (config_.rs422 && (!rs422_de_ || !rs422_re_)) {
+        status_.error = aux::AuxError::kUartPinError;
+        return;
+      }
+
+      // For half-duplex (tied-line) UART encoders the driver enable is
+      // released after every command by the UART's transmission-complete
+      // interrupt, so leave it de-asserted here and let the UART own it.
+      // Full-duplex RS422 and BiSS-C clock output keep it asserted.
+      const bool half_duplex = IsHalfDuplexUart(config_.uart.mode);
+      if (rs422_de_) { rs422_de_->write(config_.rs422 && !half_duplex); }
+      if (rs422_re_) { rs422_re_->write(!config_.rs422); }
+    }
+
     if (config_.uart.mode != aux::UartEncoder::Config::kDisabled) {
-      const auto maybe_uart = aux::FindUartOption(config_.pins, hw_config_);
+      const auto maybe_uart = aux::FindUartOption(
+          config_.pins, pin_count_, hw_config_);
       if (!maybe_uart) {
         status_.error = aux::AuxError::kUartPinError;
         return;
       }
-
-      if (config_.uart.rs422 && (!rs422_de_ || !rs422_re_)) {
-        status_.error = aux::AuxError::kUartPinError;
-        return;
-      }
-
-      if (rs422_de_) { rs422_de_->write(config_.uart.rs422); }
-      if (rs422_re_) { rs422_re_->write(!config_.uart.rs422); }
 
       uart_.emplace(
           [&]() {
@@ -1364,6 +1501,9 @@ class AuxPort {
             options.baud_rate = config_.uart.baud_rate;
             options.rx_dma = dma_channels_[2];
             options.tx_dma = dma_channels_[3];
+            if (IsHalfDuplexUart(config_.uart.mode) && rs422_de_) {
+              options.de = &*rs422_de_;
+            }
             return options;
           }());
 
@@ -1390,6 +1530,15 @@ class AuxPort {
           cui_amt21_.emplace(config_.uart, &*uart_, timer_);
           break;
         }
+        case C::kSerial: {
+          // Create the micro server wrapping the UART
+          uart_micro_server_.emplace(&*uart_);
+          // Notify that new uart_micro_server is available
+          if (uart_server_changed_callback_) {
+            uart_server_changed_callback_(&*uart_micro_server_);
+          }
+          break;
+        }
         default: {
           status_.error = aux::AuxError::kUartPinError;
           return;
@@ -1399,7 +1548,7 @@ class AuxPort {
       updated_any_isr = true;
     }
 
-    for (size_t i = 0; i < config_.pins.size(); i++) {
+    for (size_t i = 0; i < pin_count_; i++) {
       const auto cfg = config_.pins[i];
       const auto first_mbed = [&]() {
           for (const auto& pin : hw_config_.pins) {
@@ -1412,14 +1561,14 @@ class AuxPort {
       if (cfg.mode == aux::Pin::Mode::kDigitalInput) {
         status_.gpio_bit_active |= (1 << i);
         digital_inputs_[i].emplace(first_mbed,
-                                   aux::MbedMapPull(cfg.pull));
+                                   MbedMapPull(cfg.pull));
         updated_any_isr = true;
       } else if (cfg.mode == aux::Pin::Mode::kDigitalOutput) {
         status_.gpio_bit_active |= (1 << i);
         digital_outputs_[i].emplace(first_mbed,
-                                    aux::MbedMapPull(cfg.pull));
+                                    MbedMapPull(cfg.pull));
         updated_any_isr = true;
-      } else if (cfg.mode == aux::Pin::Mode::kPwmOut) {
+      } else if (cfg.mode == aux::Pin::Mode::kPwmOutput) {
         const auto timer = [&]() -> TIM_TypeDef* {
           for (const auto& pin: hw_config_.pins) {
             if (pin.number == static_cast<int>(i) &&
@@ -1484,12 +1633,25 @@ class AuxPort {
             break;
           }
         }
-        pin_mode(pin->mbed, aux::MbedMapPull(cfg.pull));
+        pin_mode(pin->mbed, MbedMapPull(cfg.pull));
+        updated_any_isr = true;
+      } else if (cfg.mode == aux::Pin::Mode::kPwmInput) {
+        if (pwm_input_) {
+          // Only one PWM input supported per aux port
+          status_.error = aux::AuxError::kPwmPinError;
+          return;
+        }
+        pwm_input_.emplace(first_mbed, cfg.pull, timer_);
+        if (pwm_input_->error() != aux::AuxError::kNone) {
+          status_.error = pwm_input_->error();
+          return;
+        }
         updated_any_isr = true;
       }
     }
 
     if (ic_pz_) { AddSampleType(SampleType::kIcPz, true, true); }
+    if (orbis_) { AddSampleType(SampleType::kOrbis, false, true); }
     if (status_.gpio_bit_active != 0) {
       AddSampleType(SampleType::kGpio, false, true);
     }
@@ -1499,11 +1661,45 @@ class AuxPort {
     if (aksim2_) { AddSampleType(SampleType::kAksim2, false, true); }
     if (cui_amt21_) { AddSampleType(SampleType::kCuiAmt21, false, true); }
     if (i2c_) { AddSampleType(SampleType::kI2c, false, true); }
+    if (pwm_input_) { AddSampleType(SampleType::kPwmInput, false, true); }
+    if (bissc_) { AddSampleType(SampleType::kBissC, false, true); }
 
     pwm_timer_set_.Start();
 
     adc_info_.config_update();
     any_isr_enabled_ = updated_any_isr;
+  }
+
+  void SetDefaultUartPins() {
+    const auto has_uart = [&](int pin_number) {
+      for (const auto& hw_pin : hw_config_.pins) {
+        if (hw_pin.number == pin_number &&
+            hw_pin.uart) {
+          return true;
+        }
+      }
+      return false;
+    };
+
+    int uart_pins = std::count_if(config_.pins.begin(),
+                                  config_.pins.end(),
+                                  [](const auto& p) {
+                                    return p.mode == aux::Pin::Mode::kUart;
+                                  });
+
+    // Find the two highest pin numbers with UART capability set to
+    // kBoardDefault, then set them to uart.
+    for (int i = pin_count_ - 1; i >= 0; i--) {
+      if (uart_pins == 2) { break; }
+
+      auto& pin = config_.pins[i];
+
+      if (pin.mode == aux::Pin::Mode::kBoardDefault &&
+          has_uart(i)) {
+        uart_pins++;
+        pin.mode = aux::Pin::Mode::kUart;
+      }
+    }
   }
 
   void AddSampleType(SampleType stype, bool start, bool finish) {
@@ -1543,6 +1739,7 @@ class AuxPort {
   Config config_;
   Status status_;
 
+  const size_t pin_count_;
   mjlib::micro::AsyncStream* const tunnel_stream_;
   MillisecondTimer* const timer_;
 
@@ -1554,7 +1751,11 @@ class AuxPort {
   std::optional<MA732> ma732_;
   std::optional<MA732::Options> ma732_options_;
 
+  std::optional<CuiAmt22> cui_amt22_;
+  std::optional<CuiAmt22::Options> cui_amt22_options_;
+
   std::optional<IcPz> ic_pz_;
+  std::optional<Orbis> orbis_;
   std::optional<DigitalOut> onboard_cs_;
 
   std::array<std::optional<DigitalIn>,
@@ -1571,7 +1772,10 @@ class AuxPort {
 
   std::optional<aux::Stm32Quadrature> quad_;
   std::optional<aux::Stm32Index> index_;
+  std::optional<aux::Stm32PwmInput> pwm_input_;
+  std::optional<BissC> bissc_;
   std::optional<Stm32G4DmaUart> uart_;
+  std::optional<UartFdcanusbMicroServer> uart_micro_server_;
   std::optional<Aksim2> aksim2_;
   std::optional<CuiAmt21> cui_amt21_;
   std::optional<DigitalOut> rs422_re_;
@@ -1615,12 +1819,15 @@ class AuxPort {
 
   std::optional<DigitalOut> i2c_pullup_dout_;
   const aux::AuxHardwareConfig hw_config_;
-  const std::array<DMA_Channel_TypeDef*, 4> dma_channels_;
+  const std::array<DMA_Channel_TypeDef*, 5> dma_channels_;
   const SpiDefault spi_default_;
+  const UartDefault uart_default_;
 
   std::array<SampleType, static_cast<int>(SampleType::kLastEntry)> start_sample_types_ = {};
   std::array<SampleType, static_cast<int>(SampleType::kLastEntry)> finish_sample_types_ = {};
 
+  // Callback for uart_micro_server changes
+  UartServerChangedCallback uart_server_changed_callback_;
 };
 
 }

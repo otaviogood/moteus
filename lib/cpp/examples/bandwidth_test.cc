@@ -49,16 +49,19 @@ int main(int argc, char** argv) {
 
   args.erase(args.begin());  // our name
 
-  // Should use use int16 position/velocity command and query and
-  // disable torque query?
-  const bool minimal_format = [&]() {
-    auto it = std::find(args.begin(), args.end(), "--minimal-format");
+  auto parse_bool = [&](const std::string& name) {
+    auto it = std::find(args.begin(), args.end(), name);
     if (it != args.end()) {
       args.erase(it);
       return true;
     }
     return false;
-  }();
+  };
+
+  // Should use use int16 position/velocity command and query and
+  // disable torque query?
+  const bool minimal_format = parse_bool("--minimal-format");
+  const bool stop_on_short = parse_bool("--stop-on-short");
 
   // This will keep track of if we had a response to a given device in
   // each cycle.
@@ -88,6 +91,13 @@ int main(int argc, char** argv) {
 
   std::vector<moteus::CanFdFrame> send_frames;
   std::vector<moteus::CanFdFrame> receive_frames;
+
+  // Start by sending a stop command.
+  for (auto& c : controllers) {
+    send_frames.push_back(c->MakeStop());
+  }
+  transport->BlockingCycle(&send_frames[0], send_frames.size(),
+                           &receive_frames);
 
   moteus::PositionMode::Command cmd;
   cmd.position = NaN;
@@ -129,6 +139,11 @@ int main(int argc, char** argv) {
       printf("%6.1fHz  rx_count=%2d   \r",
              hz_count / kStatusPeriodS, count);
       fflush(stdout);
+
+      if (stop_on_short &&
+          count != static_cast<int>(controllers.size())) {
+        return 0;
+      }
 
       hz_count = 0;
       status_time += kStatusPeriodS;

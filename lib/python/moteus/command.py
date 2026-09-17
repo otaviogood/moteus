@@ -13,20 +13,30 @@
 # limitations under the License.
 
 
+from .device_info import DeviceAddress
+
+
 class Command():
-    destination = 1
+    destination = DeviceAddress(can_id=1)
     source = 0
     reply_required = False
     data = b''
     can_prefix = 0x0000  # a 13 bit CAN prefix
     expected_reply_size = 0
 
+    # An optional function object which when passed a Frame returns
+    # True if the frame matches what is expected for this command.
+    reply_filter = None
+
     # If True, then the following parameters are used directly instead
     # of being calculated from destination and source (i.e. for
     # non-moteus devices).
     raw = False
     arbitration_id = 0  # this is the name python-can gives
-    bus = None  # Only valid for pi3hat
+
+    # The channel can be specified to direct this to a particular
+    # transport device.
+    channel = None
 
     def parse(self, message):
         # By default, we just return the message as is.

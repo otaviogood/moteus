@@ -208,6 +208,10 @@ class Drv8323::Impl {
     return config_.csa_gain;
   }
 
+  float csa_settling_time() {
+    return CsaSettlingTime(config_.csa_gain);
+  }
+
   void HandleConfigUpdate() {
     if (g_measured_hw_family == 0 &&
         g_measured_hw_rev == 7) {
@@ -216,7 +220,10 @@ class Drv8323::Impl {
       config_.idrivep_hs_ma = std::min<uint16_t>(config_.idrivep_hs_ma, 50);
       config_.idriven_hs_ma = std::min<uint16_t>(config_.idriven_hs_ma, 100);
       config_.idrivep_ls_ma = std::min<uint16_t>(config_.idrivep_ls_ma, 50);
-      config_.idriven_ls_ma = std::min<uint16_t>(config_.idriven_ls_ma, 100);
+      // 200 maps to the same drv8353 IDRIVEN_LS register code (index 2)
+      // as the old "100" clamp did under the previous, incorrect reg4
+      // table, so the physical sink drive is unchanged.
+      config_.idriven_ls_ma = std::min<uint16_t>(config_.idriven_ls_ma, 200);
     } else {
       // hw rev 8 (silk 4.10) has improved layout and an additional
       // gate drive resistor, it will likely not be damaged at up to
@@ -265,9 +272,11 @@ class Drv8323::Impl {
       return (val ? 1 : 0) << pos;
     };
 
+    // moteus-r4.5 and earlier (family 0 hwrev <=6), and the moteus-c1
+    // (family 2) both use the drv8323.
     const bool drv8323 =
         (g_measured_hw_family == 0 && g_measured_hw_rev <= 6) ||
-        (g_measured_hw_family == 1);
+        (g_measured_hw_family == 2);
 
     constexpr uint16_t idrivep_table_drv8323[] = {
       10, 30, 60, 80, 120, 140, 170, 190,
@@ -357,7 +366,7 @@ class Drv8323::Impl {
         (map_choice(tdrive_ns_table, config_.tdrive_ns) << 8) |
         (map_choice(drv8323 ? idrivep_table_drv8323 : idrivep_table_drv8353,
                     config_.idrivep_ls_ma) << 4) |
-        (map_choice(drv8323 ? idriven_table_drv8323 : idrivep_table_drv8353,
+        (map_choice(drv8323 ? idriven_table_drv8323 : idriven_table_drv8353,
                     config_.idriven_ls_ma) << 0);
 
     const uint16_t reg5 =
@@ -401,6 +410,9 @@ class Drv8323::Impl {
 
     status_.fault_config = fault_config;
     status_.config_count++;
+
+    // Update a consumer who might care about our parameters.
+    if (config_update_) { config_update_(); }
   }
 
   MillisecondTimer* const timer_;
@@ -418,6 +430,7 @@ class Drv8323::Impl {
   EnableResult enable_state_ = kDisabled;
 
   mjlib::base::inplace_function<void()> status_update_;
+  mjlib::base::inplace_function<void()> config_update_;
 };
 
 Drv8323::Drv8323(micro::Pool* pool,
@@ -433,6 +446,9 @@ Drv8323::~Drv8323() {}
 MotorDriver::EnableResult Drv8323::StartEnable(bool value) {
   return impl_->StartEnable(value);
 }
+
+void Drv8323::PowerOn() { hiz_.set(); }
+void Drv8323::PowerOff() { hiz_.clear(); }
 
 bool Drv8323::fault() {
   const bool check_fault_config = !!impl_->status_.fault_config;
@@ -455,6 +471,11 @@ bool Drv8323::fault() {
 void Drv8323::PollMillisecond() { impl_->PollMillisecond(); }
 float Drv8323::max_sense_V() { return impl_->max_sense_V(); }
 float Drv8323::i_gain() { return impl_->i_gain(); }
+float Drv8323::csa_settling_time() { return impl_->csa_settling_time(); }
+void Drv8323::SetConfigUpdateCallback(
+    mjlib::base::inplace_function<void()> cb) {
+  impl_->config_update_ = std::move(cb);
+}
 const Drv8323::Status* Drv8323::status() const { return &impl_->status_; }
 
 }

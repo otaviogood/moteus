@@ -37,7 +37,7 @@ GitInfo::GitInfo() {
   if (std::strlen(kGitHash) != 40) {
     dirty = true;
   } else {
-    for (size_t i = 0; i <= 20; i++) {
+    for (size_t i = 0; i < hash.size(); i++) {
       hash[i] = ParseHexByte(&kGitHash[i * 2]);
     }
 

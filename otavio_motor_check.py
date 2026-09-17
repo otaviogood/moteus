@@ -53,9 +53,9 @@ async def main():
     qr = moteus.QueryResolution()
     qr._extra = {
         # Quaternion values
-        0x072: INT16,  # Register.AUX2_QUATERNIONX
-        0x073: INT16,  # Register.AUX2_QUATERNIONY
-        0x074: INT16,  # Register.AUX2_QUATERNIONZ
+        moteus.Register.AUX2_QUATERNIONX: INT16,
+        moteus.Register.AUX2_QUATERNIONY: INT16,
+        moteus.Register.AUX2_QUATERNIONZ: INT16,
 
         # Encoder position (position source 0)
         0x050: F32,    # Register.ENCODER_0_POSITION
@@ -77,9 +77,9 @@ async def main():
     all_passed = True
 
     # Check quaternion values
-    quat_x = result.values.get(0x072, 0)
-    quat_y = result.values.get(0x073, 0)
-    quat_z = result.values.get(0x074, 0)
+    quat_x = result.values.get(moteus.Register.AUX2_QUATERNIONX, 0)
+    quat_y = result.values.get(moteus.Register.AUX2_QUATERNIONY, 0)
+    quat_z = result.values.get(moteus.Register.AUX2_QUATERNIONZ, 0)
 
     # Convert from int16 to float16
     x = float16_to_float32(quat_x)

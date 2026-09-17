@@ -28,6 +28,14 @@ import histogram
 
 COGGING_TABLE_SIZE = 1024
 
+# Bin count of the firmware's histogram (kHistogramBinCount in
+# fw/board_debug.cc).  read_data captures HISTOGRAM_BIN_COUNT *
+# split_count samples per direction, and the averaging loop below
+# requires that to be at least COGGING_TABLE_SIZE so every bucket gets
+# at least one sample.
+HISTOGRAM_BIN_COUNT = 128
+MIN_SPLIT_COUNT = COGGING_TABLE_SIZE // HISTOGRAM_BIN_COUNT
+
 async def read_data(args, s, speed=None):
     if args.input:
         with open(args.input) as inf:
@@ -44,38 +52,44 @@ async def read_data(args, s, speed=None):
     position_max = await histogram.read_config_double(s, "servopos.position_max")
     output_scale = await histogram.read_config_double(s, "motor_position.rotor_to_output_ratio")
 
+    # Soft position limits must be disabled while we drive the motor
+    # at constant velocity through whatever range the histogram needs.
+    # The original values are restored unconditionally on the way out
+    # so that an early exit, an exception, or Ctrl-C can't leave the
+    # controller wedged with NaN limits and rejecting every subsequent
+    # position-mode command.
     await s.command(b'conf set servopos.position_min nan')
     await s.command(b'conf set servopos.position_max nan')
+    try:
+        # And we'll operate both forward and backwards.
+        result = {}
+        for velocity in [-speed, speed]:
+            print(f'vel={velocity}')
+            await s.command(f"d pos nan {velocity * output_scale} nan a4".encode('utf8'))
+            await asyncio.sleep(2)
 
-    # And we'll operate both forward and backwards.
-    result = {}
-    for velocity in [-speed, speed]:
-        print(f'vel={velocity}')
-        await s.command(f"d pos nan {velocity * output_scale} nan a4".encode('utf8'))
-        await asyncio.sleep(2)
+            values, _ = await histogram.capture_histogram(
+                stream=s,
+                hist_options=["yq"],
+                split_count=args.split_count,
+                sample_time = int(args.average_count / speed))
 
-        values, _ = await histogram.capture_histogram(
-            stream=s,
-            hist_options=["yq"],
-            split_count=args.split_count,
-            sample_time = int(args.average_count / speed))
+            await s.command(b"d stop")
+            await asyncio.sleep(2)
 
-        await s.command(b"d stop")
-        await asyncio.sleep(2)
+            if any([not math.isfinite(x) for x in values]):
+                print(f'Compensation failed.  Ensure that PID values are set for smooth motion at speed={speed * output_scale}')
+                sys.exit(1)
 
-        if any([not math.isfinite(x) for x in values]):
-            print(f'Compensation failed.  Ensure that PID values are set for smooth motion at speed={speed * output_scale}')
-            sys.exit(1)
-
-        if velocity < 0.0:
-            result['reverse'] = values
-        else:
-            result['forward'] = values
-
-    await s.command(
-        f'conf set servopos.position_min {position_min}'.encode('utf8'))
-    await s.command(
-        f'conf set servopos.position_max {position_max}'.encode('utf8'))
+            if velocity < 0.0:
+                result['reverse'] = values
+            else:
+                result['forward'] = values
+    finally:
+        await s.command(
+            f'conf set servopos.position_min {position_min}'.encode('utf8'))
+        await s.command(
+            f'conf set servopos.position_max {position_max}'.encode('utf8'))
 
     return result
 
@@ -98,6 +112,16 @@ async def main():
     parser.add_argument('--store', action='store_true')
 
     args = parser.parse_args()
+
+    if args.split_count < MIN_SPLIT_COUNT:
+        print(
+            f"--split-count must be at least {MIN_SPLIT_COUNT} "
+            f"(got {args.split_count}); the firmware histogram has "
+            f"{HISTOGRAM_BIN_COUNT} bins per split and the "
+            f"compensation table has {COGGING_TABLE_SIZE} entries, "
+            f"so a smaller value would leave bins empty.",
+            file=sys.stderr)
+        sys.exit(1)
 
     m = moteus.Controller(id=args.target)
     s = moteus.Stream(m, verbose=args.verbose)
@@ -124,8 +148,8 @@ async def main():
     fig, ax = plt.subplots()
 
     if args.plot_source:
-        ax.plot(data['reverse'], label='fwd')
-        ax.plot(data['forward'], label='rev')
+        ax.plot(data['forward'], label='fwd')
+        ax.plot(data['reverse'], label='rev')
 
     source_length = len(data['reverse'])
     assert len(data['forward']) == source_length

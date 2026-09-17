@@ -165,7 +165,7 @@ class IcPz {
       status_.temp2 = (rx_buffer_[2] & 0x80) ? true : false;
 
       status_.adi = rx_buffer_[3];
-      status_.adi = rx_buffer_[4];
+      status_.dig = rx_buffer_[4];
 
       EnterOperating();
     }

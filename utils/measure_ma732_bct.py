@@ -137,7 +137,7 @@ class BctDetector:
 
             print(f"Selecting kTrim{'X' if best_bct > 0 else 'Y'} bct={abs(best_bct)}")
             await self.command(f"conf set {self.auxstr}.spi.trim {1 if best_bct > 0 else 2}")
-            await self.command(f"conf set {self.auxstr}.spi.bct {best_bct}")
+            await self.command(f"conf set {self.auxstr}.spi.bct {abs(best_bct)}")
 
         finally:
             # Try to stop and clean up.

@@ -25,6 +25,7 @@ EXAMPLES = [
     "timeout_debug",
     "bandwidth_test",
     "read_quaternion",
+    "wait_complete",
 ]
 
 [cc_binary(

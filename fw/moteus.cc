@@ -39,7 +39,7 @@
 #if defined(TARGET_STM32G4)
 #include "fw/fdcan.h"
 #include "fw/fdcan_micro_server.h"
-#include "fw/stm32g4_async_uart.h"
+#include "fw/multi_transport_datagram_server.h"
 #include "fw/stm32g4_flash.h"
 #else
 #error "Unknown target"
@@ -57,7 +57,6 @@ namespace micro = mjlib::micro;
 namespace multiplex = mjlib::multiplex;
 
 #if defined(TARGET_STM32G4)
-using HardwareUart = Stm32G4AsyncUart;
 using Stm32Flash = Stm32G4Flash;
 #else
 #error "Unknown target"
@@ -86,22 +85,34 @@ void SetupClock() {
 
     PeriphClkInit.PeriphClockSelection =
         RCC_PERIPHCLK_FDCAN |
+        RCC_PERIPHCLK_USART1 |
         RCC_PERIPHCLK_USART2 |
         RCC_PERIPHCLK_USART3 |
         RCC_PERIPHCLK_ADC12 |
         RCC_PERIPHCLK_ADC345 |
-        RCC_PERIPHCLK_I2C1
+        RCC_PERIPHCLK_I2C1 |
+        RCC_PERIPHCLK_I2C2
         ;
     PeriphClkInit.FdcanClockSelection = RCC_FDCANCLKSOURCE_PCLK1;
+    // Each USART instance uses its natural APB clock (PCLK2 for
+    // USART1, PCLK1 for USART2/USART3); mbed's serial_baud queries
+    // the matching PCLK frequency for baud-rate computation.
+    PeriphClkInit.Usart1ClockSelection = RCC_USART1CLKSOURCE_PCLK2;
     PeriphClkInit.Usart2ClockSelection = RCC_USART2CLKSOURCE_PCLK1;
     PeriphClkInit.Usart3ClockSelection = RCC_USART3CLKSOURCE_PCLK1;
     PeriphClkInit.Adc12ClockSelection = RCC_ADC12CLKSOURCE_SYSCLK;
     PeriphClkInit.Adc345ClockSelection = RCC_ADC345CLKSOURCE_SYSCLK;
+    // Both I2C peripherals run from SYSCLK so Stm32I2c can use a
+    // single HAL_RCC_GetSysClockFreq() reading for the timing
+    // calculator regardless of which instance any given aux port
+    // happens to route to.
     PeriphClkInit.I2c1ClockSelection = RCC_I2C1CLKSOURCE_SYSCLK;
+    PeriphClkInit.I2c2ClockSelection = RCC_I2C2CLKSOURCE_SYSCLK;
     if (HAL_RCCEx_PeriphCLKConfig(&PeriphClkInit) != HAL_OK) {
       mbed_die();
     }
 
+    __HAL_RCC_TIM1_CLK_ENABLE();
     __HAL_RCC_TIM2_CLK_ENABLE();
     __HAL_RCC_TIM3_CLK_ENABLE();
     __HAL_RCC_TIM4_CLK_ENABLE();
@@ -191,20 +202,8 @@ int main(void) {
 
   // Turn on our power light.
   DigitalOut power_led(g_hw_pins.power_led, 0);
-  
-  micro::SizedPool<20000> pool;
 
-  std::optional<HardwareUart> rs485;
-  if (g_hw_pins.uart_tx != NC) {
-    rs485.emplace(&pool, &timer, []() {
-      HardwareUart::Options options;
-      options.tx = g_hw_pins.uart_tx;
-      options.rx = g_hw_pins.uart_rx;
-      options.dir = g_hw_pins.uart_dir;
-      options.baud_rate = 3000000;
-      return options;
-                                 }());
-  }
+  micro::SizedPool<24000> pool;
 
   FDCan fdcan([]() {
       FDCan::Options options;
@@ -229,8 +228,11 @@ int main(void) {
       return options;
     }());
   FDCanMicroServer fdcan_micro_server(&fdcan);
+
+  MultiTransportDatagramServer multi_transport(&fdcan_micro_server);
+
   multiplex::MicroServer multiplex_protocol(
-      &pool, &fdcan_micro_server,
+      &pool, &multi_transport,
       []() {
         multiplex::MicroServer::Options options;
         options.max_tunnel_streams = 3;
@@ -259,6 +261,7 @@ int main(void) {
       &command_manager,
       &telemetry_manager,
       &multiplex_protocol,
+      &multi_transport,
       &clock,
       &system_info,
       &timer,
@@ -269,39 +272,72 @@ int main(void) {
       &pool, &command_manager, &telemetry_manager, &multiplex_protocol,
       moteus_controller.bldc_servo());
 
-  persistent_config.Register("id", multiplex_protocol.config(), [](){});
-
   GitInfo git_info;
   telemetry_manager.Register("git", &git_info);
 
   CanConfig can_config, old_can_config;
 
-  persistent_config.Register(
-      "can", &can_config,
-      [&can_config, &fdcan, &fdcan_micro_server, &old_can_config]() {
+  // We always want to update our filters at least once.
+  uint8_t old_multiplex_id = 255;
+
+  const auto maybe_update_filters =
+      [&can_config, &fdcan, &multi_transport, &old_can_config,
+       &old_multiplex_id, &multiplex_protocol]() {
+        // Prevent the ID from being set to an unusable value.
+        if (multiplex_protocol.config()->id < 1 ||
+            multiplex_protocol.config()->id > 126) {
+          multiplex_protocol.config()->id = 1;
+        }
+
         // We only update our config if it has actually changed.
         // Re-initializing the CAN-FD controller can cause packets to
         // be lost, so don't do it unless actually necessary.
-        if (can_config == old_can_config) {
+        if (can_config == old_can_config &&
+            multiplex_protocol.config()->id == old_multiplex_id) {
           return;
         }
         old_can_config = can_config;
+        old_multiplex_id = multiplex_protocol.config()->id;
 
-        FDCan::Filter filters[1] = {};
-        filters[0].id1 = can_config.prefix << 16;
-        filters[0].id2 = 0x1fff0000u;
+        FDCan::Filter filters[4] = {};
+        filters[0].id1 = (can_config.prefix << 16) | old_multiplex_id;
+        filters[0].id2 = 0x1fff00ffu;
         filters[0].mode = FDCan::FilterMode::kMask;
         filters[0].action = FDCan::FilterAction::kAccept;
         filters[0].type = FDCan::FilterType::kExtended;
+
+        filters[1].id1 = (can_config.prefix << 16) | 0x7f;
+        filters[1].id2 = 0x1fff00ffu;
+        filters[1].mode = FDCan::FilterMode::kMask;
+        filters[1].action = FDCan::FilterAction::kAccept;
+        filters[1].type = FDCan::FilterType::kExtended;
+
+        filters[2].id1 = (can_config.prefix << 16) | old_multiplex_id;
+        filters[2].id2 = 0x1fff00ffu;
+        filters[2].mode = FDCan::FilterMode::kMask;
+        filters[2].action = FDCan::FilterAction::kAccept;
+        filters[2].type = FDCan::FilterType::kStandard;
+
+        filters[3].id1 = (can_config.prefix << 16) | 0x7f;
+        filters[3].id2 = 0x1fff00ffu;
+        filters[3].mode = FDCan::FilterMode::kMask;
+        filters[3].action = FDCan::FilterAction::kAccept;
+        filters[3].type = FDCan::FilterType::kStandard;
+
         FDCan::FilterConfig filter_config;
         filter_config.begin = std::begin(filters);
         filter_config.end = std::end(filters);
-        filter_config.global_std_action = FDCan::FilterAction::kAccept;
+        filter_config.global_std_action = FDCan::FilterAction::kReject;
         filter_config.global_ext_action = FDCan::FilterAction::kReject;
         fdcan.ConfigureFilters(filter_config);
 
-        fdcan_micro_server.SetPrefix(can_config.prefix);
-      });
+        // Set prefix on both CAN-FD and UART transports
+        multi_transport.SetPrefix(can_config.prefix);
+      };
+
+  persistent_config.Register("id", multiplex_protocol.config(), maybe_update_filters);
+
+  persistent_config.Register("can", &can_config, maybe_update_filters);
 
   persistent_config.Load();
 
@@ -312,11 +348,8 @@ int main(void) {
   auto old_time = timer.read_us();
 
   for (;;) {
-    if (rs485) {
-      rs485->Poll();
-    }
 #if defined(TARGET_STM32G4)
-    fdcan_micro_server.Poll();
+    multi_transport.Poll();
 #endif
     moteus_controller.Poll();
     multiplex_protocol.Poll();
@@ -335,7 +368,8 @@ int main(void) {
       system_info.PollMillisecond();
       moteus_controller.PollMillisecond();
       board_debug.PollMillisecond();
-      system_info.SetCanResetCount(fdcan_micro_server.can_reset_count());
+      system_info.SetCanResetCount(multi_transport.can_reset_count());
+      timer.AdvanceMsSinceBoot();
 
       old_time += 1000;
     }

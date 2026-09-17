@@ -25,6 +25,7 @@ namespace moteus {
 //  moteus    - family 0
 //  moteus-n1 - family 1
 //  moteus-c1 - family 2
+//  moteus-x1 - family 3
 //
 // Each family has an independent hardware version timeline, and
 // possibly a different mechanism for verifying hardware version
@@ -61,10 +62,6 @@ struct MoteusHwPins {
   PinName msense = NC;
 
   float vsense_adc_scale = 0.0f;
-
-  PinName uart_tx = NC;
-  PinName uart_rx = NC;
-  PinName uart_dir = NC;
 
   PinName as5047_cs = NC;
 
@@ -172,8 +169,46 @@ MoteusHwPins FindHardwarePins(FamilyAndVersion);
 // * servo.motor_temperature_margin replaces
 //   servo.motor_derate_temperature
 
+// # 0x010c #
+//
+// * motor_position.sources.x.pll_filter_hz was previously specified
+//   in terms of a somewhat arbitrary "natural frequency", but is now
+//   specified in terms of the 3dB cutoff frequency
+
+// # 0x010d #
+//
+// * aux?.rs422 replaced aux?.uart.rs422 as now the RS422 transceiver
+//   can be enabled for both UART and BiSS-C encoders
+
+// # 0x010e #
+//
+// * servo.pid_dq.kp/ki/max_desired_rate replaced by servo.pid_dq_hz
+//   and servo.max_current_desired_rate.  PI gains are now computed
+//   automatically from the bandwidth and motor parameters.
+
+// # 0x010000
+//
+// No functional changes.  ABI release 1.0.0
+
+// # 0x010100
+//
+// * The drv8323_conf reg4 calculation now maps idriven_ls_ma through the
+//   DRV8353 pull-down (idriven) table instead of the pull-up (idrivep)
+//   table.  DRV8353-board idriven_ls_ma defaults were adjusted and
+//   moteus_tool migrates stored configs so the gate-drive register
+//   output is unchanged across the upgrade.
+// * The gate-driver family routing was corrected: moteus-c1 (family 2,
+//   a DRV8323) now uses the drv8323 register path and moteus-n1
+//   (family 1, a DRV8353) uses the drv8353 register path.  These were
+//   swapped by an inadvertent "family == 1" clause in the c1-support
+//   commit.  c1's defaults are adjusted (and configs migrated) to keep
+//   its register output unchanged; n1's register output is restored to
+//   what it was before the c1-support commit.
+//
+// ABI release 1.1.0
+
 #define MOTEUS_MODEL_NUMBER 0x0000
-#define MOTEUS_FIRMWARE_VERSION 0x00010b
+#define MOTEUS_FIRMWARE_VERSION 0x010100
 
 extern MoteusHwPins g_hw_pins;
 

@@ -32,23 +32,37 @@ filegroup(
     srcs = [
         "aioserial.py",
         "aiostream.py",
+        "async_timeout.py",
         "calibrate_encoder.py",
         "command.py",
+        "device_info.py",
         "export.py",
         "fdcanusb.py",
+        "fdcanusb_device.py",
+        "ld_measure.py",
+        "ld_saturation.py",
         "moteus.py",
         "moteus_tool.py",
         "multiplex.py",
         "posix_aioserial.py",
+        "protocol.py",
         "pythoncan.py",
+        "pythoncan_device.py",
         "reader.py",
         "regression.py",
-        "router.py",
         "transport.py",
+        "transport_factory.py",
+        "transport_device.py",
+        "transport_wrapper.py",
         "version.py",
         "win32_aioserial.py",
     ]
 )
+
+exports_files([
+    "__init__.py",
+    "py.typed",
+])
 
 py_library(
     name = "moteus",
@@ -77,46 +91,132 @@ py_test(
     deps = ["moteus"],
     # Just so it is built.
     data = [":manual_calibrate_encoder"],
+    size = "small",
 )
 
 py_test(
     name = "multiplex_test",
     srcs = ["test/multiplex_test.py"],
     deps = [":moteus"],
+    size = "small",
+)
+
+py_test(
+    name = "async_timeout_test",
+    srcs = ["test/async_timeout_test.py"],
+    deps = [":moteus"],
+    size = "small",
+)
+
+py_test(
+    name = "aiostream_test",
+    srcs = ["test/aiostream_test.py"],
+    deps = [":moteus"],
+    size = "small",
 )
 
 py_test(
     name = "moteus_test",
     srcs = ["test/moteus_test.py"],
     deps = [":moteus"],
+    size = "small",
+)
+
+py_test(
+    name = "moteus_tool_test",
+    srcs = ["test/moteus_tool_test.py"],
+    deps = [":moteus"],
+    size = "small",
+)
+
+py_test(
+    name = "protocol_test",
+    srcs = ["test/protocol_test.py"],
+    deps = [":moteus"],
+    size = "small",
 )
 
 py_test(
     name = "reader_test",
     srcs = ["test/reader_test.py"],
     deps = [":moteus"],
+    size = "small",
 )
 
 py_test(
     name = "regression_test",
     srcs = ["test/regression_test.py"],
     deps = [":moteus"],
+    size = "small",
+)
+
+py_library(
+    name = "test_helpers",
+    srcs = [
+        "test/mock_serial.py",
+        "test/fdcanusb_test_base.py",
+    ],
+    imports = [".."],
+    deps = [":moteus"],
 )
 
 py_test(
-    name = "router_test",
-    srcs = ["test/router_test.py"],
+    name = "fdcanusb_test",
+    srcs = ["test/fdcanusb_test.py"],
+    deps = [":moteus", ":test_helpers"],
+    size = "small",
+)
+
+py_test(
+    name = "transport_test",
+    srcs = ["test/transport_test.py"],
+    deps = [":moteus", ":test_helpers"],
+    size = "small",
+)
+
+py_test(
+    name = "transport_factory_test",
+    srcs = ["test/transport_factory_test.py"],
     deps = [":moteus"],
+    size = "small",
+)
+
+py_test(
+    name = "discovery_test",
+    srcs = ["test/discovery_test.py"],
+    deps = [":moteus", ":test_helpers"],
+    size = "small",
+)
+
+filegroup(
+    name = "ld_testdata",
+    srcs = glob(["test/testdata/ld_*.json"]),
+)
+
+py_test(
+    name = "ld_saturation_test",
+    srcs = ["test/ld_saturation_test.py"],
+    deps = [":moteus"],
+    data = [":ld_testdata"],
+    size = "small",
 )
 
 test_suite(
     name = "test",
     tests = [
+        ":aiostream_test",
+        ":async_timeout_test",
         ":calibrate_encoder_test",
+        ":fdcanusb_test",
+        ":ld_saturation_test",
         ":moteus_test",
+        ":moteus_tool_test",
         ":multiplex_test",
+        ":protocol_test",
         ":reader_test",
         ":regression_test",
-        ":router_test",
+        ":transport_factory_test",
+        ":transport_test",
+        ":discovery_test",
     ],
 )

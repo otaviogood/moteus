@@ -18,29 +18,50 @@ controller."""
 ALL = [
     'aiostream',
     'make_transport_args', 'get_singleton_transport',
-    'Fdcanusb', 'Router', 'Controller', 'Register', 'Transport',
-    'PythonCan',
+    'DeviceAddress', 'DeviceInfo',
+    'Frame', 'FrameFilter', 'TransportDevice',
+    'Fdcanusb', 'FdcanusbDevice', 'Controller', 'Register', 'Transport', 'TransportWrapper',
+    'PythonCan', 'PythonCanDevice',
     'Mode', 'QueryResolution', 'PositionResolution', 'Command', 'CommandError',
+    'FaultError',
     'Stream',
+    'Setpoint',
+    'move_to',
+    'timeout',
     'TRANSPORT_FACTORIES',
     'INT8', 'INT16', 'INT32', 'F32', 'IGNORE',
     'reader',
     'RegisterParser', 'QueryParser',
+    'SubframeType', 'RegisterSubframe', 'ErrorSubframe', 'StreamSubframe',
+    'Subframe', 'parse_frame',
+    'ParsedRegisters', 'parse_registers', 'scale_register',
 ]
+from moteus.async_timeout import timeout
 from moteus.command import Command
+from moteus.device_info import DeviceAddress, DeviceInfo
 from moteus.fdcanusb import Fdcanusb
-from moteus.router import Router
+from moteus.fdcanusb_device import FdcanusbDevice
 from moteus.transport import Transport
+from moteus.transport_wrapper import TransportWrapper
 from moteus.pythoncan import PythonCan
-from moteus.moteus import (
-    CommandError,
-    Controller, Register, Mode, QueryResolution, PositionResolution, Stream,
-    make_transport_args, get_singleton_transport,
-    TRANSPORT_FACTORIES)
+from moteus.pythoncan_device import PythonCanDevice
 from moteus.multiplex import (INT8, INT16, INT32, F32, IGNORE,
-                              RegisterParser, QueryParser)
+                              RegisterParser, QueryParser,
+                              SubframeType, RegisterSubframe, ErrorSubframe,
+                              StreamSubframe, Subframe, parse_frame)
+from moteus.transport_device import Frame, FrameFilter, TransportDevice
 import moteus.reader as reader
 import moteus.aiostream as aiostream
+
+from moteus.moteus import (
+    CommandError,
+    FaultError,
+    Setpoint,
+    Controller, Register, Mode, QueryResolution, PositionResolution, Stream,
+    make_transport_args, get_singleton_transport,
+    move_to,
+    TRANSPORT_FACTORIES)
+from moteus.protocol import ParsedRegisters, parse_registers, scale_register
 
 try:
     from moteus.version import VERSION

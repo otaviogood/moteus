@@ -107,6 +107,10 @@ bool ParseOptions(BldcServo::CommandData* command, base::Tokenizer* tokenizer,
         command->ignore_position_bounds = value != 0.0f;
         break;
       }
+      case 'q': {
+        command->meas_ind_axis = static_cast<int8_t>(value);
+        break;
+      }
       default: {
         return false;
       }
@@ -213,7 +217,13 @@ class BoardDebug::Impl {
     if (spec.size() <= offset) { return false; }
 
     if (spec[2] >= '0' && spec[2] <= '9') {
-      source->encoder_channel = spec[2] - '0';
+      const int ch = spec[2] - '0';
+      // motor_config.sources / motor_position.sources are
+      // std::array<..., kNumSources>; accepting digits >= kNumSources
+      // would later index past the end of those arrays in
+      // SampleHistogram().
+      if (ch >= MotorPosition::kNumSources) { return true; }
+      source->encoder_channel = ch;
       offset += 1;
     }
 
@@ -766,15 +776,20 @@ class BoardDebug::Impl {
       }
 
       const float volt = *maybe_volt;
-      const int8_t period = static_cast<int>(*maybe_period);
-      if (period <= 0) {
-        WriteMessage(response, "ERR period must > 0\r\n");
+      // Validate as a wide integer first.  meas_ind_period is int8_t,
+      // so anything outside [1, 127] would otherwise wrap silently
+      // (e.g. 300 -> 44) or trigger the misleading "must > 0" error.
+      const int period_int = static_cast<int>(*maybe_period);
+      if (period_int <= 0 ||
+          period_int > std::numeric_limits<int8_t>::max()) {
+        WriteMessage(response, "ERR period must be in 1..127\r\n");
         return;
       }
+      const int8_t period = static_cast<int8_t>(period_int);
 
       BldcServo::CommandData command;
 
-      if (!ParseOptions(&command, &tokenizer, "ob")) {
+      if (!ParseOptions(&command, &tokenizer, "obq")) {
         WriteMessage(response, "ERR unknown option\r\n");
         return;
       }
@@ -966,7 +981,11 @@ class BoardDebug::Impl {
       // Ensure everything is stopped!
       MoteusEnsureOff();
 
-      MultiplexBootloader(multiplex_protocol_->config()->id, USART1, GPIOA, 8);
+      // Use indirect call to avoid linker warning about branch to
+      // absolute symbol on Thumb-only CPU (GCC 15+).
+      void (*volatile boot_fn)(uint8_t, USART_TypeDef*, GPIO_TypeDef*, int) =
+          MultiplexBootloader;
+      boot_fn(multiplex_protocol_->config()->id, USART1, GPIOA, 8);
       // We should never get here.
       MJ_ASSERT(false);
     }

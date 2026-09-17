@@ -19,6 +19,13 @@
 
 #include "mjlib/base/visitor.h"
 
+// The default BAUD rate for the port which is configured to accept
+// UART commands by default.  921600 is the highest that can be
+// reliably achieved with inexpensive adapters like the CP2012.
+#ifndef MOTEUS_UART_DEFAULT_COMMAND_BAUD_RATE
+#define MOTEUS_UART_DEFAULT_COMMAND_BAUD_RATE 921600
+#endif
+
 namespace moteus {
 namespace aux {
 
@@ -33,6 +40,8 @@ struct Spi {
       kMa600,
       kOnboardMa600,
       kBoardDefault,
+      kCuiAmt22,
+      kOrbis,
 
       kNumModes,
     };
@@ -69,12 +78,15 @@ struct Spi {
 
     uint8_t ic_pz_bits = 0;
 
+    uint16_t checksum_errors = 0;
+
     template <typename Archive>
     void Serialize(Archive* a) {
       a->Visit(MJ_NVP(active));
       a->Visit(MJ_NVP(value));
       a->Visit(MJ_NVP(nonce));
       a->Visit(MJ_NVP(ic_pz_bits));
+      a->Visit(MJ_NVP(checksum_errors));
     }
   };
 };
@@ -86,17 +98,18 @@ struct UartEncoder {
     enum Mode {
       kDisabled,
       kAksim2,
-      kTunnel,
-      kDebug,
+      kTunnel,   // client controls arbitrary stream
+      kDebug,    // full control-rate debug output
       kCuiAmt21,
+      kSerial,   // fdcanusb ASCII protocol for serial control
+      kBoardDefault,
 
       kNumModes,
     };
-    Mode mode = kDisabled;
+    Mode mode = kBoardDefault;
 
-    int32_t baud_rate = 115200;
+    int32_t baud_rate = MOTEUS_UART_DEFAULT_COMMAND_BAUD_RATE;
     int32_t poll_rate_us = 100;
-    bool rs422 = false;
     uint8_t cui_amt21_address = 0x54;
 
     template <typename Archive>
@@ -104,7 +117,6 @@ struct UartEncoder {
       a->Visit(MJ_NVP(mode));
       a->Visit(MJ_NVP(baud_rate));
       a->Visit(MJ_NVP(poll_rate_us));
-      a->Visit(MJ_NVP(rs422));
       a->Visit(MJ_NVP(cui_amt21_address));
     }
   };
@@ -177,6 +189,7 @@ struct Hall {
     bool active = false;
     uint8_t bits = 0;
     uint8_t count = 0;
+    uint8_t nonce = 0;
     uint16_t error = 0;
 
     template <typename Archive>
@@ -184,18 +197,65 @@ struct Hall {
       a->Visit(MJ_NVP(active));
       a->Visit(MJ_NVP(bits));
       a->Visit(MJ_NVP(count));
+      a->Visit(MJ_NVP(nonce));
       a->Visit(MJ_NVP(error));
     }
   };
+
+  // Apply one new raw hall reading to the status struct.
+  //
+  // raw_bits has the three hall lines packed in its low three bits
+  // (bit 0 = A, bit 1 = B, bit 2 = C); polarity is XORed against
+  // them to select sensor polarity.  Updates status->bits, ->count,
+  // ->nonce (on a single-bit change) and ->error (on a multi-bit
+  // change), and forces ->active = true.
+  //
+  // Ensure that we accept the first change after startup, no matter
+  // how many bits have changed, but looking at the prior active flag.
+  static void ApplyHallReading(
+      uint8_t raw_bits, uint8_t polarity, Status* status) {
+    const bool first_sample = !status->active;
+    status->active = true;
+    const auto old_bits = status->bits;
+    status->bits = raw_bits;
+    if (first_sample) {
+      status->nonce += 1;
+    } else {
+      const auto delta = status->bits ^ old_bits;
+      // Popcount of delta's low three bits.
+      const auto numbits_changed =
+          ((delta & 0x01) ? 1 : 0) +
+          ((delta & 0x02) ? 1 : 0) +
+          ((delta & 0x04) ? 1 : 0);
+      if (numbits_changed > 1) {
+        status->error++;
+      } else if (numbits_changed > 0) {
+        status->nonce += 1;
+      }
+    }
+    static constexpr uint8_t kHallMapping[] = {
+      0,  // invalid
+      0,  // 0b001 => 0
+      2,  // 0b010 => 2
+      1,  // 0b011 => 1
+      4,  // 0b100 => 4
+      5,  // 0b101 => 5
+      3,  // 0b110 => 3
+      0,  // invalid
+    };
+    status->count = kHallMapping[status->bits ^ polarity];
+  }
 };
 
 struct Index {
   struct Config {
     bool enabled = false;
+    bool invert = false;
 
     template <typename Archive>
     void Serialize(Archive* a) {
       a->Visit(MJ_NVP(enabled));
+      a->Visit(MJ_NVP(invert));
     }
   };
 
@@ -237,6 +297,70 @@ struct SineCosine {
       a->Visit(MJ_NVP(sine_raw));
       a->Visit(MJ_NVP(cosine_raw));
       a->Visit(MJ_NVP(value));
+    }
+  };
+};
+
+struct PwmInput {
+  struct Config {
+    bool enabled = false;
+
+    template <typename Archive>
+    void Serialize(Archive* a) {
+      a->Visit(MJ_NVP(enabled));
+    }
+  };
+
+  struct Status {
+    bool active = false;
+    uint16_t period_us = 0;       // Time between rising edges
+    uint16_t pulse_width_us = 0;  // Time from rising to falling edge
+    uint8_t nonce = 0;
+
+    template <typename Archive>
+    void Serialize(Archive* a) {
+      a->Visit(MJ_NVP(active));
+      a->Visit(MJ_NVP(period_us));
+      a->Visit(MJ_NVP(pulse_width_us));
+      a->Visit(MJ_NVP(nonce));
+    }
+  };
+};
+
+struct BissC {
+  struct Config {
+    bool enabled = false;
+    uint32_t rate_hz = 1000000;  // 1 MHz default
+    uint8_t data_bits = 20;      // Position data bits (1-64)
+    uint8_t crc_bits = 6;        // CRC bits (0-16)
+    int32_t poll_rate_us = 100;
+
+    template <typename Archive>
+    void Serialize(Archive* a) {
+      a->Visit(MJ_NVP(enabled));
+      a->Visit(MJ_NVP(rate_hz));
+      a->Visit(MJ_NVP(data_bits));
+      a->Visit(MJ_NVP(crc_bits));
+      a->Visit(MJ_NVP(poll_rate_us));
+    }
+  };
+
+  struct Status {
+    bool active = false;
+    uint64_t value = 0;           // Position data
+    uint8_t nonce = 0;
+    uint16_t crc_errors = 0;
+    bool error_flag = false;      // BiSS-C error bit
+    bool warning_flag = false;    // BiSS-C warning bit
+
+    template <typename Archive>
+    void Serialize(Archive* a) {
+      a->Visit(MJ_NVP(active));
+      a->Visit(MJ_NVP(value));
+      a->Visit(MJ_NVP(nonce));
+      a->Visit(MJ_NVP(crc_errors));
+      a->Visit(MJ_NVP(error_flag));
+      a->Visit(MJ_NVP(warning_flag));
     }
   };
 };
@@ -335,16 +459,18 @@ struct Pin {
     kCosine,
     kStep,
     kDir,
-    kRcPwm,
+    kPwmInput,
     kI2C,
     kDigitalInput,
     kDigitalOutput,
     kAnalogInput,
-    kPwmOut,
+    kPwmOutput,
+    kBissC,
+    kBoardDefault,
 
     kLength,
   };
-  Mode mode = kNC;
+  Mode mode = kBoardDefault;
 
   // Not every mode supports pullup or pulldown.
   enum Pull {
@@ -370,8 +496,11 @@ struct AuxConfig {
   aux::Hall::Config hall;
   aux::Index::Config index;
   aux::SineCosine::Config sine_cosine;
+  aux::PwmInput::Config pwm_input;
+  aux::BissC::Config bissc;
   int32_t i2c_startup_delay_ms = 30;
   int32_t pwm_period_us = 1000;
+  bool rs422 = false;
 
   static constexpr size_t kNumPins = 5;
   std::array<Pin, kNumPins> pins = { {} };
@@ -385,8 +514,11 @@ struct AuxConfig {
     a->Visit(MJ_NVP(hall));
     a->Visit(MJ_NVP(index));
     a->Visit(MJ_NVP(sine_cosine));
+    a->Visit(MJ_NVP(pwm_input));
+    a->Visit(MJ_NVP(bissc));
     a->Visit(MJ_NVP(i2c_startup_delay_ms));
     a->Visit(MJ_NVP(pwm_period_us));
+    a->Visit(MJ_NVP(rs422));
     a->Visit(MJ_NVP(pins));
   }
 };
@@ -405,6 +537,7 @@ enum class AuxError {
   kUartPinError,
   kPwmPinError,
   kMaXXXConfigError,
+  kBisscPinError,
 
   kLength,
 };
@@ -419,6 +552,8 @@ struct AuxStatus {
   Hall::Status hall;
   Index::Status index;
   SineCosine::Status sine_cosine;
+  PwmInput::Status pwm_input;
+  BissC::Status bissc;
 
   uint8_t gpio_bit_active = 0;
   std::array<bool, 5> pins = { {} };
@@ -440,6 +575,8 @@ struct AuxStatus {
     a->Visit(MJ_NVP(hall));
     a->Visit(MJ_NVP(index));
     a->Visit(MJ_NVP(sine_cosine));
+    a->Visit(MJ_NVP(pwm_input));
+    a->Visit(MJ_NVP(bissc));
     a->Visit(MJ_NVP(gpio_bit_active));
     a->Visit(MJ_NVP(pins));
     a->Visit(MJ_NVP(analog_bit_active));
@@ -470,6 +607,8 @@ struct IsEnum<moteus::aux::Spi::Config::Mode> {
         { M::kMa600, "ma600" },
         { M::kOnboardMa600, "onboard_ma600" },
         { M::kBoardDefault, "board_default" },
+        { M::kCuiAmt22, "cui_amt22" },
+        { M::kOrbis, "orbis" },
       }};
   }
 };
@@ -501,6 +640,8 @@ struct IsEnum<moteus::aux::UartEncoder::Config::Mode> {
         { M::kTunnel, "tunnel" },
         { M::kDebug, "debug" },
         { M::kCuiAmt21, "cui_amt21" },
+        { M::kSerial, "serial" },
+        { M::kBoardDefault, "board_default" },
       }};
   }
 };
@@ -543,12 +684,14 @@ struct IsEnum<moteus::aux::Pin::Mode> {
         { P::kCosine, "cosine" },
         { P::kStep, "step" },
         { P::kDir, "dir" },
-        { P::kRcPwm, "rc_pwm" },
+        { P::kPwmInput, "pwm_in" },
         { P::kI2C, "i2c" },
         { P::kDigitalInput, "digital_in" },
         { P::kDigitalOutput, "digital_out" },
         { P::kAnalogInput, "analog_in" },
-        { P::kPwmOut, "pwm_out" },
+        { P::kPwmOutput, "pwm_out" },
+        { P::kBissC, "bissc" },
+        { P::kBoardDefault, "board_default" },
       }};
   }
 };
@@ -590,6 +733,7 @@ struct IsEnum<moteus::aux::AuxError> {
         { A::kUartPinError, "uart_pin_error" },
         { A::kPwmPinError, "pwm_pin_error" },
         { A::kMaXXXConfigError, "maxxx_config" },
+        { A::kBisscPinError, "bissc_pin_error" },
       }};
   }
 };

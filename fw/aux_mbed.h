@@ -20,6 +20,9 @@
 
 #include "fw/aux_common.h"
 #include "fw/ccm.h"
+#include "fw/mbed_util.h"
+#include "fw/millisecond_timer.h"
+#include "fw/stm32_dma.h"
 #include "fw/stm32_gpio_interrupt_in.h"
 
 namespace moteus {
@@ -61,36 +64,13 @@ struct UartPinOption {
   PinName rx = NC;
 };
 
-inline PinMode MbedMapPull(aux::Pin::Pull pull) {
-  switch (pull) {
-    case aux::Pin::kNone: { return PullNone; }
-    case aux::Pin::kPullUp: { return PullUp; }
-    case aux::Pin::kPullDown: { return PullDown; }
-    case aux::Pin::kOpenDrain: { return OpenDrain; }
-  }
-  return PullNone;
-}
-
-/// Figure out which mbed alt pin is associated with the given STM32
-/// timer.
-inline PinName FindTimerAlt(PinName pin, TIM_TypeDef* timer) {
-  const auto int_timer = reinterpret_cast<uint32_t>(timer);
-
-  for (uint32_t alt : {0, 0x100, 0x200, 0x300, 0x400}) {
-    const PinName mbed_pin = static_cast<PinName>(pin | alt);
-    if (pinmap_find_peripheral(mbed_pin, PinMap_PWM) == int_timer) {
-      return mbed_pin;
-    }
-  }
-  return NC;
-}
-
 class Stm32Quadrature {
  public:
   template <typename PinArray>
   Stm32Quadrature(const Quadrature::Config& config,
                   aux::Quadrature::Status* status,
                   const PinArray& array,
+                  size_t array_size,
                   const AuxHardwareConfig& hw_config)
       : config_(config),
         status_(status) {
@@ -99,7 +79,7 @@ class Stm32Quadrature {
     aux::AuxPinConfig pinb = {};
     aux::Pin::Mode pinb_mode = {};
 
-    for (size_t i = 0; i < array.size(); i++) {
+    for (size_t i = 0; i < array_size; i++) {
       const auto& pin = array[i];
 
       if (pin.mode != aux::Pin::Mode::kQuadratureSoftware &&
@@ -296,8 +276,10 @@ class Stm32Index {
   template <typename PinArray>
   Stm32Index(const Index::Config& config,
              const PinArray& array,
-             const AuxHardwareConfig& hw_config) {
-    for (size_t i = 0; i < array.size(); i++) {
+             size_t array_size,
+             const AuxHardwareConfig& hw_config)
+      : invert_(config.invert) {
+    for (size_t i = 0; i < array_size; i++) {
       const auto& cfg = array[i];
       if (cfg.mode == Pin::Mode::kIndex) {
         if (index_) {
@@ -333,7 +315,7 @@ class Stm32Index {
 
     const bool old_raw = status->raw;
     const bool observed = observed_.exchange(false);
-    status->raw = observed || index_isr_->read();
+    status->raw = observed || (invert_ ^ index_isr_->read());
     status->value = status->raw && !old_raw;
     status->active = true;
   }
@@ -344,7 +326,7 @@ class Stm32Index {
     // The principle here is that we capture any high readings in the
     // ISR so that the minimum pulse width we can read is determined
     // by the ISR latency, not by the control period.
-    if (index_isr_->read()) { observed_.store(true); }
+    if (invert_ ^ index_isr_->read()) { observed_.store(true); }
   }
 
   static void ISR_CallbackDelegate(uint32_t my_this) MOTEUS_CCM_ATTRIBUTE {
@@ -352,10 +334,98 @@ class Stm32Index {
   }
 
  private:
+  bool invert_ = false;
   aux::AuxError error_ = aux::AuxError::kNone;
   std::atomic<bool> observed_{false};
   std::optional<Stm32GpioInterruptIn> index_isr_;
   std::optional<DigitalIn> index_;
+};
+
+/// Measures the period (and optionally duty cycle) of an input PWM signal
+/// using GPIO interrupts and system timestamps.
+class Stm32PwmInput {
+ public:
+  // ~3000 at 30kHz = ~100ms timeout for stale detection
+  static constexpr uint16_t kStaleThreshold = 3000;
+
+  Stm32PwmInput(PinName pin, Pin::Pull pull, moteus::MillisecondTimer* timer)
+      : timer_(timer) {
+    // Stm32GpioInterruptIn configures the pin as input but with no pull.
+    // We need to apply the pull configuration separately.
+    isr_ = Stm32GpioInterruptIn::Make(
+        pin,
+        &Stm32PwmInput::ISR_CallbackDelegate,
+        reinterpret_cast<uint32_t>(this));
+    if (!isr_) {
+      error_ = AuxError::kPwmPinError;
+      return;
+    }
+    // Apply the pull configuration after the interrupt is set up.
+    pin_mode(pin, MbedMapPull(pull));
+  }
+
+  AuxError error() const { return error_; }
+
+  void ISR_Update(PwmInput::Status* status) MOTEUS_CCM_ATTRIBUTE {
+    if (error_ != AuxError::kNone) { return; }
+
+    const uint16_t last_rising = last_rising_us_.load();
+    const uint16_t prev_rising = prev_rising_us_.load();
+    const uint16_t pulse_width = last_pulse_width_us_.load();
+
+    if (last_rising != last_rising_seen_) {
+      // New edge detected
+      last_rising_seen_ = last_rising;
+      stale_count_ = 0;
+      // Unsigned subtraction handles 16-bit wrap correctly
+      status->period_us = static_cast<uint16_t>(last_rising - prev_rising);
+      status->pulse_width_us = pulse_width;
+      status->nonce++;
+    } else {
+      // No new edge
+      if (stale_count_ < kStaleThreshold) {
+        stale_count_++;
+      } else {
+        // Signal is stale/stopped
+        status->period_us = 0;
+        status->pulse_width_us = 0;
+      }
+    }
+    status->active = true;
+  }
+
+  static void ISR_CallbackDelegate(uint32_t my_this) MOTEUS_CCM_ATTRIBUTE {
+    reinterpret_cast<Stm32PwmInput*>(my_this)->ISR_Callback();
+  }
+
+  void ISR_Callback() MOTEUS_CCM_ATTRIBUTE {
+    const bool pin_high = isr_->read();
+    const uint16_t now = static_cast<uint16_t>(timer_->read_us());
+
+    if (pin_high) {
+      // Rising edge
+      prev_rising_us_.store(last_rising_us_.load());
+      last_rising_us_.store(now);
+    } else {
+      // Falling edge - compute pulse width now while we know which
+      // rising edge this corresponds to
+      last_pulse_width_us_.store(
+          static_cast<uint16_t>(now - last_rising_us_.load()));
+    }
+  }
+
+ private:
+  moteus::MillisecondTimer* const timer_;
+  AuxError error_ = AuxError::kNone;
+  std::optional<Stm32GpioInterruptIn> isr_;
+
+  std::atomic<uint16_t> last_rising_us_{0};
+  std::atomic<uint16_t> prev_rising_us_{0};
+  std::atomic<uint16_t> last_pulse_width_us_{0};
+
+  // For stale detection (non-atomic, only accessed in ISR_Update)
+  uint16_t last_rising_seen_ = 0;
+  uint16_t stale_count_ = 0;
 };
 
 /// This manages a single STM32 timer for PWM purposes, which may have
@@ -512,13 +582,14 @@ enum RequireCs {
 
 template <typename PinArray>
 std::optional<SpiPinOption> FindSpiOption(const PinArray& pin_array,
+                                          size_t array_size,
                                           const AuxHardwareConfig& hw_config,
                                           RequireCs require_cs) {
   SpiPinOption result;
 
   // Figure out if appropriate pins are configured.
   int cs_count = 0;
-  for (size_t i = 0; i < pin_array.size(); i++) {
+  for (size_t i = 0; i < array_size; i++) {
     const auto& cfg = pin_array[i];
     if (cfg.mode == Pin::Mode::kSpiCs) {
       cs_count++;
@@ -586,10 +657,11 @@ std::optional<SpiPinOption> FindSpiOption(const PinArray& pin_array,
 
 template <typename PinArray>
 std::optional<UartPinOption> FindUartOption(const PinArray& pin_array,
+                                            size_t array_size,
                                             const AuxHardwareConfig& hw_config) {
   UartPinOption result;
 
-  for (size_t i = 0; i < pin_array.size(); i++) {
+  for (size_t i = 0; i < array_size; i++) {
     const auto& cfg = pin_array[i];
     if (cfg.mode == Pin::Mode::kUart) {
       const auto* pin = [&]() {

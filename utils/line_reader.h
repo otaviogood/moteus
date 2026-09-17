@@ -85,6 +85,10 @@ class LineReader {
         read_streambuf_,
         AtLeast(4),
         boost::asio::redirect_error(boost::asio::use_awaitable, ec));
+    // Surface the IO error rather than dropping it on the floor.
+    // Without this, a stream that delivered fewer than 4 bytes
+    // would later trip the gcount assertion below and ::abort().
+    if (ec) { throw mjlib::base::system_error(ec); }
 
     std::istream istr(&read_streambuf_);
     uint32_t size = 0;
@@ -96,6 +100,9 @@ class LineReader {
         read_streambuf_,
         AtLeast(size),
         boost::asio::redirect_error(boost::asio::use_awaitable, ec));
+    // Without this, a short payload would silently fall through to
+    // a zero-padded result and look successful to the caller.
+    if (ec) { throw mjlib::base::system_error(ec); }
 
     std::string result;
     result.resize(size);

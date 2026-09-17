@@ -14,10 +14,13 @@
 
 #pragma once
 
+#include <algorithm>
+
 #include "mbed.h"
 
 #include "mjlib/base/string_span.h"
 
+#include "fw/millisecond_timer.h"
 #include "fw/stm32_i2c_timing.h"
 
 namespace moteus {
@@ -29,6 +32,15 @@ class Stm32I2c {
     PinName scl = NC;
     int frequency = 400000;
     I2cMode i2c_mode = I2cMode::kFast;
+    // The analog filter rejects spikes shorter than tAF(min)=50ns
+    // (STM32G474 datasheet section 5.3.27, Table 88), which would
+    // otherwise be seen as SCL or SDA edges on noisy or slowly
+    // rising buses.
+    AnalogFilter analog_filter = AnalogFilter::kOn;
+    // When non-null, transactions that take much longer than they
+    // could on a functioning bus are abandoned and the peripheral
+    // reset.
+    MillisecondTimer* timer = nullptr;
   };
 
   Stm32I2c(const Options& options) : options_(options) {
@@ -46,11 +58,23 @@ class Stm32I2c {
     // PE must be low for a bit, so wait.
     for (int i = 0; i < 1000; i++);
 
+    // mbed's i2c_init() leaves own-address matching enabled with
+    // address 0, which a glitchy bus can match (verified on
+    // hardware).  We are master-only: on a match the slave engine
+    // sets ADDR and per RM0440 section 41.4.8 stretches SCL low
+    // until ADDR is cleared, which no code here ever does.  An
+    // own-address match racing a pending master START can also leave
+    // the peripheral in an unpredictable state per ES0430 erratum
+    // section 2.15.3.  Disable all slave address matching.
+    i2c_->OAR1 = 0;
+    i2c_->OAR2 = 0;
+
     // Now figure out the actual timing values.
     TimingInput timing_input;
     timing_input.peripheral_hz = HAL_RCC_GetSysClockFreq();
     timing_input.i2c_hz = options_.frequency;
     timing_input.i2c_mode = options_.i2c_mode;
+    timing_input.analog_filter = options_.analog_filter;
 
     const auto timing = CalculateI2cTiming(timing_input);
     if (timing.error) {
@@ -86,6 +110,9 @@ class Stm32I2c {
     slave_address_ = slave_address;
     rx_data_ = data;
 
+    // Address + register, then repeated start, address + data.
+    ArmTimeout(3 + data.size());
+
     i2c_->ICR |= (I2C_ICR_STOPCF | I2C_ICR_NACKCF);
 
     i2c_->CR2 = (
@@ -112,6 +139,9 @@ class Stm32I2c {
     }
 
     tx_data_ = data;
+
+    // Address + register + data.
+    ArmTimeout(2 + data.size());
 
     i2c_->CR2 = (
         I2C_CR2_START |
@@ -166,6 +196,17 @@ class Stm32I2c {
       i2c_->ICR |= (I2C_ICR_NACKCF |
                     I2C_ICR_ARLOCF |
                     I2C_ICR_BERRCF);
+      return;
+    }
+
+    // The peripheral state machine can wedge permanently with no
+    // error flags set, for instance if a transaction is started while
+    // the bus is held low.  The only way out is a PE toggle, which
+    // the kError path of CheckRead performs.
+    if (busy() && options_.timer &&
+        MillisecondTimer::subtract_us(
+            options_.timer->read_us(), start_us_) > timeout_us_) {
+      mode_ = Mode::kError;
       return;
     }
 
@@ -269,6 +310,21 @@ class Stm32I2c {
   }
 
  private:
+  void ArmTimeout(size_t total_bytes) {
+    if (!options_.timer) { return; }
+
+    // Each byte takes 9 bit-times on the wire, plus a few more for
+    // the start/stop conditions.  Allow 10x that to account for
+    // polling granularity and slave clock stretching; a legitimate
+    // transaction can never approach this, while a wedged peripheral
+    // never completes.
+    const uint32_t nominal_us =
+        (static_cast<uint32_t>(total_bytes) * 9 + 4) * 1000000u /
+        static_cast<uint32_t>(std::max(1, options_.frequency));
+    timeout_us_ = 1000 + 10 * nominal_us;
+    start_us_ = options_.timer->read_us();
+  }
+
   const Options options_;
   bool valid_ = false;
   i2c_t mbed_i2c_;
@@ -289,6 +345,8 @@ class Stm32I2c {
   mjlib::base::string_span rx_data_;
   std::string_view tx_data_;
   int32_t offset_ = 0;
+  uint32_t start_us_ = 0;
+  uint32_t timeout_us_ = 0;
 };
 
 }

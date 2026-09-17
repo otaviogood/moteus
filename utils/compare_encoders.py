@@ -24,23 +24,9 @@ import numpy
 import time
 
 import histogram
+from encoder_math import wrap_half, wrap_zero_one, circular_mean
 
 PRINT_DURATION = 0.1
-
-def wrap_half(value):
-    while value > 0.5:
-        value -= 1.0
-    while value < -0.5:
-        value += 1.0
-    return value
-
-
-def wrap_zero_one(value):
-    while value > 1.0:
-        value -= 1.0
-    while value < 0.0:
-        value += 1.0
-    return value
 
 
 def get_encoder(item, number):
@@ -110,7 +96,8 @@ async def main():
     reference_values = [get_encoder(x, args.reference_encoder) for x in results]
     measure_values = [get_encoder(x, args.measure_encoder) for x in results]
 
-    offset = numpy.mean([wrap_half(r - m) for r, m in zip(reference_values, measure_values)])
+    offset = circular_mean(
+        [r - m for r, m in zip(reference_values, measure_values)])
 
     error_values = [-wrap_half(r - offset - m) for r, m in zip(reference_values, measure_values)]
 

@@ -52,14 +52,13 @@ class Stm32GpioInterruptIn {
       return {};
     }
 
-    Stm32GpioInterruptIn result{pin, function, data};
-
-    if (!result.entry_) {
-      // Somehow we exhausted our entry table.
+    Callback* const entry = FindCallback(Callback{function, data});
+    if (!entry) {
+      // We exhausted our entry table.
       return {};
     }
 
-    return result;
+    return Stm32GpioInterruptIn{pin, entry};
   }
 
   Stm32GpioInterruptIn(Stm32GpioInterruptIn&& rhs)
@@ -81,8 +80,9 @@ class Stm32GpioInterruptIn {
     return *this;
   }
 
-  Stm32GpioInterruptIn(PinName pin, CallbackFunction function, uint32_t val)
-      : pin_(pin) {
+  Stm32GpioInterruptIn(PinName pin, Callback* entry)
+      : pin_(pin),
+        entry_(entry) {
     __HAL_RCC_SYSCFG_CLK_ENABLE();
     __HAL_RCC_GPIOA_CLK_ENABLE();
     __HAL_RCC_GPIOB_CLK_ENABLE();
@@ -107,8 +107,6 @@ class Stm32GpioInterruptIn {
     mask_ = static_cast<uint32_t>(1 << (static_cast<uint32_t>(pin) & 0xf));
 
 
-    Callback cbk(function, val);
-    entry_ = FindCallback(cbk);
     entry_->ref_count++;
 
     // Set up as GPIO and input.
@@ -222,7 +220,7 @@ class Stm32GpioInterruptIn {
     }
   }
 
-  static constexpr int kMaxCallbacks = 3;
+  static constexpr int kMaxCallbacks = 5;
 
   static Callback entries_[kMaxCallbacks];
 

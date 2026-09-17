@@ -20,7 +20,15 @@ import sys
 import time
 
 fd = open(sys.argv[1])
-out = open(sys.argv[2], "w")
+# Line-buffered so data already captured survives an abrupt
+# termination (USB unplug, SIGINT, etc.).
+out = open(sys.argv[2], "w", buffering=1)
 while True:
     line = fd.readline()
-    print(f'{time.time()} {line}', file=out)
+    if not line:
+        # EOF: input descriptor closed (USB device unplugged, regular
+        # file fully read, peer side of a pipe closed).  readline()
+        # returns '' indefinitely after this, so we'd otherwise
+        # busy-spin filling the output with timestamp-only lines.
+        break
+    print(f'{time.time():.6f} {line.rstrip()}', file=out)

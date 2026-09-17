@@ -76,6 +76,10 @@ FirmwareInfo::FirmwareInfo(mjlib::micro::Pool& pool,
 
 FirmwareInfo::~FirmwareInfo() {}
 
+uint32_t FirmwareInfo::model_number() const {
+  return impl_->info_.model;
+}
+
 uint32_t FirmwareInfo::firmware_version() const {
   return impl_->info_.version;
 }

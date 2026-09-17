@@ -280,6 +280,48 @@ BOOST_AUTO_TEST_CASE(CurrentMake) {
   BOOST_TEST(reply_size == 0);
 }
 
+// Regression test: Format::d_A and Format::q_A had been wired into
+// the resolution slots in the wrong order (slot 0 == reg 0x1c == Q,
+// but the resolution at slot 0 was format.d_A).  When only one of
+// d_A / q_A is non-ignore, that swap caused the
+// kIgnore-resolution branch in WriteCanData::WriteMapped to fire
+// and abort().
+BOOST_AUTO_TEST_CASE(CurrentMakeQOnly) {
+  moteus::CanData frame;
+  moteus::WriteCanData write_frame(&frame);
+
+  moteus::CurrentMode::Command cmd;
+  cmd.q_A = 2.0;
+  moteus::CurrentMode::Format fmt;
+  fmt.d_A = moteus::Resolution::kIgnore;
+  fmt.q_A = moteus::Resolution::kFloat;
+
+  const auto reply_size =
+      moteus::CurrentMode::Make(&write_frame, cmd, fmt);
+
+  // WriteFloat 1 reg 0x1c, value 2.0
+  BOOST_TEST(Hexify(frame) == "0100090d1c00000040");
+  BOOST_TEST(reply_size == 0);
+}
+
+BOOST_AUTO_TEST_CASE(CurrentMakeDOnly) {
+  moteus::CanData frame;
+  moteus::WriteCanData write_frame(&frame);
+
+  moteus::CurrentMode::Command cmd;
+  cmd.d_A = 1.0;
+  moteus::CurrentMode::Format fmt;
+  fmt.d_A = moteus::Resolution::kFloat;
+  fmt.q_A = moteus::Resolution::kIgnore;
+
+  const auto reply_size =
+      moteus::CurrentMode::Make(&write_frame, cmd, fmt);
+
+  // WriteFloat 1 reg 0x1d, value 1.0
+  BOOST_TEST(Hexify(frame) == "0100090d1d0000803f");
+  BOOST_TEST(reply_size == 0);
+}
+
 BOOST_AUTO_TEST_CASE(StayWithinDefaults) {
   moteus::CanData frame;
   moteus::WriteCanData write_frame(&frame);
@@ -446,4 +488,86 @@ BOOST_AUTO_TEST_CASE(AuxPwmWrite) {
 
   BOOST_TEST(Hexify(frame) == "05769919057d3233");
   BOOST_TEST(reply_size == 0);
+}
+
+BOOST_AUTO_TEST_CASE(DiagnosticReadFlowMake) {
+  moteus::CanData frame;
+  moteus::WriteCanData write_frame(&frame);
+
+  moteus::DiagnosticReadFlow::Command cmd;
+  cmd.channel = 1;
+  cmd.packet_number = 0;
+  cmd.max_length = 48;
+
+  const auto reply_size = moteus::DiagnosticReadFlow::Make(
+      &write_frame, cmd, {});
+
+  // [0x44, channel=1, packet_number=0, max_length=48]
+  BOOST_TEST(Hexify(frame) == "44010030");
+  BOOST_TEST(reply_size == 52);
+}
+
+BOOST_AUTO_TEST_CASE(DiagnosticReadFlowMakeHighPacket) {
+  moteus::CanData frame;
+  moteus::WriteCanData write_frame(&frame);
+
+  moteus::DiagnosticReadFlow::Command cmd;
+  cmd.channel = 1;
+  cmd.packet_number = 200;
+  cmd.max_length = 48;
+
+  const auto reply_size = moteus::DiagnosticReadFlow::Make(
+      &write_frame, cmd, {});
+
+  // packet_number 200 = 0xc8, stored as signed int8 = -56 = 0xc8
+  BOOST_TEST(Hexify(frame) == "4401c830");
+  BOOST_TEST(reply_size == 52);
+}
+
+BOOST_AUTO_TEST_CASE(DiagnosticFlowResponseParse) {
+  // [0x43, channel=1, packet_number=5, size=3, data="abc"]
+  const uint8_t data[] = {0x43, 0x01, 0x05, 0x03, 'a', 'b', 'c'};
+  auto result = moteus::DiagnosticFlowResponse::Parse(data, sizeof(data));
+
+  BOOST_TEST(result.channel == 1);
+  BOOST_TEST(result.packet_number == 5);
+  BOOST_TEST(result.size == 3);
+  BOOST_TEST(result.data[0] == 'a');
+  BOOST_TEST(result.data[1] == 'b');
+  BOOST_TEST(result.data[2] == 'c');
+}
+
+BOOST_AUTO_TEST_CASE(DiagnosticFlowResponseParseHighPacket) {
+  // packet_number=200 (0xc8)
+  const uint8_t data[] = {0x43, 0x01, 0xc8, 0x02, 'x', 'y'};
+  auto result = moteus::DiagnosticFlowResponse::Parse(data, sizeof(data));
+
+  BOOST_TEST(result.channel == 1);
+  BOOST_TEST(result.packet_number == 200);
+  BOOST_TEST(result.size == 2);
+}
+
+BOOST_AUTO_TEST_CASE(DiagnosticFlowResponseParseEmpty) {
+  // Empty data response.
+  const uint8_t data[] = {0x43, 0x01, 0x03, 0x00};
+  auto result = moteus::DiagnosticFlowResponse::Parse(data, sizeof(data));
+
+  BOOST_TEST(result.channel == 1);
+  BOOST_TEST(result.packet_number == 3);
+  BOOST_TEST(result.size == 0);
+}
+
+BOOST_AUTO_TEST_CASE(DiagnosticFlowResponseParseWrongType) {
+  // Not a flow response (0x41 = regular kServerToClient).
+  const uint8_t data[] = {0x41, 0x01, 0x02, 'a', 'b'};
+  auto result = moteus::DiagnosticFlowResponse::Parse(data, sizeof(data));
+
+  BOOST_TEST(result.channel == -1);
+}
+
+BOOST_AUTO_TEST_CASE(DiagnosticFlowResponseParseTooShort) {
+  const uint8_t data[] = {0x43, 0x01, 0x05};
+  auto result = moteus::DiagnosticFlowResponse::Parse(data, sizeof(data));
+
+  BOOST_TEST(result.channel == -1);
 }

@@ -35,8 +35,18 @@ void mbed_die(void) {
   // LED which exists.
   moteus::MoteusEnsureOff();
 
+  // If we got here before g_hw_pins was populated (e.g. an assertion
+  // fired during family detection), debug_led1 is NC.  Calling
+  // gpio_init_out with NC leaves the gpio_t's mask/reg_set/reg_clr
+  // uninitialized, and the subsequent gpio_write would dereference a
+  // garbage stack pointer.  Just spin in that case.
+  const auto led_pin = moteus::g_hw_pins.debug_led1;
+  if (led_pin == NC) {
+    for (;;) {}
+  }
+
   gpio_t led;
-  gpio_init_out(&led, moteus::g_hw_pins.debug_led1);
+  gpio_init_out(&led, led_pin);
 
   // Now flash an actual LED.
   for (;;) {

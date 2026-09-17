@@ -16,7 +16,8 @@
 
 namespace moteus {
 
-void EnableAdc(MillisecondTimer* timer, ADC_TypeDef* adc, int prescaler, int offset) {
+void EnableAdc(MillisecondTimer* timer, ADC_TypeDef* adc, int prescaler, int offset,
+               AdcTriggerMode trigger_mode) {
   // 20.4.6: ADC Deep power-down mode startup procedure
   adc->CR &= ~ADC_CR_DEEPPWD;
   adc->CR |= ADC_CR_ADVREGEN;
@@ -132,7 +133,22 @@ void EnableAdc(MillisecondTimer* timer, ADC_TypeDef* adc, int prescaler, int off
   while (! (adc->ISR & ADC_ISR_ADRDY));
   adc->ISR |= ADC_ISR_ADRDY;
 
-  adc->CFGR &= ~(ADC_CFGR_CONT);
+  // Configure ADC trigger mode
+  if (trigger_mode == AdcTriggerMode::kLptim1) {
+    // Configure ADC for external trigger from LPTIM1_OUT.
+    // Per STM32G4 errata ES0430 section 2.7.11, all ADCs must be triggered
+    // simultaneously. LPTIM1_OUT provides this synchronization.
+    // EXTSEL = 0x1D (LPTIM_OUT), EXTEN = 0x1 (rising edge)
+    adc->CFGR = (adc->CFGR & ~(ADC_CFGR_CONT | ADC_CFGR_EXTSEL | ADC_CFGR_EXTEN)) |
+                (0x1D << ADC_CFGR_EXTSEL_Pos) |
+                (0x01 << ADC_CFGR_EXTEN_Pos);
+
+    // For external trigger mode, ADC needs to be started to respond to triggers
+    adc->CR |= ADC_CR_ADSTART;
+  } else {
+    // Software trigger mode - clear external trigger and continuous mode
+    adc->CFGR &= ~(ADC_CFGR_CONT | ADC_CFGR_EXTEN);
+  }
 }
 
 #if 0

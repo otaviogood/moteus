@@ -47,13 +47,9 @@ void hard_fault_handler_c (unsigned int * hardfault_args)
   (void)stacked_psr;
 
   // Do our best to disable the motor driver, so we cause fewer
-  // explosions!
-
-  GPIOC->BSRR = (1 << (3 + 16));
-  GPIOA->BSRR = (1 << (3 + 16));
-
-  // TODO(jpieper): Verify that the 8323 pin assignments match these
-  // hard-coded constants.
+  // explosions!  MoteusEnsureOff is documented to be safe to call from
+  // here.
+  moteus::MoteusEnsureOff();
 
   const auto debug_led = moteus::g_hw_pins.debug_led1;
   volatile GPIO_TypeDef* io_port =

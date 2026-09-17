@@ -23,6 +23,7 @@ test_suite(
         "//utils:host",
         "//lib/python:host",
         "//lib/cpp:host",
+        "//lib/rust:host",
     ],
 )
 
@@ -34,5 +35,3 @@ filegroup(
         "//fw:can_bootloader",
     ],
 )
-
-exports_files(["tsconfig.json"])

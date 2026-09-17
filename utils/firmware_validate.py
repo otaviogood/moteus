@@ -39,7 +39,7 @@ def dyno(*args, keep_log=False):
 
     try:
         subprocess.run(args = [DYNAMOMETER_DRIVE,
-                               '--torque_transducer', '/dev/ttyUSB0',
+                               '--torque_transducer', '/dev/serial/by-id/usb-FTDI_FT231X_USB_UART_D3086Z20-if00-port0',
                                '--log', tmp.name] + list(args),
                        check = True)
         if not keep_log:
@@ -114,6 +114,9 @@ class TestDynoFast(unittest.TestCase):
 
     def test_validate_velocity_accel_limits(self):
         dyno('--validate_velocity_accel_limits', '1')
+
+    def test_validate_field_weakening_perf(self):
+        dyno('--validate_field_weakening_perf', '1')
 
 
 class TestDynoSlow(unittest.TestCase):

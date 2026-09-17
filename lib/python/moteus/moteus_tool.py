@@ -18,6 +18,9 @@
 
 import argparse
 import asyncio
+import codecs
+import collections
+import collections.abc
 import datetime
 import elftools
 import elftools.elf.elffile
@@ -33,8 +36,19 @@ import uuid
 
 from . import moteus
 from . import aiostream
+from . import ld_measure
 from . import regression
 from . import calibrate_encoder as ce
+from .moteus import namedtuple_to_dict
+
+from .device_info import DeviceAddress
+
+try:
+    from . import version
+except ImportError:
+    class Version:
+        VERSION = 'dev'
+    version = Version()  # type: ignore[assignment]
 
 MAX_FLASH_BLOCK_SIZE = 32
 
@@ -43,6 +57,26 @@ MAX_FLASH_BLOCK_SIZE = 32
 # short intervals.
 FIND_TARGET_TIMEOUT = 0.01 if sys.platform != 'win32' else 0.05
 
+
+def _read_config_text(filename):
+    """Read a config file, handling UTF-8/UTF-16/UTF-32 BOMs that some
+    Windows tools (Notepad, PowerShell redirection) insert."""
+    with open(filename, "rb") as fp:
+        data = fp.read()
+
+    # UTF-32 BOMs must be checked before UTF-16, since the UTF-32 LE
+    # marker starts with the UTF-16 LE marker.
+    for bom, encoding in [
+        (codecs.BOM_UTF32_LE, 'utf-32'),
+        (codecs.BOM_UTF32_BE, 'utf-32'),
+        (codecs.BOM_UTF16_LE, 'utf-16'),
+        (codecs.BOM_UTF16_BE, 'utf-16'),
+        (codecs.BOM_UTF8, 'utf-8-sig'),
+    ]:
+        if data.startswith(bom):
+            return data.decode(encoding)
+    return data.decode('latin1')
+
 # By default, we will only use current mode calibration if our
 # expected maximum current is X times the sense noise in current.
 CURRENT_QUALITY_MIN = 20
@@ -50,6 +84,7 @@ CURRENT_QUALITY_MIN = 20
 # We switch to voltage mode control if the ratio of maximum possible
 # current to current noise is less than this amount.
 VOLTAGE_MODE_QUALITY_MIN = 40
+
 
 def _wrap_neg_pi_to_pi(value):
     while value > math.pi:
@@ -78,11 +113,99 @@ def stddev(data):
     mean = sum(data) / len(data)
     return math.sqrt(sum((x - mean) ** 2 for x in data) / len(data))
 
-SUPPORTED_ABI_VERSION = 0x010b
+
+class MoteusFault(RuntimeError):
+    def __init__(self, fault_code):
+        self.fault_code = fault_code
+        super(MoteusFault, self).__init__(
+            f"Controller reported fault: {int(self.fault_code)}")
+
+
+SUPPORTED_ABI_VERSION = 0x010100
 
 # Old firmwares used a slightly incorrect definition of Kv/v_per_hz
 # that didn't match with vendors or oscilloscope tests.
 V_PER_HZ_FUDGE_010a = 1.09
+
+
+# The DRV8323/DRV8353 gate-drive register tables, copied verbatim from
+# fw/drv8323.cc.  They are used by the 0x010100 migration to keep the
+# gate-drive register codes unchanged when idriven_ls_ma stops using the
+# wrong table and when the moteus-c1/n1 register paths are corrected.
+IDRIVEP_TABLE_DRV8323 = [
+    10, 30, 60, 80, 120, 140, 170, 190,
+    260, 330, 370, 440, 570, 680, 820, 1000,
+]
+IDRIVEP_TABLE_DRV8353 = [
+    50, 50, 100, 150, 300, 350, 400, 450,
+    550, 600, 650, 700, 850, 900, 950, 1000,
+]
+IDRIVEN_TABLE_DRV8323 = [
+    20, 60, 120, 160, 240, 280, 340, 380,
+    520, 660, 740, 880, 1140, 1360, 1640, 2000,
+]
+IDRIVEN_TABLE_DRV8353 = [
+    100, 100, 200, 300, 600, 700, 800, 900,
+    1100, 1200, 1300, 1400, 1700, 1800, 1900, 2000,
+]
+DEGLITCH_TABLE_DRV8323 = [2, 4, 6, 8]
+DEGLITCH_TABLE_DRV8353 = [1, 2, 4, 8]
+VDS_LVL_TABLE_DRV8323 = [
+    60, 130, 200, 260, 310, 450, 530, 600,
+    680, 750, 940, 1130, 1300, 1500, 1700, 1880,
+]
+VDS_LVL_TABLE_DRV8353 = [
+    60, 70, 80, 90, 100, 200, 300, 400,
+    500, 600, 700, 800, 900, 1000, 1500, 2000,
+]
+
+
+def _map_choice(table, ma):
+    '''Mirror the firmware's drv8323.cc map_choice: return the first index
+    whose table value is >= ma, else the last index.'''
+    for i, value in enumerate(table):
+        if ma <= value:
+            return i
+    return len(table) - 1
+
+
+# moteus-n1 (family 1) gate-drive defaults.  Through 0x010e n1 was (wrongly)
+# on the DRV8323 register path; 0x010100 returns it to the DRV8353 path and
+# adopts more conservative defaults.  Each entry is (field, default_value,
+# table on that firmware's path) so an "untouched" board can be recognized by
+# its register codes rather than by exact config values.
+N1_OLD_DEFAULTS = [
+    ('idrivep_hs_ma', 150, IDRIVEP_TABLE_DRV8323),
+    ('idriven_hs_ma', 300, IDRIVEN_TABLE_DRV8323),
+    ('idrivep_ls_ma', 150, IDRIVEP_TABLE_DRV8323),
+    ('idriven_ls_ma', 300, IDRIVEN_TABLE_DRV8323),
+]
+N1_NEW_DEFAULTS = [
+    ('idrivep_hs_ma', 150, IDRIVEP_TABLE_DRV8353),
+    ('idriven_hs_ma', 200, IDRIVEN_TABLE_DRV8353),
+    ('idrivep_ls_ma', 150, IDRIVEP_TABLE_DRV8353),
+    ('idriven_ls_ma', 100, IDRIVEN_TABLE_DRV8353),
+]
+
+
+def _at_drv8323_defaults(items, defaults):
+    '''True if every drv8323_conf field is present and maps to the same
+    register index as the default value -- i.e. the gate drive looks like it
+    was never modified.'''
+    for field, default, table in defaults:
+        key = b'drv8323_conf.' + field.encode('utf8')
+        if key not in items:
+            return False
+        if (_map_choice(table, int(float(items[key]))) !=
+                _map_choice(table, default)):
+            return False
+    return True
+
+
+def _set_drv8323_defaults(items, defaults):
+    for field, default, _table in defaults:
+        items[b'drv8323_conf.' + field.encode('utf8')] = str(default).encode('utf8')
+
 
 class FirmwareUpgrade:
     '''This encodes "magic" rules about upgrading firmware, largely about
@@ -90,10 +213,11 @@ class FirmwareUpgrade:
     change upon firmware changes.
     '''
 
-    def __init__(self, old, new, board_family):
+    def __init__(self, old, new, board_family, board_hwrev=None):
         self.old = old
         self.new = new
         self.board_family = board_family
+        self.board_hwrev = board_hwrev
 
         if new > SUPPORTED_ABI_VERSION:
             raise RuntimeError(f"\nmoteus_tool needs to be upgraded to support this firmware\n\n (likely 'python -m pip install --upgrade moteus')\n\nThe provided firmare is ABI version 0x{new:04x} but this moteus_tool only supports up to 0x{SUPPORTED_ABI_VERSION:04x}")
@@ -101,9 +225,128 @@ class FirmwareUpgrade:
         if old > SUPPORTED_ABI_VERSION:
             raise RuntimeError(f"\nmoteus_tool needs to be upgraded to support this board\n\n (likely 'python -m pip install --upgrade moteus')\n\nThe board firmware is ABI version 0x{old:04x} but this moteus_tool only supports up to 0x{SUPPORTED_ABI_VERSION:04x}")
 
+    def _fixed_path_is_drv8353(self):
+        '''Whether firmware >= 0x010100 programs this board through the
+        DRV8353 gate-drive tables.  Mirrors the corrected drv8323.cc
+        boolean: family 0 rev<=6 and family 2 (moteus-c1) use the DRV8323
+        path, everything else (family 0 rev>=7, n1, x1) uses the DRV8353
+        path.'''
+        family = self.board_family or 0
+        if family == 0:
+            if self.board_hwrev is None:
+                # hwrev has been reported since 2020; if it is somehow
+                # missing assume an older board which were only r4.5's
+                # using drv8323.
+                return False
+            return self.board_hwrev >= 7
+        if family == 2:
+            return False
+        return True
+
     def fix_config(self, old_config):
         lines = old_config.split(b'\n')
         items = dict([line.split(b' ') for line in lines if b' ' in line])
+
+        def remap_drv8323(key, old_table, new_table):
+            # Rewrite drv8323_conf.<key> so the firmware being flashed selects
+            # the same register index the current firmware did.  If the value
+            # already encodes that index under the new table, leave it alone:
+            # otherwise it would needlessly snap to the canonical table entry
+            # and not round-trip across an upgrade/downgrade pair.
+            full_key = b'drv8323_conf.' + key
+            if full_key not in items:
+                return
+            old_value = int(float(items[full_key]))
+            target = _map_choice(old_table, old_value)
+            if _map_choice(new_table, old_value) == target:
+                return
+            new_value = new_table[target]
+            items[full_key] = str(new_value).encode('utf8')
+            print(f"Remapped {full_key.decode('utf8')} "
+                  f"{old_value} -> {new_value} for 0x010100")
+
+        if self.new <= 0x010000 and self.old >= 0x010100:
+            # Downgrade across the 0x010100 boundary.  Invert the
+            # idriven_ls_ma table fix and the moteus-c1/n1 path
+            # correction (see the upgrade block below for rationale).
+            family = self.board_family or 0
+            if family == 2:
+                remap_drv8323(b'idrivep_hs_ma',
+                              IDRIVEP_TABLE_DRV8323, IDRIVEP_TABLE_DRV8353)
+                remap_drv8323(b'idriven_hs_ma',
+                              IDRIVEN_TABLE_DRV8323, IDRIVEN_TABLE_DRV8353)
+                remap_drv8323(b'idrivep_ls_ma',
+                              IDRIVEP_TABLE_DRV8323, IDRIVEP_TABLE_DRV8353)
+                remap_drv8323(b'idriven_ls_ma',
+                              IDRIVEN_TABLE_DRV8323, IDRIVEP_TABLE_DRV8353)
+                # ocp_deg_us is intentionally not remapped (see the
+                # upgrade block).
+                remap_drv8323(b'vds_lvl_mv',
+                              VDS_LVL_TABLE_DRV8323, VDS_LVL_TABLE_DRV8353)
+            elif family == 1:
+                if int(items.get(b'servo.pwm_rate_hz', b'0')) == 20000:
+                    print(f"Downgraded moteus-n1 pwm_rate to 30000 Hz")
+                    items[b'servo.pwm_rate_hz'] = b'30000'
+
+                # moteus-n1 returns from the DRV8353 path to the (incorrect)
+                # DRV8323 path that pre-0x010100 firmware used.  If the gate
+                # drive still looks like the 0x010100 defaults, restore the
+                # older defaults; otherwise preserve the register codes.
+                if _at_drv8323_defaults(items, N1_NEW_DEFAULTS):
+                    _set_drv8323_defaults(items, N1_OLD_DEFAULTS)
+                    print("moteus-n1 gate drive at defaults; restoring "
+                          "pre-0x010100 defaults")
+                else:
+                    remap_drv8323(b'idrivep_hs_ma',
+                                  IDRIVEP_TABLE_DRV8353, IDRIVEP_TABLE_DRV8323)
+                    remap_drv8323(b'idriven_hs_ma',
+                                  IDRIVEN_TABLE_DRV8353, IDRIVEN_TABLE_DRV8323)
+                    remap_drv8323(b'idrivep_ls_ma',
+                                  IDRIVEP_TABLE_DRV8353, IDRIVEP_TABLE_DRV8323)
+                    remap_drv8323(b'idriven_ls_ma',
+                                  IDRIVEN_TABLE_DRV8353, IDRIVEN_TABLE_DRV8323)
+            elif self._fixed_path_is_drv8353():
+                remap_drv8323(b'idriven_ls_ma',
+                              IDRIVEN_TABLE_DRV8353, IDRIVEP_TABLE_DRV8353)
+
+        if self.new <= 0x010e and self.old >= 0x010000:
+            # Nothing to do here.
+            pass
+
+        if self.new <= 0x010d and self.old >= 0x010e:
+            pid_dq_hz = float(items.pop(b'servo.pid_dq_hz', 100.0))
+            max_desired_rate = float(items.pop(b'servo.max_current_desired_rate', 10000.0))
+
+            inductance = float(items.pop(b'motor.inductance_d_H', 0))
+            items.pop(b'motor.inductance_q_H', None)
+            resistance = float(items.get(b'motor.resistance_ohm', 0))
+
+            twopi = 2 * math.pi
+            w = twopi * pid_dq_hz
+            kp = w * inductance if inductance > 0 else 0.005
+            ki = w * resistance if resistance > 0 else 30.0
+
+            items[b'servo.pid_dq.kp'] = str(kp).encode('utf8')
+            items[b'servo.pid_dq.ki'] = str(ki).encode('utf8')
+            items[b'servo.pid_dq.max_desired_rate'] = str(max_desired_rate).encode('utf8')
+            print(f"Downgraded servo.pid_dq_hz to servo.pid_dq kp={kp:.6g} ki={ki:.6g}")
+
+        if self.new <= 0x010c and self.old >= 0x010d:
+            for aux_num in [1, 2]:
+                key = f'aux{aux_num}.rs422'.encode('utf8')
+                rs422_val = items.pop(key, "0")
+                new_key = f'aux{aux_num}.uart.rs422'.encode('utf8')
+                items[new_key] = rs422_val
+                print(f"Downgraded aux{aux_num}.rs422 to aux{aux_num}.uart.rs422")
+
+        if self.new <= 0x010b and self.old >= 0x010c:
+            # Update all pll_filter_hz parameters.
+            for mpsource in range(0, 3):
+                key = f'motor_position.sources.{mpsource}.pll_filter_hz'.encode('utf8')
+                pll_filter_hz = float(items.get(key, 150.0))
+                natural_hz = pll_filter_hz / 2.48
+                items[key] = str(natural_hz).encode('utf8')
+                print(f"Downgraded motor_position.sources.{mpsource}.pll_filter_hz from {pll_filter_hz} to {natural_hz}")
 
         if self.new <= 0x010a and self.old >= 0x010b:
             flux_brake_margin_voltage = float(items.pop(b'servo.flux_brake_margin_voltage'))
@@ -150,7 +393,7 @@ class FirmwareUpgrade:
                         0 : b'450.0',
                         1 : b'450.0',
                         2 : b'100.0',
-                        }[self.board_family or 0]
+                        }.get(self.board_family or 0, b'nan')
                 else:
                     # If it was finite, then we'll try to set it
                     # appropriately based on what the PWM rate was.
@@ -516,10 +759,14 @@ class FirmwareUpgrade:
                     0 : 450.0,
                     1 : 450.0,
                     2 : 100.0,
-                }[self.board_family or 0]
+                }.get(self.board_family or 0)
 
                 old_max_power = float(items[b'servo.max_power_W'])
-                if old_max_power == board_default:
+                # x1 (family 3) and any future board defaulted max_power_W to
+                # the built-in board limit (a non-finite value); a value equal
+                # to a known family's old default also maps to the new
+                # board-limit default.  Both become NaN.
+                if not math.isfinite(old_max_power) or old_max_power == board_default:
                     items[b'servo.max_power_W'] = b'nan'
                 else:
                     pwm_rate = float(items.get(b'servo.pwm_rate_hz', 40000))
@@ -566,6 +813,119 @@ class FirmwareUpgrade:
                 print(f"Upgraded servo.motor_derate_temperature to servo.motor_temperature_margin={motor_temperature_margin}")
                 items[b'servo.motor_temperature_margin'] = str(motor_temperature_margin).encode('utf8')
 
+        if self.new >= 0x010c and self.old <= 0x010b:
+            # Update all pll_filter_hz parameters.
+            for mpsource in range(0, 3):
+                key = f'motor_position.sources.{mpsource}.pll_filter_hz'.encode('utf8')
+                natural_hz = float(items.get(key, 400.0))
+                pll_filter_hz = natural_hz * 2.48
+                items[key] = str(pll_filter_hz).encode('utf8')
+                print(f"Upgraded motor_position.sources.{mpsource}.pll_filter_hz from {natural_hz} to {pll_filter_hz}")
+
+        if self.new >= 0x010d and self.old <= 0x010c:
+            for aux_num in [1, 2]:
+                key = f'aux{aux_num}.uart.rs422'.encode('utf8')
+                rs422_val = items.pop(key, None)
+                if rs422_val is not None:
+                    new_key = f'aux{aux_num}.rs422'.encode('utf8')
+                    items[new_key] = rs422_val
+                    print(f"Upgraded aux{aux_num}.uart.rs422 to aux{aux_num}.rs422")
+
+        if self.new >= 0x010e and self.old <= 0x010d:
+            # Replace pid_dq/pid_q PI constants with bandwidth-in-Hz.
+            kp = float(items.pop(b'servo.pid_dq.kp', 0.005))
+            ki = float(items.pop(b'servo.pid_dq.ki', 30.0))
+            max_desired_rate = float(
+                items.pop(b'servo.pid_dq.max_desired_rate', 10000.0))
+
+            inductance = float(items.get(b'motor.inductance_d_H', 0))
+            resistance = float(items.get(b'motor.resistance_ohm', 0))
+
+            # Estimate bandwidth from ki/resistance (resistance is
+            # always calibrated on old firmware).  Then back-compute
+            # inductance from kp so the new firmware reproduces the
+            # same gains.
+            twopi = 2 * math.pi
+            if resistance > 0:
+                hz = ki / (twopi * resistance)
+            else:
+                hz = 100.0
+
+            w = twopi * hz
+            if inductance <= 0 and w > 0:
+                inductance = kp / w
+                items[b'motor.inductance_d_H'] = (
+                    str(inductance).encode('utf8'))
+                items[b'motor.inductance_q_H'] = (
+                    str(inductance).encode('utf8'))
+                print(f"Estimated motor.inductance_d_H="
+                      f"{inductance:.6g} from pid_dq gains")
+
+            items[b'servo.pid_dq_hz'] = str(hz).encode('utf8')
+            items[b'servo.max_current_desired_rate'] = (
+                str(max_desired_rate).encode('utf8'))
+            print(f"Upgraded servo.pid_dq to servo.pid_dq_hz={hz:.1f}")
+
+        if self.new >= 0x010000 and self.old <= 0x010e:
+            # Nothing to do.
+            pass
+
+        if self.new >= 0x010100 and self.old <= 0x010000:
+            # 0x010100 corrected the reg4 idriven_ls_ma calculation to use
+            # the DRV8353 pull-down (idriven) table and corrected the
+            # gate-driver family routing (moteus-c1 to the DRV8323 path,
+            # moteus-n1 to the DRV8353 path).  Remap the affected
+            # gate-drive config so the same register codes are written.
+            family = self.board_family or 0
+            if family == 2:
+                # moteus-c1 moves from the DRV8353 path to the DRV8323
+                # path.  Preserve every config-driven gate-drive register
+                # code (idriven_ls_ma was additionally on the wrong
+                # DRV8353 table, hence its IDRIVEP source).
+                remap_drv8323(b'idrivep_hs_ma',
+                              IDRIVEP_TABLE_DRV8353, IDRIVEP_TABLE_DRV8323)
+                remap_drv8323(b'idriven_hs_ma',
+                              IDRIVEN_TABLE_DRV8353, IDRIVEN_TABLE_DRV8323)
+                remap_drv8323(b'idrivep_ls_ma',
+                              IDRIVEP_TABLE_DRV8353, IDRIVEP_TABLE_DRV8323)
+                remap_drv8323(b'idriven_ls_ma',
+                              IDRIVEP_TABLE_DRV8353, IDRIVEN_TABLE_DRV8323)
+                # ocp_deg_us is intentionally not preserved: the c1
+                # firmware default stays at 4, so all c1 boards use the
+                # same 4us deglitch rather than the 6us it ran while
+                # mis-routed on the drv8353 path.
+                remap_drv8323(b'vds_lvl_mv',
+                              VDS_LVL_TABLE_DRV8353, VDS_LVL_TABLE_DRV8323)
+            elif family == 1:
+                if int(items.get(b'servo.pwm_rate_hz', b'0')) == 30000:
+                    print(f"Upgrading moteus-n1 pwm_rate to 20000 Hz for 1.1")
+                    items[b'servo.pwm_rate_hz'] = b'20000'
+
+                # moteus-n1 moves from the (incorrect) DRV8323 path back to
+                # the DRV8353 path.  If the gate drive is untouched (every
+                # field maps to the old default's register code) adopt the
+                # new, more conservative 0x010100 defaults; otherwise preserve
+                # the register codes across the path change.
+                if _at_drv8323_defaults(items, N1_OLD_DEFAULTS):
+                    _set_drv8323_defaults(items, N1_NEW_DEFAULTS)
+                    print("moteus-n1 gate drive at defaults; adopting new "
+                          "conservative defaults for 0x010100")
+                else:
+                    remap_drv8323(b'idrivep_hs_ma',
+                                  IDRIVEP_TABLE_DRV8323, IDRIVEP_TABLE_DRV8353)
+                    remap_drv8323(b'idriven_hs_ma',
+                                  IDRIVEN_TABLE_DRV8323, IDRIVEN_TABLE_DRV8353)
+                    remap_drv8323(b'idrivep_ls_ma',
+                                  IDRIVEP_TABLE_DRV8323, IDRIVEP_TABLE_DRV8353)
+                    remap_drv8323(b'idriven_ls_ma',
+                                  IDRIVEN_TABLE_DRV8323, IDRIVEN_TABLE_DRV8353)
+            elif self._fixed_path_is_drv8353():
+                # Boards that remain on the DRV8353 path (family 0 rev>=7 and
+                # x1) only need idriven_ls_ma corrected from the IDRIVEP table
+                # to the IDRIVEN table.
+                remap_drv8323(b'idriven_ls_ma',
+                              IDRIVEP_TABLE_DRV8353, IDRIVEN_TABLE_DRV8353)
+
         lines = [key + b' ' + value for key, value in items.items()]
         return b'\n'.join(lines)
 
@@ -595,19 +955,47 @@ def _average(x):
     return sum(x) / len(x)
 
 
+def _isint(x):
+    try:
+        int(x)
+        return True
+    except:
+        return False
+
+
+def _parse_uuid(x):
+    try:
+        maybe_uuid = bytes.fromhex(x)
+        if len(maybe_uuid) >= 4 and len(maybe_uuid) <= 16:
+            return maybe_uuid
+    except:
+        pass
+    try:
+        maybe_uuid = uuid.UUID(x)
+        return maybe_uuid.bytes
+    except:
+        pass
+    return None
+
+
 def expand_targets(targets):
-    result = set()
+    intset = set()
+    results = []
 
     for item in targets:
         fields = item.split(',')
         for field in fields:
-            if '-' in field:
-                first, last = field.split('-')
-                result |= set(range(int(first), int(last) + 1))
-            else:
-                result |= { int(field) }
+            maybe_uuid = _parse_uuid(field)
 
-    return sorted(list(result))
+            if field.count('-') == 1:
+                first, last = field.split('-')
+                intset |= set(range(int(first), int(last) + 1))
+            elif _isint(field) and int(field) < 0x7f:
+                intset |= { int(field) }
+            elif maybe_uuid is not None:
+                results.append(DeviceAddress(uuid=maybe_uuid))
+
+    return [DeviceAddress(can_id=x) for x in sorted(list(intset))] + results
 
 
 def _base64_serial_number(s1, s2, s3):
@@ -656,7 +1044,7 @@ class ElfMappings:
 
 
 class ElfData:
-    sections = []
+    sections: list = []
     firmware_version = None
 
 
@@ -717,7 +1105,7 @@ async def _copy_stream(inp, out):
         data = await inp.read(4096, block=False)
         if len(data) == 0:
             # EOF
-            exit(0)
+            sys.exit(0)
         out.write(data)
         await out.drain()
 
@@ -776,12 +1164,15 @@ def _verify_blocks(expected, message):
 
 
 class Stream:
-    def __init__(self, args, target_id, transport):
+    def __init__(self, args, target_id, transport,
+                 use_flow_control=None):
         self.args = args
+        self.transport = transport
         self.controller = moteus.Controller(target_id, transport=transport,
                                             can_prefix=args.can_prefix)
         self.stream = moteus.Stream(self.controller, verbose=args.verbose,
-                                    channel=args.diagnostic_channel)
+                                    channel=args.diagnostic_channel,
+                                    use_flow_control=use_flow_control)
 
     async def do_console(self):
         console_stdin = aiostream.AioStream(sys.stdin.buffer.raw)
@@ -828,6 +1219,10 @@ class Stream:
             return False
         return True
 
+    async def conf_write(self):
+        print("Saving to persistent storage with 'conf write'")
+        await self.command("conf write")
+
     async def read_uuid(self):
         try:
             text_data = await self.command("conf enumerate uuid")
@@ -872,26 +1267,25 @@ class Stream:
             position_raw = servo_stats.position_raw
             await self.command(f"conf set motor.position_offset {-position_raw:d}")
 
-        await self.command("conf write")
+        await self.conf_write()
         await self.command(f"d rezero {value}")
 
     async def do_restore_config(self, config_file):
         errors = []
 
-        with open(config_file, "r") as fp:
-            for line in fp.readlines():
-                if '#' in line:
-                    line = line[0:line.index('#')]
-                line = line.rstrip()
-                if len(line) == 0:
-                    continue
+        for line in _read_config_text(config_file).splitlines():
+            if '#' in line:
+                line = line[0:line.index('#')]
+            line = line.rstrip()
+            if len(line) == 0:
+                continue
 
-                try:
-                    await self.command(f'conf set {line}'.encode('latin1'))
-                except moteus.CommandError as ce:
-                    errors.append(line)
+            try:
+                await self.command(f'conf set {line}'.encode('latin1'))
+            except moteus.CommandError as ce:
+                errors.append(line)
 
-        await self.command(b'conf write')
+        await self.conf_write()
 
         if len(errors):
             print("\nSome config could not be set:")
@@ -900,7 +1294,7 @@ class Stream:
             print()
 
     async def do_write_config(self, config_file):
-        fp = open(config_file, "rb")
+        fp = io.BytesIO(_read_config_text(config_file).encode('latin1'))
         await self.write_config_stream(fp)
 
     async def write_config_stream(self, fp):
@@ -930,7 +1324,17 @@ class Stream:
                 print(f" {line}")
             print()
 
+    async def do_read(self, channel):
+        result = await self.read_data(channel)
+        print(json.dumps(namedtuple_to_dict(result), indent=2))
+
     async def do_flash(self, elffile):
+        # Check if the transport device for this target supports flashing
+        if not await self.transport.supports_flash_for_target(self.controller.id):
+            raise RuntimeError(
+                "Flashing is not supported over UART connections. "
+                "Use an fdcanusb or other CAN-FD adapter to flash firmware.")
+
         elf = _read_elf(elffile, [".text", ".ARM.extab", ".ARM.exidx",
                                   ".data", ".ccmram", ".isr_vector"])
         count_bytes = sum([len(section) for address, section in elf.sections])
@@ -953,7 +1357,8 @@ class Stream:
             if old_firmware is None else
             old_firmware.version,
             elf.firmware_version,
-            None if old_firmware is None else getattr(old_firmware, 'family', 0)
+            None if old_firmware is None else getattr(old_firmware, 'family', 0),
+            None if old_firmware is None else getattr(old_firmware, 'hwrev', None)
         )
 
         if not self.args.bootloader_active and not self.args.no_restore_config:
@@ -1012,23 +1417,24 @@ class Stream:
             cmd = f"w {final_address:x} {'ff' * remaining_to_flush}"
             result = await self.command(cmd)
 
-        verify_ctx = FlashContext(elfs)
-        while True:
-            expected_block = verify_ctx.get_next_block()
-            cmd = f"r {expected_block.address:x} {len(expected_block.data):x}"
-            result = await self.command(cmd, allow_any_response=True)
-            # Emit progress first, to make it easier to see where
-            # things go wrong.
-            self._emit_flash_progress(verify_ctx, "verifying")
-            _verify_blocks(expected_block, result)
-            done = verify_ctx.advance_block()
-            if done:
-                break
+        if not self.args.no_verify:
+            verify_ctx = FlashContext(elfs)
+            while True:
+                expected_block = verify_ctx.get_next_block()
+                cmd = f"r {expected_block.address:x} {len(expected_block.data):x}"
+                result = await self.command(cmd, allow_any_response=True)
+                # Emit progress first, to make it easier to see where
+                # things go wrong.
+                self._emit_flash_progress(verify_ctx, "verifying")
+                _verify_blocks(expected_block, result)
+                done = verify_ctx.advance_block()
+                if done:
+                    break
 
     async def read_servo_stats(self):
         servo_stats = await self.read_data("servo_stats")
         if servo_stats.mode == 1:
-            raise RuntimeError(f"Controller reported fault: {int(servo_stats.fault)}")
+            raise MoteusFault(int(servo_stats.fault))
         return servo_stats
 
     async def check_for_fault(self):
@@ -1041,7 +1447,8 @@ class Stream:
                 continue
             new_config.append(b'conf set ' + line + b'\n')
         await self.write_config_stream(io.BytesIO(b''.join(new_config)))
-        await self.command("conf write")
+
+        await self.conf_write()
 
         # Reset the controller so we're sure any config has taken
         # effect.
@@ -1083,6 +1490,19 @@ class Stream:
             i += 1
 
     async def do_calibrate(self):
+        try:
+            await self.do_checked_calibrate()
+        except MoteusFault as mf:
+            if mf.fault_code == 33:
+                print()
+                print("*** FAILED: Gate driver fault (code=33) during calibration: ")
+                drv8323 = await self.read_data("drv8323")
+                print(json.dumps(namedtuple_to_dict(drv8323), indent=2))
+                sys.exit(1)
+            else:
+                raise
+
+    async def do_checked_calibrate(self):
         self.firmware = await self.read_data("firmware")
 
         old_config = None
@@ -1178,8 +1598,12 @@ class Stream:
                 await self.calculate_bandwidth(winding_resistance, inductance,
                                                control_rate_hz)
 
-            await self.command(f"conf set servo.pid_dq.kp {kp}")
-            await self.command(f"conf set servo.pid_dq.ki {ki}")
+            if await self.is_config_supported("servo.pid_dq_hz"):
+                await self.command(
+                    f"conf set servo.pid_dq_hz {torque_bw_hz}")
+            else:
+                await self.command(f"conf set servo.pid_dq.kp {kp}")
+                await self.command(f"conf set servo.pid_dq.ki {ki}")
 
             await self.check_for_fault()
 
@@ -1193,9 +1617,31 @@ class Stream:
             unwrapped_position_scale)
         await self.check_for_fault()
 
+        inductance_d, inductance_q = None, None
+        kp_d, kp_q = kp, kp
+        if inductance and await self.is_config_supported("motor.inductance_d_H"):
+            inductance_d, inductance_q = await self.calibrate_dq_inductance(
+                resistance_cal_voltage, input_V)
+            await self.check_for_fault()
+
         motor_kv = await self.calibrate_kv_rating(
             input_V, unwrapped_position_scale, motor_output_sign)
         await self.check_for_fault()
+
+        inductance_d_scale = 0.0
+        if (self.args.cal_measure_ld_saturation and
+                hasattr(self, '_kv_v_per_hz')):
+            ld_result = await self.measure_ld_saturation(
+                winding_resistance, unwrapped_position_scale)
+            if ld_result is not None:
+                inductance_d, inductance_d_scale = ld_result
+            await self.check_for_fault()
+        elif await self.is_config_supported("motor.inductance_d_scale"):
+            # Not measuring saturation this run — report the value
+            # already configured on the controller so the calibration
+            # report reflects reality.
+            inductance_d_scale = await self.read_config_double(
+                "motor.inductance_d_scale")
 
         # Rezero the servo since we just spun it a lot.
         await self.command("d rezero")
@@ -1224,8 +1670,7 @@ class Stream:
         device_info = await self.get_device_info()
 
         if not self.args.cal_no_update:
-            print("Saving to persistent storage")
-            await self.command("conf write")
+            await self.conf_write()
         else:
             # Restore our baseline configuration.
             print("Restoring baseline configuration for --cal-no-update")
@@ -1245,7 +1690,11 @@ class Stream:
             'calibration' : cal_result.to_json(),
             'winding_resistance' : winding_resistance,
             'inductance' : inductance,
-            'pid_dq_kp' : kp,
+            'inductance_d' : inductance_d,
+            'inductance_q' : inductance_q,
+            'inductance_d_scale' : inductance_d_scale,
+            'pid_dq_kp' : kp_d,
+            'pid_q_kp' : kp_q,
             'pid_dq_ki' : ki,
             'torque_bw_hz' : torque_bw_hz,
             'encoder_filter_bw_hz' : enc_bw_hz,
@@ -1256,6 +1705,7 @@ class Stream:
             'motor_position_output_sign' : motor_output_sign,
             'abi_version' : self.firmware.version,
             'voltage_mode_control' : voltage_mode_control,
+            'py_version' : version.VERSION,
         }
 
         log_filename = f"moteus-cal-{device_info['serial_number']}-{now.strftime('%Y%m%dT%H%M%S.%f')}.log"
@@ -1350,30 +1800,101 @@ class Stream:
         aux_number = await self.read_config_int(
             f"motor_position.sources.{commutation_source}.aux_number")
 
-        hall_cal_data = []
-        STEPS = 24
-        for i in range(STEPS):
-            phase = i / STEPS * 2 * math.pi
-            await self.command(f"d pwm {phase} {encoder_cal_voltage}")
-            await asyncio.sleep(0.5)
-            motor_position = await self.read_data("motor_position")
-            hall_cal_data.append(
-                (phase, motor_position.sources[commutation_source].raw))
+        # Sweep PWM phase across several electrical cycles, first
+        # forward and then reverse.  The dense scan serves two
+        # purposes: calibrate_hall identifies sign, offset and
+        # polarity (which only needs all six states), and every sector
+        # transition of every electrical cycle in both directions is
+        # circular-averaged into per-boundary phases so the firmware's
+        # motor.offset[] commutation correction table averages over
+        # several pole pairs rather than a single, possibly
+        # unrepresentative, one.  Averaging the two directions cancels
+        # the settling lag (and hall switching hysteresis, measured at
+        # ~10 deg-e on a typical hoverboard motor), which both
+        # dominates any single-direction scan and permits a much
+        # shorter per-step settle time.
+        #
+        # More cycles help only weakly beyond a few: the residual
+        # error is dominated by systematic pole-to-pole placement
+        # variation, so on a 30-pole test motor a 3-cycle scan landed
+        # within ~2 deg-e of the full-revolution table while taking a
+        # fifth of the time.
+        STEPS_PER_CYCLE = 90
+        settle_s = self.args.cal_hall_settle
+        full_rev_cycles = self.args.cal_motor_poles // 2
+        cycles = (full_rev_cycles
+                  if self.args.cal_hall_cycles <= 0 else
+                  min(self.args.cal_hall_cycles, full_rev_cycles))
+        total_steps = STEPS_PER_CYCLE * cycles
+        two_pi = 2 * math.pi
+
+        async def hall_sweep(step_range):
+            result = []
+            for i in step_range:
+                phase = i / STEPS_PER_CYCLE * two_pi
+                await self.command(
+                    f"d pwm {phase % two_pi:.6f} {encoder_cal_voltage}")
+                await asyncio.sleep(settle_s)
+                motor_position = await self.read_data("motor_position")
+                result.append(
+                    (phase, motor_position.sources[commutation_source].raw))
+            return result
+
+        try:
+            # Lock the rotor to the starting phase before sweeping.
+            await self.command(f"d pwm 0 {encoder_cal_voltage}")
+            await asyncio.sleep(1.0)
+
+            print(f"Sweeping {cycles} electrical cycle(s) forward")
+            sweep_fwd = await hall_sweep(range(total_steps + 1))
+            print(f"Sweeping {cycles} electrical cycle(s) reverse")
+            sweep_rev = await hall_sweep(range(total_steps, -1, -1))
+        finally:
+            await self.command("d stop")
 
         if self.args.cal_write_raw:
             with open(self.args.cal_write_raw, "wb") as f:
-                f.write(json.dumps(hall_cal_data, indent=2).encode('utf8'))
-
-        await self.command("d stop")
+                f.write(json.dumps(
+                    {'forward': sweep_fwd, 'reverse': sweep_rev},
+                    indent=2).encode('utf8'))
 
         # See if we support phase_invert.
         allow_phase_invert = \
             await self.is_config_supported("motor.phase_invert")
 
         cal_result = ce.calibrate_hall(
-            hall_cal_data,
+            sweep_fwd,
             desired_direction=1 if not self.args.cal_invert else -1,
             allow_phase_invert=allow_phase_invert)
+
+        # Compute the per-sector boundary corrections before writing
+        # any configuration, so a failure here leaves the device
+        # untouched.
+        offset_table, boundary_phases, observations = \
+            ce.build_hall_offset_table_multi(
+                [sweep_fwd, sweep_rev], cal_result,
+                poles=self.args.cal_motor_poles)
+
+        summaries = ce.summarize_hall_observations(
+            boundary_phases, observations)
+        print("Hall boundary deltas (deg): "
+              "mean / fwd-rev hysteresis / spread across cycles")
+        for k, s in enumerate(summaries):
+            print(f"  {k}: {math.degrees(s.delta):+6.1f} / "
+                  f"{math.degrees(s.hysteresis):5.1f} / "
+                  f"{math.degrees(s.spread):5.1f}")
+        noisy = [k for k, s in enumerate(summaries)
+                 if s.count_up != cycles or s.count_down != cycles]
+        if noisy:
+            print(f"WARNING: unexpected transition counts at "
+                  f"boundaries {noisy}; the hall readings may be "
+                  f"noisy or the rotor may not be settling")
+
+        # Carry the boundary statistics into the calibration report,
+        # since that is often the only thing users share.
+        cal_result.sweep_cycles = cycles
+        cal_result.boundary_summaries = summaries
+        cal_result.noisy_boundaries = noisy
 
         await self.command(f"conf set motor.poles {self.args.cal_motor_poles}")
         await self.command(f"conf set motor_position.sources.{commutation_source}.sign {cal_result.sign}")
@@ -1383,8 +1904,8 @@ class Stream:
             await self.command(
                 f"conf set motor.phase_invert {1 if cal_result.phase_invert else 0}")
 
-        for i in range(64):
-            await self.command(f"conf set motor.offset.{i} 0")
+        for i, value in enumerate(offset_table):
+            await self.command(f"conf set motor.offset.{i} {value:.6f}")
 
         return cal_result
 
@@ -1618,13 +2139,15 @@ class Stream:
         # non-linear, corrupting the result.
 
         # What we'll do is take the very last result, and the last
-        # result that is less than 70% of the current of the last
+        # result that is less than X% of the current of the last
         # result.
 
         last_result = results[-1]
 
-        less_than = [x for x in results if x[1] < 0.60 * last_result[1]][-1]
-
+        less_than_X = [x for x in results if x[1] < 0.60 * last_result[1]]
+        if len(less_than_X) == 0:
+            raise RuntimeError(f"Could not detect resistance, is motor connected?  Peak current only {last_result[1]:.3f}A w/ {last_result[0]:.3f}V applied.")
+        less_than = less_than_X[-1]
 
         resistance = ((last_result[0] - less_than[0]) /
                       (last_result[1] - less_than[1]))
@@ -1673,7 +2196,7 @@ class Stream:
 
 
     async def calibrate_inductance(self, cal_voltage, input_V):
-        print("Calculating motor inductance")
+        print("Calculating preliminary motor inductance")
 
         old_motor_poles = await self.read_config_int("motor.poles")
         if old_motor_poles == 0:
@@ -1743,7 +2266,125 @@ class Stream:
             raise RuntimeError(f'Inductance too small ({inductance} < 1e-6)')
 
         print(f"Calculated inductance: {inductance}H")
+
+        if await self.is_config_supported("motor.inductance_d_H"):
+            await self.command(f"conf set motor.inductance_d_H {inductance}")
+            await self.command(f"conf set motor.inductance_q_H {inductance}")
+        elif await self.is_config_supported("motor.inductance_H"):
+            await self.command(f"conf set motor.inductance_H {inductance}")
+
         return inductance
+
+    async def _measure_inductance_axis(self, cal_voltage, input_V,
+                                       period, axis):
+        """Measure inductance on a single axis (0=d, 1=q).
+
+        Requires encoder calibration to be complete so the DQ frame is
+        aligned to the rotor.
+        """
+        offset = min(0.2 * input_V, cal_voltage)
+        ind_voltage = min(0.15 * input_V, 0.80 * cal_voltage)
+        await asyncio.wait_for(
+            self.command(
+                f"d ind {ind_voltage} {period} o{offset} q{axis}"), 0.25)
+
+        start = time.time()
+        await asyncio.sleep(1.0)
+
+        # Hold position while we read the result.
+        await self.command(f"d pos nan 0 nan o{offset} b1")
+
+        end = time.time()
+        data = await self.read_servo_stats()
+
+        delta_time = end - start
+        di_dt = data.meas_ind_integrator / delta_time
+
+        if self.args.verbose:
+            print(f"  axis={axis} period={period} di_dt={di_dt}")
+
+        return ind_voltage / di_dt if di_dt > 0 else None
+
+    async def calibrate_dq_inductance(self, cal_voltage, input_V):
+        """Measure separate D-axis and Q-axis inductances.
+
+        This must be called after encoder calibration so that the DQ
+        frame is aligned to the physical rotor.
+        """
+        print("Measuring D/Q axis inductances")
+
+        # Find a good period by sweeping on the d-axis first.
+        periods_to_test = [2, 3, 4, 6, 8, 10, 12, 16, 20, 24, 32]
+        best_period = 4
+        highest_di_dt = None
+        since_highest = None
+
+        offset = min(0.2 * input_V, cal_voltage)
+        ind_voltage = min(0.15 * input_V, 0.80 * cal_voltage)
+
+        try:
+            for period in periods_to_test:
+                await asyncio.wait_for(
+                    self.command(
+                        f"d ind {ind_voltage} {period} o{offset} q0"), 0.25)
+                start = time.time()
+                await asyncio.sleep(0.5)
+                await self.command(f"d pos nan 0 nan o{offset} b1")
+                end = time.time()
+                data = await self.read_servo_stats()
+                di_dt = data.meas_ind_integrator / (end - start)
+
+                if self.args.verbose:
+                    print(f"  dq sweep period={period} di_dt={di_dt}")
+
+                if highest_di_dt is None or di_dt > highest_di_dt:
+                    highest_di_dt = di_dt
+                    best_period = period
+                    since_highest = 0
+                else:
+                    if since_highest is not None:
+                        since_highest += 1
+
+                if (highest_di_dt > 0 and
+                    (di_dt < 0.5 * highest_di_dt or since_highest > 2)):
+                    break
+
+            await self.command("d stop")
+            await asyncio.sleep(0.1)
+        except (moteus.CommandError, asyncio.TimeoutError):
+            print("Firmware does not support DQ inductance measurement")
+            return None, None
+
+        if self.args.verbose:
+            print(f"  Using period={best_period}")
+
+        # Measure d-axis inductance.
+        L_d = await self._measure_inductance_axis(
+            cal_voltage, input_V, best_period, 0)
+        await self.command("d stop")
+        await asyncio.sleep(0.1)
+        await self.check_for_fault()
+
+        # Measure q-axis inductance.
+        L_q = await self._measure_inductance_axis(
+            cal_voltage, input_V, best_period, 1)
+        await self.command("d stop")
+        await asyncio.sleep(0.1)
+        await self.check_for_fault()
+
+        if L_d is None or L_q is None:
+            print("WARNING: Could not measure D/Q inductances")
+            return None, None
+
+        ratio = L_q / L_d if L_d > 0 else float('inf')
+        print(f"  L_d = {L_d:.6g} H")
+        print(f"  L_q = {L_q:.6g} H")
+        print(f"  Saliency ratio L_q/L_d = {ratio:.2f}")
+
+        await self.command(f"conf set motor.inductance_d_H {L_d}")
+        await self.command(f"conf set motor.inductance_q_H {L_q}")
+
+        return L_d, L_q
 
     async def set_encoder_filter(self, torque_bw_hz, inductance, control_rate_hz = None):
         # Check to see if our firmware supports encoder filtering.
@@ -1768,31 +2409,36 @@ class Stream:
                 if output_type == 4:  # kHall
                     hall_output = True
 
-            if inductance and hall_output:
-                desired_encoder_bw_hz = min(
-                    desired_encoder_bw_hz, 2e-2 / inductance)
+            # If we are calibrating a device with older firmware, we
+            # artifically limit the bandwidth for hall commutation
+            # sensors.
+            if self.firmware.version <= 0x010b:
+                if inductance and hall_output:
+                    desired_encoder_bw_hz = min(
+                        desired_encoder_bw_hz, 2e-2 / inductance)
 
-            # Also, limit the bandwidth for halls based on the number
-            # of poles and the estimated calibration speed.
-            if hall_output:
-                max_pole_bandwidth_hz = (
-                    0.5 * self.args.cal_motor_poles *
-                    self.args.cal_motor_speed)
-                desired_encoder_bw_hz = min(
-                    desired_encoder_bw_hz, max_pole_bandwidth_hz)
+                # Also, limit the bandwidth for halls based on the number
+                # of poles and the estimated calibration speed.
+                if hall_output:
+                    max_pole_bandwidth_hz = (
+                        0.5 * self.args.cal_motor_poles *
+                        self.args.cal_motor_speed)
+                    desired_encoder_bw_hz = min(
+                        desired_encoder_bw_hz, max_pole_bandwidth_hz)
 
 
         # And our bandwidth with the filter can be no larger than
-        # 1/30th the control rate.
-        encoder_bw_hz = min(control_rate_hz / 30, desired_encoder_bw_hz)
+        # a fixed fraction of the control rate.
+        encoder_bw_hz = min(control_rate_hz / 10, desired_encoder_bw_hz)
 
         if encoder_bw_hz != desired_encoder_bw_hz:
             print(f"Warning: using lower encoder bandwidth than "+
                   f"requested: {encoder_bw_hz:.1f}Hz")
 
-        w_3db = encoder_bw_hz * 2 * math.pi
-        kp = 2 * w_3db
-        ki = w_3db * w_3db
+        encoder_natural_frequency_hz = encoder_bw_hz / 2.48
+        w_n = encoder_natural_frequency_hz * 2 * math.pi  # natural frequency for zeta=1.0
+        kp = 2 * w_n
+        ki = w_n * w_n
 
         if servo_style:
             await self.command(f"conf set servo.encoder_filter.enabled 1")
@@ -1800,7 +2446,12 @@ class Stream:
             await self.command(f"conf set servo.encoder_filter.ki {ki}")
         elif motor_position_style:
             commutation_source = await self.read_config_int("motor_position.commutation_source")
-            await self.command(f"conf set motor_position.sources.{commutation_source}.pll_filter_hz {encoder_bw_hz}")
+            output_hz = encoder_bw_hz if self.firmware.version >= 0x010c else encoder_natural_frequency_hz
+            await self.command(f"conf set motor_position.sources.{commutation_source}.pll_filter_hz {output_hz}")
+
+            output_source = await self.read_config_int("motor_position.output.source")
+            if output_source != commutation_source:
+                await self.command(f"conf set motor_position.sources.{output_source}.pll_filter_hz {output_hz}")
         else:
             assert False
         return kp, ki, encoder_bw_hz
@@ -2009,13 +2660,14 @@ class Stream:
                 raise RuntimeError(
                     f"v_per_hz measured as negative ({v_per_hz}), something wrong")
 
-            # Experimental verification of Kv using this protocol
-            # typically results in a determination of Kv roughly 14%
-            # below what an open circuit spin measures with an
-            # oscilloscope.  That is probably due to friction in the
-            # system and other non-linearities.
-            FUDGE = 1.14
-            motor_kv = FUDGE * 0.5 * 60 / v_per_hz
+            # Save for optional L_d saturation measurement.
+            self._kv_cal_voltage = kv_cal_voltage
+            self._kv_v_per_hz = v_per_hz
+
+            # Kv = RPM / V_peak_LL, and v_per_hz = V_peak_LN / f_mech
+            # Since V_peak_LL = sqrt(3) * V_peak_LN:
+            #   Kv = 60 / (sqrt(3) * v_per_hz)
+            motor_kv = 60 / (math.sqrt(3) * v_per_hz)
         else:
             motor_kv = self.args.cal_force_kv
             print(f"Using forced Kv: {self.args.cal_force_kv}")
@@ -2036,6 +2688,45 @@ class Stream:
 
         return motor_kv
 
+    async def measure_ld_saturation(self, winding_resistance,
+                                      unwrapped_position_scale):
+        """Measure D-axis effective inductance via multi-speed
+        steady-state regression.
+
+        Uses voltage-mode V_d injection: `d vdq V_d V_q` provides
+        inherently stable speed control (set by V_q), while a
+        V_d integral controller drives the measured d_A toward
+        each target level.  The device-facing protocol and the
+        analysis pipeline both live in ``ld_measure`` and
+        ``ld_saturation`` respectively; this method is thin glue
+        that owns device config reads/writes.
+        """
+        motor_poles = await self.read_config_int("motor.poles")
+        if motor_poles <= 0:
+            print("WARNING: motor.poles not set, skipping L_d measurement")
+            return None
+
+        params = ld_measure.LdSweepParams(
+            winding_resistance=winding_resistance,
+            unwrapped_position_scale=unwrapped_position_scale,
+            pp=motor_poles / 2.0,
+            v_per_hz=self._kv_v_per_hz,
+            kv_cal_voltage=self._kv_cal_voltage,
+            motor_power=self.args.cal_motor_power,
+            power_factor=self.args.cal_ld_power_factor,
+            voltage_factor=self.args.cal_ld_voltage_factor,
+        )
+
+        fit = await ld_measure.measure_and_fit(self, params, motor_poles)
+        if fit is None:
+            return None
+
+        await self.command(f"conf set motor.inductance_d_H {fit.B}")
+        if await self.is_config_supported("motor.inductance_d_scale"):
+            await self.command(
+                f"conf set motor.inductance_d_scale {fit.C}")
+        return (fit.B, fit.C)
+
     async def stop_and_idle(self):
         await self.command("d stop")
 
@@ -2055,65 +2746,6 @@ class Stream:
             if stop_count > 5:
                 return
             await asyncio.sleep(0.2)
-
-
-    async def do_restore_calibration(self, filename):
-        report = json.load(open(filename, "r"))
-
-        # Verify that the serial number matches.
-        device_info = await self.get_device_info()
-        if device_info['serial_number'] != report['device_info']['serial_number']:
-            raise RuntimeError(
-                f"Serial number in calibration ({report['serial_number']}) " +
-                f"does not match device ({device_info['serial_number']})")
-
-        cal_result = report['calibration']
-
-        await self.command(
-            f"conf set motor.poles {cal_result['poles']}")
-        if await self.is_config_supported("motor_position.sources.0.sign"):
-            await self.command(f"conf set motor_position.sources.0.sign {-1 if cal_result['invert'] else 1}")
-        else:
-            await self.command(
-                f"conf set motor.invert {1 if cal_result['invert'] else 0}")
-        if await self.is_config_supported("motor.phase_invert"):
-            phase_invert = cal_result.get('phase_invert', False)
-            await self.command(
-                f"conf set motor.phase_invert {1 if phase_invert else 0}")
-        for index, offset in enumerate(cal_result['offset']):
-            await self.command(f"conf set motor.offset.{index} {offset}")
-
-        await self.command(f"conf set motor.resistance_ohm {report['winding_resistance']}")
-        if await self.is_config_supported("motor.v_per_hz"):
-            await self.command(f"conf set motor.v_per_hz {report['v_per_hz']}")
-        elif await self.is_config_supported("motor.Kv"):
-            await self.command(f"conf set motor.Kv {report['kv']}")
-
-        pid_dq_kp = report.get('pid_dq_kp', None)
-        if pid_dq_kp is not None:
-            await self.command(f"conf set servo.pid_dq.kp {pid_dq_kp}")
-
-        pid_dq_ki = report.get('pid_dq_ki', None)
-        if pid_dq_ki is not None:
-            await self.command(f"conf set servo.pid_dq.ki {pid_dq_ki}")
-
-        enc_kp = report.get('encoder_filter_kp', None)
-        enc_ki = report.get('encoder_filter_ki', None)
-        enc_hz = report.get('encoder_filter_bw_hz', None)
-        if (enc_hz and
-            await self.is_config_supported(
-                "motor_position.sources.0.pll_filter_hz")):
-            await self.command(
-                f"conf set motor_position.sources.0.pll_filter_hz {enc_hz}")
-        elif await self.is_config_supported("servo.encoder_filter.kp"):
-            if enc_kp:
-                await self.command(f"conf set servo.encoder_filter.kp {enc_kp}")
-            if enc_ki:
-                await self.command(f"conf set servo.encoder_filter.ki {enc_ki}")
-
-        await self.command("conf write")
-
-        print("Calibration restored")
 
 
 class Runner:
@@ -2148,17 +2780,19 @@ class Runner:
         result = []
         self._discovered = True
 
-        for i in range(1, 127):
-            c = moteus.Controller(id=i, transport=self.transport)
-            try:
-                response = await asyncio.wait_for(
-                    c.query(), FIND_TARGET_TIMEOUT)
-                if response:
-                    result.append(i)
-            except asyncio.TimeoutError:
-                pass
+        discovered = await self.transport.discover(self.args.can_prefix)
 
-        return result
+        not_addressable = [x for x in discovered
+                           if x.address is None]
+
+        if len(not_addressable) > 0:
+            print("One or more controllers are not addressable")
+            print()
+            for x in not_addressable:
+                print(f' * {x}')
+            sys.exit(1)
+
+        return [x.address for x in discovered]
 
     def default_tel_stop(self):
         # The user might want to see what the device is spewing.
@@ -2178,7 +2812,11 @@ class Runner:
         return True
 
     async def run_action(self, target_id):
-        stream = Stream(self.args, target_id, self.transport)
+        # The bootloader does not support flow control frames, so
+        # disable probing when we intend to flash.
+        use_flow_control = False if self.args.flash else None
+        stream = Stream(self.args, target_id, self.transport,
+                        use_flow_control=use_flow_control)
 
         tel_stop = self.default_tel_stop()
         if self.args.tel_stop:
@@ -2209,12 +2847,12 @@ class Runner:
             await stream.do_restore_config(self.args.restore_config)
         elif self.args.write_config:
             await stream.do_write_config(self.args.write_config)
+        elif self.args.read:
+            await stream.do_read(self.args.read)
         elif self.args.flash:
             await stream.do_flash(self.args.flash)
         elif self.args.calibrate:
             await stream.do_calibrate()
-        elif self.args.restore_cal:
-            await stream.do_restore_calibration(self.args.restore_cal)
         else:
             raise RuntimeError("No action specified")
 
@@ -2236,6 +2874,7 @@ async def async_main():
 
     group = parser.add_mutually_exclusive_group()
 
+    group.add_argument('--version', action='store_true')
     group.add_argument('-s', '--stop', action='store_true',
                        help='command the servos to stop')
     group.add_argument('-i', '--info', action='store_true',
@@ -2248,8 +2887,13 @@ async def async_main():
                        help='restore a config saved with --dump-config')
     group.add_argument('--write-config', metavar='FILE',
                        help='write the given configuration')
+    group.add_argument('-r', '--read', metavar='CHAN',
+                       help='report the diagnostic channel as JSON')
     group.add_argument('--flash', metavar='FILE',
                        help='write the given elf file to flash')
+
+    parser.add_argument('--no-verify', action='store_true',
+                        help='do not verify after flashing')
 
     parser.add_argument('--no-restore-config', action='store_true',
                         help='do not restore config after flash')
@@ -2259,8 +2903,6 @@ async def async_main():
     group.add_argument('--calibrate', action='store_true',
                         help='calibrate the motor, requires full freedom of motion')
 
-    group.add_argument('--restore-cal', metavar='FILE', type=str,
-                        help='restore calibration from logged data')
     group.add_argument('--zero-offset', action='store_true',
                         help='set the motor\'s position offset')
     group.add_argument('--set-offset', metavar='O',
@@ -2278,7 +2920,7 @@ async def async_main():
                         help='calibrate a motor with hall commutation sensors')
 
     parser.add_argument('--cal-bw-hz', metavar='HZ', type=float,
-                        default=100.0,
+                        default=200.0,
                         help='configure current loop bandwidth in Hz')
     parser.add_argument('--encoder-bw-hz', metavar='HZ', type=float,
                         default=None,
@@ -2328,6 +2970,16 @@ async def async_main():
     parser.add_argument('--cal-motor-poles', metavar='N', type=int,
                         default=None,
                         help='number of motor poles (2x pole pairs)')
+    parser.add_argument('--cal-hall-cycles', metavar='N', type=int,
+                        default=3,
+                        help='electrical cycles to sweep in each '
+                        'direction during hall calibration; <= 0 '
+                        'sweeps a full mechanical revolution')
+    parser.add_argument('--cal-hall-settle', metavar='S', type=float,
+                        default=0.05,
+                        help='per-step settle time in seconds during '
+                        'hall calibration sweeps; increase for high '
+                        'inertia or high friction rotors')
     parser.add_argument('--cal-force-kv', metavar='Kv', type=float,
                         default=None,
                         help='do not calibrate Kv, but use the specified value')
@@ -2336,6 +2988,16 @@ async def async_main():
     parser.add_argument('--cal-disable-optimize', action='store_true',
                         help='prevent nonlinear commutation optimization')
 
+
+    parser.add_argument('--cal-measure-ld-saturation', action='store_true',
+                        help='measure D-axis inductance vs current after Kv cal')
+    parser.add_argument('--cal-ld-power-factor', metavar='F', type=float,
+                        default=6.0,
+                        help='multiple of cal-motor-power for L_d sweep')
+    parser.add_argument('--cal-ld-voltage-factor', metavar='F', type=float,
+                        default=1.0,
+                        help='max multiple of kv-cal-voltage for '
+                        'L_d speed sweep')
 
     parser.add_argument('--cal-max-remainder', metavar='F',
                         type=float, default=0.1,
@@ -2350,6 +3012,10 @@ async def async_main():
                         help='never use current mode calibration')
 
     args = parser.parse_args()
+
+    if args.version:
+        print(f"moteus_tool version '{version.VERSION}'")
+        sys.exit(0)
 
     with Runner(args) as runner:
         await runner.start()

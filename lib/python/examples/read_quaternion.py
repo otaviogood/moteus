@@ -53,16 +53,16 @@ async def main():
 
     # Configure which components to query based on command-line options
     if args.component == 'x':
-        qr._extra[0x072] = INT16  # Register.AUX2_QUATERNIONX
+        qr._extra[moteus.Register.AUX2_QUATERNIONX] = INT16
     elif args.component == 'y':
-        qr._extra[0x073] = INT16  # Register.AUX2_QUATERNIONY
+        qr._extra[moteus.Register.AUX2_QUATERNIONY] = INT16
     elif args.component == 'z':
-        qr._extra[0x074] = INT16  # Register.AUX2_QUATERNIONZ
+        qr._extra[moteus.Register.AUX2_QUATERNIONZ] = INT16
     else:  # Default to 'all'
         qr._extra = {
-            0x072: INT16,  # Register.AUX2_QUATERNIONX
-            0x073: INT16,  # Register.AUX2_QUATERNIONY
-            0x074: INT16,  # Register.AUX2_QUATERNIONZ
+            moteus.Register.AUX2_QUATERNIONX: INT16,
+            moteus.Register.AUX2_QUATERNIONY: INT16,
+            moteus.Register.AUX2_QUATERNIONZ: INT16,
         }
     # Also query the absolute position from the Aux1 SPI encoder
     qr._extra[0x006] = F32  # Register.ABS_POSITION
@@ -80,9 +80,9 @@ async def main():
             result = await controller.query()
 
             # Extract the quaternion values, defaulting to 0 if not queried
-            quat_x = result.values.get(0x072, 0) if args.component in ['all', 'x'] else 0
-            quat_y = result.values.get(0x073, 0) if args.component in ['all', 'y'] else 0
-            quat_z = result.values.get(0x074, 0) if args.component in ['all', 'z'] else 0
+            quat_x = result.values.get(moteus.Register.AUX2_QUATERNIONX, 0) if args.component in ['all', 'x'] else 0
+            quat_y = result.values.get(moteus.Register.AUX2_QUATERNIONY, 0) if args.component in ['all', 'y'] else 0
+            quat_z = result.values.get(moteus.Register.AUX2_QUATERNIONZ, 0) if args.component in ['all', 'z'] else 0
 
             # Extract the absolute position value
             abs_pos = result.values.get(0x006, 0.0)

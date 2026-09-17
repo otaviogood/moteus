@@ -50,6 +50,7 @@ class MotorPosition {
       kSineCosine,
       kI2C,
       kSensorless,
+      kBissC,
 
       kNumTypes,
     };
@@ -74,6 +75,31 @@ class MotorPosition {
 
     float pll_filter_hz = 400.0;
 
+    // For hall sources only: lost-tracking recovery.  When in slow
+    // mode, if the time since the most recent hall transition
+    // exceeds (hall_lost_tracking_scale * prev_inter_sample_time),
+    // capped at hall_lost_tracking_max_s, the estimator slews
+    // filtered_value exponentially toward the centre of the current
+    // sector (compensated + 0.5 ticks) with time constant
+    // hall_lost_tracking_tau_s.
+    //
+    // This bounds the commutation angle error at +/-
+    // (sector_width / 2) regardless of how stale the inter-sample
+    // velocity estimate has become, guaranteeing the motor always
+    // has at least cos(60°) = 0.5 of its commanded torque available
+    // to break free of a stall caused by misaligned hall sensors.
+    //
+    // The scaled timeout adapts to the motor's actual speed: a
+    // fast motor at 100 ticks/s recovers in ~30 ms, a slow motor
+    // at 1 tick/s waits proportionally longer (capped).  A real
+    // hall-effect motor never operates so slowly that transitions
+    // are more than ~1/s apart, hence the conservative default
+    // cap.  Set hall_lost_tracking_scale or
+    // hall_lost_tracking_tau_s to 0 to disable.
+    float hall_lost_tracking_scale = 5.0f;
+    float hall_lost_tracking_max_s = 0.5f;
+    float hall_lost_tracking_tau_s = 0.05f;
+
     // The CPR for this source is subdivided into N equal segments.
     // This table specifies a fraction of CPR that should be applied
     // when at the *center* of that offset region.  Other counts will
@@ -94,6 +120,10 @@ class MotorPosition {
     // This is not serialized, but is calculated during configuration.
     bool cached_any_compensation_enabled = false;
 
+    // 1.0f / cpr.  Computed during configuration so that the ISR can
+    // avoid an f32 division in WrapCpr.
+    float cached_inv_cpr = 0.0f;
+
     template <typename Archive>
     void Serialize(Archive* a) {
       a->Visit(MJ_NVP(aux_number));
@@ -107,6 +137,9 @@ class MotorPosition {
       a->Visit(MJ_NVP(timeout_s));
       a->Visit(MJ_NVP(reference));
       a->Visit(MJ_NVP(pll_filter_hz));
+      a->Visit(MJ_NVP(hall_lost_tracking_scale));
+      a->Visit(MJ_NVP(hall_lost_tracking_max_s));
+      a->Visit(MJ_NVP(hall_lost_tracking_tau_s));
       a->Visit(MJ_NVP(compensation_table));
       a->Visit(MJ_NVP(compensation_scale));
     }
@@ -180,6 +213,32 @@ class MotorPosition {
     bool active_absolute = false;
     uint32_t raw = 0;
     float time_since_update = 0.0f;
+    float old_delta = 0.0f;
+    // For hall sources: the inter-sample time of the previous
+    // hall transition while in slow mode.  Used to scale the
+    // lost-tracking recovery timeout to the motor's current speed.
+    float prev_time_since_update = 0.0f;
+    uint8_t slow_count = std::numeric_limits<uint8_t>::max();
+
+    // For hall sources only.  hall_prev_dt is the previous inter-edge
+    // interval; hall_v2 is the two-edge (rise+fall averaged, hence
+    // rise/fall-asymmetry-free) velocity computed from it, with no
+    // rise-time calibration.  hall_v2 is the unbiased reference that
+    // the PLL-band DC bias correction adapts toward; it is NOT the
+    // slow-mode velocity (slow mode computes its own two-edge velocity
+    // inline, from prev_time_since_update and without the read-delay
+    // term).  hall_v2 is exactly 0.0f when no valid two-edge
+    // measurement is available (a real measurement always has a nonzero
+    // count delta, so 0.0f is unambiguous).
+    float hall_prev_dt = 0.0f;
+    float hall_v2 = 0.0f;
+
+    // Slowly-adapted estimate of the PLL velocity's DC bias (raw PLL
+    // velocity minus the unbiased two-edge velocity).  Subtracted from
+    // the reported velocity to remove the rise/fall bias without
+    // disturbing the loop.  Forced to zero in slow mode, where the
+    // reported velocity is already the unbiased two-edge measurement.
+    float hall_bias_est = 0.0f;
 
     // This will increment every time a new value is provided.
     uint8_t nonce = 0;
@@ -193,6 +252,11 @@ class MotorPosition {
     // This value is compensated_value + pll_filter
     float filtered_value = 0.0f;
 
+    // The velocity integral.  This is the reported, smoothed value.
+    float integral = 0.0f;
+
+    // The instantaneous velocity.  This is used to propagate
+    // filtered_value in time.
     float velocity = 0.0f;
 
     template <typename Archive>
@@ -202,10 +266,17 @@ class MotorPosition {
       a->Visit(MJ_NVP(active_absolute));
       a->Visit(MJ_NVP(raw));
       a->Visit(MJ_NVP(time_since_update));
+      a->Visit(MJ_NVP(old_delta));
+      a->Visit(MJ_NVP(prev_time_since_update));
+      a->Visit(MJ_NVP(slow_count));
+      a->Visit(MJ_NVP(hall_prev_dt));
+      a->Visit(MJ_NVP(hall_v2));
+      a->Visit(MJ_NVP(hall_bias_est));
       a->Visit(MJ_NVP(nonce));
       a->Visit(MJ_NVP(offset_value));
       a->Visit(MJ_NVP(compensated_value));
       a->Visit(MJ_NVP(filtered_value));
+      a->Visit(MJ_NVP(integral));
       a->Visit(MJ_NVP(velocity));
     }
   };
@@ -325,10 +396,19 @@ class MotorPosition {
     }
   }
 
-  void ISR_Update(float dt) MOTEUS_CCM_ATTRIBUTE {
+  void SetRate(float dt) {
+    dt_ = dt;
+    const float rate_hz = 1.0f / dt;
+
+    // Time constant used to decay a hall velocity estimate once the
+    // next edge is overdue.
+    hall_overdue_filter_ = 1.0f - (1.0f / (rate_hz * 0.020f));
+  }
+
+  void ISR_Update() MOTEUS_CCM_ATTRIBUTE {
     // First, fill in each of our sources raw data and do source level
     // filtering.
-    ISR_UpdateSources(dt);
+    ISR_UpdateSources();
 
     // Then update our output structures.
     ISR_UpdateState();
@@ -347,6 +427,24 @@ class MotorPosition {
 
   static int64_t FloatToInt(float value) MOTEUS_CCM_ATTRIBUTE {
     return (1ll << 32) * static_cast<int32_t>((1l << 16) * value);
+  }
+
+  // The raw int64_t position values used throughout this firmware
+  // encode a wrapped fixed-point quantity; rollover past INT64_MAX /
+  // INT64_MIN is part of the intended semantics.  Plain signed
+  // arithmetic on the C++ level is undefined on overflow, so all
+  // additions and subtractions of these wrapped values go through
+  // these helpers, which perform the operation in unsigned (which has
+  // well-defined modular wrap) and reinterpret the bit pattern as
+  // signed.
+  static int64_t WrappingAdd(int64_t a, int64_t b) MOTEUS_CCM_ATTRIBUTE {
+    return static_cast<int64_t>(
+        static_cast<uint64_t>(a) + static_cast<uint64_t>(b));
+  }
+
+  static int64_t WrappingSub(int64_t a, int64_t b) MOTEUS_CCM_ATTRIBUTE {
+    return static_cast<int64_t>(
+        static_cast<uint64_t>(a) - static_cast<uint64_t>(b));
   }
 
   // Set the output position to be the nearest value consistent with
@@ -380,6 +478,12 @@ class MotorPosition {
   Config* config() { return &config_; }
   BldcServoMotor* motor() { return &motor_; }
 
+  // Re-apply configuration and reset all position tracking state.
+  // Call after modifying config() to ensure changes take effect.
+  void ApplyConfig() {
+    HandleConfigUpdate();
+  }
+
   // The high 32 bits of (position - position_relative).
   std::atomic<int32_t> absolute_relative_delta;
 
@@ -387,10 +491,26 @@ class MotorPosition {
     return WrapCpr(value + 1.5f * cpr, cpr) - 0.5f * cpr;
   }
 
+  // Faster variant for ISR use when an inverse cpr has been
+  // precomputed.  Callers must pass inv_cpr == 1.0f / cpr.
+  static float WrapBalancedCpr(float value, float cpr, float inv_cpr)
+      MOTEUS_CCM_ATTRIBUTE {
+    return WrapCpr(value + 1.5f * cpr, cpr, inv_cpr) - 0.5f * cpr;
+  }
+
   static float WrapCpr(float value, float cpr) MOTEUS_CCM_ATTRIBUTE {
     // We would use fmodf, but we're trying to be fast there.
 
     const int32_t divisor = static_cast<int>(value / cpr);
+    const float mod = value - divisor * cpr;
+    return (mod >= 0.0f) ? mod : (mod + cpr);
+  }
+
+  // Faster variant for ISR use when an inverse cpr has been
+  // precomputed.  Callers must pass inv_cpr == 1.0f / cpr.
+  static float WrapCpr(float value, float cpr, float inv_cpr)
+      MOTEUS_CCM_ATTRIBUTE {
+    const int32_t divisor = static_cast<int>(value * inv_cpr);
     const float mod = value - divisor * cpr;
     return (mod >= 0.0f) ? mod : (mod + cpr);
   }
@@ -407,7 +527,8 @@ class MotorPosition {
         config.type == SourceConfig::kI2C ||
         config.type == SourceConfig::kHall ||
         config.type == SourceConfig::kSineCosine ||
-        config.type == SourceConfig::kUart;
+        config.type == SourceConfig::kUart ||
+        config.type == SourceConfig::kBissC;
   };
 
   void HandleConfigUpdate() {
@@ -439,7 +560,7 @@ class MotorPosition {
       source_config.sign = (source_config.sign >= 0) ? 1 : -1;
       source_config.i2c_device =
           std::min<uint8_t>(source_config.i2c_device,
-                            aux_status_[0]->i2c.devices.size());
+                            aux_status_[0]->i2c.devices.size() - 1);
 
       source_config.cached_any_compensation_enabled = false;
       if (source_config.compensation_scale != 0.0f) {
@@ -473,7 +594,16 @@ class MotorPosition {
           const float source_rate_hz =
               1000000.0f /
               aux_config->uart.poll_rate_us;
-          const float max_pll_hz = source_rate_hz / 10.0f;
+          const float max_pll_hz = source_rate_hz / 4.0f;
+          source_config.pll_filter_hz =
+              std::min(source_config.pll_filter_hz, max_pll_hz);
+          break;
+        }
+        case SourceConfig::kBissC: {
+          const float source_rate_hz =
+              1000000.0f /
+              aux_config->bissc.poll_rate_us;
+          const float max_pll_hz = source_rate_hz / 4.0f;
           source_config.pll_filter_hz =
               std::min(source_config.pll_filter_hz, max_pll_hz);
           break;
@@ -490,6 +620,8 @@ class MotorPosition {
             source_config.cpr = 65536;
           } else if (mode == M::kIcPz) {
             source_config.cpr = 16777216;
+          } else if (mode == M::kOrbis) {
+            source_config.cpr = 16384;  // 14-bit
           }
 
           break;
@@ -502,7 +634,7 @@ class MotorPosition {
           const float source_rate_hz =
               1000000.0f /
               aux_config->i2c.devices[source_config.i2c_device].poll_rate_us;
-          const float max_pll_hz = source_rate_hz / 10.0f;
+          const float max_pll_hz = source_rate_hz / 4.0f;
           source_config.pll_filter_hz =
               std::min(source_config.pll_filter_hz, max_pll_hz);
           break;
@@ -529,6 +661,10 @@ class MotorPosition {
           break;
         }
       }
+
+      source_config.cached_inv_cpr =
+          (source_config.cpr != 0) ?
+          (1.0f / static_cast<float>(source_config.cpr)) : 0.0f;
     }
 
     if (config_.commutation_source < 0 ||
@@ -595,8 +731,11 @@ class MotorPosition {
 
     // If we have a reference source, check it out.
     if (config_.output.reference_source >= 0) {
-      config_.output.reference_source = std::min<int8_t>(
-          config_.sources.size(), config_.output.reference_source);
+      if (config_.output.reference_source >=
+          static_cast<int>(config_.sources.size())) {
+        status_.error = Status::kInvalidConfig;
+        return;
+      }
       // It must be referenced to the output.
       const auto& output_reference_config =
           config_.sources[config_.output.reference_source];
@@ -646,9 +785,54 @@ class MotorPosition {
       const auto& config = config_.sources[i];
       auto& constants = pll_filter_constants_[i];
 
-      const float w_3db = config.pll_filter_hz * k2Pi;
-      constants.kp = 2.0f * w_3db;
-      constants.ki = w_3db * w_3db;
+      // w_n = natural frequency, not the 3dB cutoff frequency
+      //
+      // They are related by w_3db / w_n = r(zeta)
+      //
+      // Where r(zeta) = sqrt((2 + 4 * zeta**2 + sqrt((2 + 4 * zeta**2)**2 + r)) / 2)
+      //
+      // Derived from: https://www.dsprelated.com/showarticle/973.php
+      // Appendix B.
+      //
+      // In the s domain, the closed loop response is:
+      //
+      // CL(s) = (2 * zeta * w_n * s + w_n ** 2) / (s**2 + 2 * zeta * w_n + w_n ** 2)
+      //
+      // For a test frequency ω, substitute jω in for s and
+      // taking the magnitude squared yields:
+      //
+      //  |CL(jω)|**2 = ((2 * zeta * w_n * ω) ** 2 + ω ** 4) / ((w_n ** 2 - ω ** 2) ** 2 + (2 *  zeta * w_n * ω) ** 2)
+      //
+      // r = ω / w_n
+      //
+      //  |CL(jω)|**2 = ((2 * zeta * r) ** 2 + 1) / ((1 - r ** 2) ** 2 + (2 * zeta * r) ** 2)
+      //
+      // The 3dB point is where |CL(j * w_3db)| ** 2 = 1/2
+      // and set r_c = w_3db / w_n
+      //
+      //  2 * ((2 * zeta * r_c) ** 2 + 1) = (1 - r_c ** 2) ** 2 + (2 * zeta * r_c) ** 2
+      //
+      // Solve for r_c:
+      //
+      //  -r_c ** 4 + (2 + r * zeta ** 2) * r_c ** 2 + 1 = 0
+      //
+      // Let x = r_c ** 2
+      //
+      //  x ** 2 - (2 + 4 * zeta ** 2) * x - 1 = 0
+      //
+      // Solve for x with quadratic formula:
+      //
+      //   x= (2 + 4 * zeta ** 2 + sqrt((2 + 4 * zeta ** 2) ** 2 + 4)) / 2
+      //
+      // and r(zeta) = sqrt(x)
+      //
+      //  r(zeta) = sqrt((2 + 4 * zeta ** 2 + sqrt((2 + 4 * zeta ** 2) ** 2 + 4)) / 2)
+      //
+      // r(1.0) ~= 2.48
+      const float w_n = (config.pll_filter_hz / 2.48f) * k2Pi;
+      const float zeta = 1.0f;
+      constants.kp = 2.0f * zeta * w_n;
+      constants.ki = w_n * w_n;
     }
   }
 
@@ -706,26 +890,33 @@ class MotorPosition {
       // cycles.  This ensures that our relative position remains
       // exactly in sync with the encoder value.
       const auto modulo_delta =
-          status_.position_relative_raw - status_.position_relative_modulo;
+          WrappingSub(status_.position_relative_raw,
+                      status_.position_relative_modulo);
       if ((modulo_delta >> 32) < output_encoder_step_hb_1_4_ &&
           encoder_ratio > 0.75f) {
-        status_.position_relative_modulo -= output_encoder_step_;
+        status_.position_relative_modulo =
+            WrappingSub(status_.position_relative_modulo,
+                        output_encoder_step_);
       } else if ((modulo_delta >> 32) > output_encoder_step_hb_3_4_ &&
                  encoder_ratio < 0.25f) {
-        status_.position_relative_modulo += output_encoder_step_;
+        status_.position_relative_modulo =
+            WrappingAdd(status_.position_relative_modulo,
+                        output_encoder_step_);
       }
 
       status_.position_relative_raw =
-          status_.position_relative_modulo +
-          scaled_int_encoder_ratio;
+          WrappingAdd(status_.position_relative_modulo,
+                      scaled_int_encoder_ratio);
 
       // Since position_relative is integral and exact, we can exactly
       // update our absolute position with no loss by applying its
       // incremental change to the absolute position.
       const auto relative_delta =
-          status_.position_relative_raw - old_position_relative_raw;
+          WrappingSub(status_.position_relative_raw,
+                      old_position_relative_raw);
 
-      status_.position_raw += relative_delta;
+      status_.position_raw =
+          WrappingAdd(status_.position_raw, relative_delta);
 
       if (output_status.active_absolute &&
           status_.homed == Status::kRelative) {
@@ -745,7 +936,11 @@ class MotorPosition {
 
       status_.position_relative = IntToFloat(status_.position_relative_raw);
       status_.position = IntToFloat(status_.position_raw);
-      status_.velocity = output_status.velocity * output_cpr_scale_;
+      // Report the DC-bias-corrected velocity (hall_bias_est is zero
+      // for non-hall sources and in slow mode).
+      status_.velocity =
+          (output_status.integral - output_status.hall_bias_est) *
+          output_cpr_scale_;
     }
 
     if (!output_status.active_velocity &&
@@ -761,7 +956,8 @@ class MotorPosition {
     }
 
     absolute_relative_delta.store(
-        (status_.position_raw - status_.position_relative_raw) >> 32);
+        WrappingSub(status_.position_raw,
+                    status_.position_relative_raw) >> 32);
 
     // If we have an output reference source, it is valid, the
     // position is valid, and we haven't had an index home yet, then
@@ -784,9 +980,10 @@ class MotorPosition {
     }
   }
 
-  void ISR_UpdateSources(float dt) MOTEUS_CCM_ATTRIBUTE {
+  void ISR_UpdateSources() MOTEUS_CCM_ATTRIBUTE {
     for (size_t i = 0; i < status_.sources.size(); i++) {
       const auto& config = config_.sources[i];
+      bool reset_to_compensated = false;
 
       if (config.type == SourceConfig::kNone) {
         continue;
@@ -834,6 +1031,17 @@ class MotorPosition {
               &status);
           break;
         }
+        case SourceConfig::kBissC: {
+          const auto* bissc_data = &this_aux->bissc;
+          if (!bissc_data->active) { break; }
+          status.raw = bissc_data->value;
+
+          updated = ISR_UpdateAbsoluteSource(
+              bissc_data->nonce, bissc_data->value,
+              config.offset, config.sign, config.cpr, true,
+              &status);
+          break;
+        }
         case SourceConfig::kSineCosine: {
           const auto* sc_data = &this_aux->sine_cosine;
 
@@ -875,10 +1083,110 @@ class MotorPosition {
 
           const uint32_t new_value = (status.offset_value + cpr + delta) % cpr;
 
+          const auto old_delta = status.old_delta;
+          if (delta != 0) {
+            status.old_delta = delta;
+          }
+
           updated = ISR_UpdateAbsoluteSource(
-              status.nonce + 1, new_value,
+              hall_data->nonce, new_value,
               0, 1, config.cpr, false,
               &status);
+
+          if (updated) {
+            const auto ratio = status.time_since_update * config.pll_filter_hz;
+            const bool hall_reversal = (delta * old_delta < 0.0f);
+
+            // Two-edge velocity, free of the open-collector rise/fall
+            // asymmetry: pairing this interval with the previous one
+            // spans exactly one rising and one falling edge, so the
+            // late-rising-edge error cancels out.  This is the
+            // unbiased reference the PLL-band DC bias correction
+            // adapts toward; slow mode computes its own two-edge
+            // velocity inline below (without this read-delay term).
+            //
+            // Each interval is read here in the source pass before
+            // ISR_UpdateState applies this cycle's dt_ increment, so
+            // each lands one dt_ short -- add dt_ back to each.
+            if (!hall_reversal && delta != 0 &&
+                status.hall_prev_dt > 0.0f) {
+              status.hall_v2 = (2.0f * delta) /
+                  ((status.time_since_update + dt_) +
+                   (status.hall_prev_dt + dt_));
+            } else {
+              status.hall_v2 = 0.0f;
+            }
+            status.hall_prev_dt =
+                hall_reversal ? 0.0f : status.time_since_update;
+
+            if (hall_reversal) {
+              if (&config == commutation_config_) {
+                // The direction changed from the most recent update to
+                // this one.  Reset the velocity to exactly zero and
+                // force the position to match the compensated value.
+                status.integral = 0.0f;
+                status.velocity = 0.0f;
+                reset_to_compensated = true;
+              }
+              // Don't update the filter: the possibly very short time
+              // from the previous event could cause instability.
+              status.time_since_update = 0.0f;
+              status.prev_time_since_update = 0.0f;
+              status.slow_count = std::numeric_limits<uint8_t>::max();
+              status.hall_bias_est = 0.0f;
+              updated = false;
+            } else if (ratio >
+                       ((status.slow_count >= 3) ? 0.20f : 0.25f)) {
+              // Slow mode: the velocity is measured directly from
+              // inter-sample spacing rather than through the PLL
+              // filter.  Hysteresis (enter at 0.25, leave at 0.20)
+              // keeps quantization jitter in ratio from chattering
+              // back and forth at the slow/PLL boundary.
+              if (status.slow_count < 3) {
+                status.slow_count++;
+              } else {
+                if (status.prev_time_since_update > 0.0f) {
+                  // Two-edge sliding window.  Unlike hall_v2, no
+                  // read-delay (+dt) term is needed here: slow mode
+                  // zeroes time_since_update in this source pass and
+                  // sets updated=false, so ISR_UpdateOutput's
+                  // unconditional += dt_ still runs while its own reset
+                  // is skipped.  That one-tick head start means the
+                  // value read here is already the full inter-edge
+                  // interval.  hall_v2 reads the same counter in the
+                  // source pass, but the PLL path zeroes it in the
+                  // output pass *after* that increment, so hall_v2's
+                  // reads come up one dt_ short per interval -- hence
+                  // the dt_ it adds back to each.  Adding that here
+                  // would over-inflate this full interval into an
+                  // underestimate.
+                  status.integral
+                      = status.velocity
+                      = (2.0f * delta) /
+                        (status.time_since_update +
+                         status.prev_time_since_update);
+                } else {
+                  status.integral
+                      = status.velocity
+                      = delta / status.time_since_update;
+                }
+                // Force the filtered position to match the compensated
+                // value at transition points.  The two-edge velocity
+                // is already unbiased, so no DC correction is applied.
+                reset_to_compensated = true;
+                status.prev_time_since_update = status.time_since_update;
+                status.time_since_update = 0.0f;
+                status.hall_bias_est = 0.0f;
+                updated = false;
+              }
+            } else if (status.time_since_update > 0.0f) {
+              // PLL mode (its DC bias is removed downstream against
+              // hall_v2).
+              status.slow_count = 0;
+              status.prev_time_since_update = 0.0f;
+            }
+          }
+
           break;
         }
         case SourceConfig::kQuadrature: {
@@ -917,7 +1225,8 @@ class MotorPosition {
                     config.cpr) * output_cpr_scale_;
                 const int64_t adjustment =
                     (1ll << 24) * static_cast<int32_t>((1l << 24) * ratio);
-                status_.position_relative_modulo -= adjustment;
+                status_.position_relative_modulo =
+                    WrappingSub(status_.position_relative_modulo, adjustment);
               }
             }
           }
@@ -945,6 +1254,7 @@ class MotorPosition {
       }
 
       const float cpr = config.cpr;
+      const float inv_cpr = config.cached_inv_cpr;
 
       if (config.debug_override >= 0) {
         status.active_theta = true;
@@ -960,27 +1270,27 @@ class MotorPosition {
                 status.offset_value +
                 lerp(config.compensation_table,
                      config.compensation_scale / 127.0f,
-                     static_cast<float>(status.offset_value) /
-                     cpr) * cpr,
-                cpr);
+                     static_cast<float>(status.offset_value) *
+                     inv_cpr) * cpr,
+                cpr, inv_cpr);
       } else {
         status.compensated_value = status.offset_value;
       }
 
-      status.time_since_update += dt;
+      status.time_since_update += dt_;
 
       if (!status.active_theta &&
           !status.active_velocity) {
         continue;
       }
 
-      status.filtered_value += dt * status.velocity;
-
       if (updated) {
         if (!old_active_velocity && status.active_velocity) {
           // This is our first update.  Just snap to the position.
           status.filtered_value = status.compensated_value;
-          status.velocity = 0;
+          status.integral = 0.0f;
+          status.velocity = 0.0f;
+          status.hall_bias_est = 0.0f;
           status.time_since_update = 0.0f;
         } else if (!old_active_theta && status.active_theta) {
           // Our velocity was valid before, so leave it alone.
@@ -992,39 +1302,176 @@ class MotorPosition {
           const float unwrapped_error =
               -(status.filtered_value - status.compensated_value);
           const float error =
-              WrapBalancedCpr(unwrapped_error, cpr);
+              WrapBalancedCpr(unwrapped_error, cpr, inv_cpr);
 
-          status.filtered_value +=
-              status.time_since_update * filter.kp * error;
+          status.integral += status.time_since_update * filter.ki * error;
+          status.velocity = status.integral + filter.kp * error;
 
-          status.velocity +=
-              status.time_since_update * filter.ki * error;
+          // Online DC bias estimate: The position PLL uses both
+          // falling and rising hall effect edges.  For constant speed
+          // motion, this results in it reciving update intervals of
+          // alternating sides, as the rise time is slower than the
+          // fall time.  For the formulation of PLL filter we use,
+          // that results in a steady state DC bias versus the true
+          // velocity.
+          //
+          // Track that varying offset between the PLL velocity and
+          // the two-edge velocity (which is free of the rise/fall
+          // asymmetry) and subtract it from the *reported* velocity
+          // downstream.  The loop state itself is left raw, so the
+          // filter keeps its full acceleration tracking and the slow
+          // estimate never injects v2's transient lag.
+          if (config.type == SourceConfig::kHall && status.hall_v2 != 0.0f) {
+            status.hall_bias_est += kHallBiasAdapt *
+                ((status.integral - status.hall_v2) - status.hall_bias_est);
+          }
 
           // We don't let our velocity get beyond 1 revolution in 8
           // encoder samples.
           const float max_velocity =
               0.125f * cpr / status.time_since_update;
-          if (status.velocity > max_velocity) {
-            status.velocity = max_velocity;
-          } else if (status.velocity < -max_velocity) {
-            status.velocity = -max_velocity;
-          }
+          status.integral =
+              ISR_Limit(status.integral, -max_velocity, max_velocity);
+          status.velocity =
+              ISR_Limit(status.velocity, -max_velocity, max_velocity);
         } else {
           status.filtered_value = status.compensated_value;
+          status.integral = 0.0f;
           status.velocity = 0.0f;
         }
 
         status.time_since_update = 0.0f;
       } else {
-        if (status.time_since_update > config.timeout_s) {
+        if (status.time_since_update > config.timeout_s &&
+            config.type != SourceConfig::kHall) {
           status.active_velocity = false;
           status.active_theta = false;
           status.active_absolute = false;
         }
       }
 
-      status.filtered_value = WrapCpr(status.filtered_value, cpr);
+      status.filtered_value += dt_ * status.velocity;
+
+      // For some types of encoders, we force the position to exactly
+      // match the compensated value.
+      if (reset_to_compensated) {
+        status.filtered_value = status.compensated_value;
+      }
+
+      if (config.type == SourceConfig::kHall) {
+        const auto err =
+            WrapBalancedCpr(
+                status.filtered_value - status.compensated_value,
+                cpr, inv_cpr);
+        const float velocity_sign = status.velocity > 0.0f ? 1.0f : -1.0f;
+        const float signed_err = err * velocity_sign;
+        const float max_err = std::min(1.0f, 0.5f + std::abs(status.velocity) / 10.0f);
+        // Decay the stale velocity only once the next edge is
+        // overdue.  In slow mode the dead-reckoned error sweeps
+        // 0 -> 1 count every inter-edge interval by construction, so
+        // any error threshold below max_err fires deterministically
+        // near the end of every sector even with a perfect velocity
+        // estimate, imposing a sawtooth on the reported velocity at
+        // the hall edge rate.
+        //
+        // "Overdue" is judged against two predictors of the expected
+        // inter-edge time, decaying only when the elapsed time
+        // exceeds both.  They are not independent -- in steady-state
+        // slow mode err equals velocity * elapsed time, so
+        // err > max_err is itself a time threshold at
+        // max_err / velocity, i.e. the mean of the last two intervals
+        // -- but they fail in different directions, so their max is a
+        // better predictor than either alone:
+        //
+        //  * err > max_err (elapsed > mean of last two intervals via
+        //    the two-edge velocity): robust when
+        //    prev_time_since_update is stale or unrepresentative,
+        //    e.g. near the slow/PLL hysteresis boundary; gating on
+        //    time alone measurably degrades those regimes.
+        //  * elapsed > margin * previous interval: robust when the
+        //    velocity estimate is high, and keeps ordinary hall
+        //    placement spread (sectors a few percent wider than the
+        //    two-interval mean predicts) from triggering the decay
+        //    at the tail of every wide sector.
+        //
+        // The position clamp below needs no time evidence: past the
+        // boundary the position is provably wrong regardless.
+        if (signed_err > max_err) {
+          const bool overdue =
+              (status.prev_time_since_update <= 0.0f) ||
+              (status.time_since_update >
+               kHallOverdueMargin * status.prev_time_since_update);
+          if (overdue) {
+            status.integral *= hall_overdue_filter_;
+            status.velocity *= hall_overdue_filter_;
+          }
+          if (&config == commutation_config_) {
+            status.filtered_value =
+                status.compensated_value + ISR_Limit(err, -max_err, max_err);
+          }
+        }
+
+        if (updated && &config == commutation_config_) {
+          // If we actually were updated and are being used for
+          // commutation, further ensure that we are no more than 0.5
+          // away at the transition point.
+          const float err2 = WrapBalancedCpr(
+              status.filtered_value - status.compensated_value,
+              cpr, inv_cpr);
+          status.filtered_value =
+              status.compensated_value + ISR_Limit(err2, -0.5f, 0.5f);
+        }
+
+        // Lost-tracking recovery: if no hall transition has been
+        // seen in much longer than the prior inter-sample interval
+        // (capped so a near-stopped motor still recovers in
+        // bounded time), exponentially slew filtered_value toward
+        // the centre of the current hall sector
+        // (compensated + 0.5 ticks) and decay the velocity estimate
+        // toward zero with the same time constant.  This bounds the
+        // commutation angle error at +/- (sector_width / 2) of the
+        // rotor's true electrical angle regardless of how stale the
+        // inter-sample velocity estimate has become, so the motor
+        // always has at least cos(60°) = 0.5 of its commanded
+        // torque available to "unstick" itself.
+        //
+        // Decaying velocity matches the heuristic's premise: once
+        // the timeout has elapsed we have evidence the motor is
+        // *not* moving as fast as the prior inter-sample interval
+        // suggested, so the stale velocity should not be trusted
+        // to keep advancing filtered_value through the sector.
+        if (&config == commutation_config_ &&
+            status.slow_count >= 3 &&
+            config.hall_lost_tracking_scale > 0.0f &&
+            config.hall_lost_tracking_tau_s > 0.0f) {
+          const float scaled = config.hall_lost_tracking_scale *
+              status.prev_time_since_update;
+          const float threshold =
+              (status.prev_time_since_update > 0.0f) ?
+              std::min(scaled, config.hall_lost_tracking_max_s) :
+              config.hall_lost_tracking_max_s;
+          if (status.time_since_update > threshold) {
+            const float alpha = dt_ / config.hall_lost_tracking_tau_s;
+            const float target_err = WrapBalancedCpr(
+                (status.compensated_value + 0.5f) - status.filtered_value,
+                cpr, inv_cpr);
+            status.filtered_value = WrapCpr(
+                status.filtered_value + alpha * target_err,
+                cpr, inv_cpr);
+            status.velocity *= (1.0f - alpha);
+            status.integral *= (1.0f - alpha);
+          }
+        }
+      }
+
+      status.filtered_value = WrapCpr(status.filtered_value, cpr, inv_cpr);
     }
+  }
+
+  static float ISR_Limit(float value, float min, float max) MOTEUS_CCM_ATTRIBUTE {
+    if (value < min) { return min; }
+    if (value > max) { return max; }
+    return value;
   }
 
   bool ISR_UpdateAbsoluteSource(
@@ -1162,6 +1609,24 @@ class MotorPosition {
 
   // Values cached after config changes to make runtime computation
   // faster.
+  float dt_ = 1.0f / 30000.0f;
+  float hall_overdue_filter_ = 1.0f;
+
+  // How late a hall edge must be, relative to the previous inter-edge
+  // interval, before dead-reckoning past the sector boundary decays
+  // the velocity estimate (in slow mode; outside slow mode
+  // prev_time_since_update is zero and the decay applies as soon as
+  // the boundary is crossed).  Sized to cover typical hall placement
+  // spread of a few percent.
+  static constexpr float kHallOverdueMargin = 1.05f;
+
+  // Per-edge adaptation rate of the DC bias estimate (hall_bias_est).
+  // This is set somewhat arbitrarily to get decent results across a
+  // range of accelerations on test data.  Ideally it would be instead
+  // structured to be relative to the configured PLL bandwidth, but
+  // that is work, and this is "good enough" for now.
+  static constexpr float kHallBiasAdapt = 0.02f;
+
   const SourceConfig* commutation_config_ = nullptr;
   const SourceStatus* commutation_status_ = nullptr;
   float commutation_pole_scale_ = 1.0f;
@@ -1202,6 +1667,7 @@ struct IsEnum<moteus::MotorPosition::SourceConfig::Type> {
         { T::kSineCosine, "sine_cosine" },
         { T::kI2C, "i2c" },
         { T::kSensorless, "sensorless" },
+        { T::kBissC, "bissc" },
       }};
   }
 };

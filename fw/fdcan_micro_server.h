@@ -45,6 +45,10 @@ class FDCanMicroServer : public mjlib::multiplex::MicroDatagramServer {
                   const std::string_view& data,
                   const Header& query_header,
                   const mjlib::micro::SizeCallback& callback) override {
+    // Enforce the contract advertised in properties().max_size; a
+    // larger payload would overrun buf_ and silently get sent as a
+    // zero-length frame (RoundUpDlc returns 0 above 64).
+    MJ_ASSERT(data.size() <= sizeof(buf_));
     const auto actual_dlc = RoundUpDlc(data.size());
     const uint32_t id =
         ((header.source & 0xff) << 8) |
@@ -140,6 +144,9 @@ class FDCanMicroServer : public mjlib::multiplex::MicroDatagramServer {
     if (value <= 32) { return 32; }
     if (value <= 48) { return 48; }
     if (value <= 64) { return 64; }
+    // Past the 64-byte CAN-FD limit; callers must enforce
+    // properties().max_size before getting here.
+    MJ_ASSERT(false);
     return 0;
   }
 

@@ -42,6 +42,22 @@ inline float WrapZeroToTwoPi(float x) {
   return (mod >= 0.0f) ? mod : (mod + k2Pi);
 }
 
+float WrapNegPiToPi(float) __attribute__((always_inline));
+
+inline float WrapNegPiToPi(float x) {
+  // Short-circuit the common case where x is already in range so
+  // we don't introduce ULP-level noise via WrapZeroToTwoPi's
+  // truncate-and-subtract.
+  if (x >= -kPi && x <= kPi) { return x; }
+
+  // Otherwise wrap into [0, 2*pi) then fold the upper half down.
+  // Wrapping first (rather than adding pi first) avoids the
+  // precision loss that would come from k2Pi not being exactly
+  // 2 * kPi in float.
+  const float wrapped = WrapZeroToTwoPi(x);
+  return (wrapped > kPi) ? (wrapped - k2Pi) : wrapped;
+}
+
 int32_t RadiansToQ31(float) __attribute__((always_inline));
 
 inline int32_t RadiansToQ31(float x) {
@@ -103,15 +119,13 @@ float pow2f_approx(float x) __attribute__((always_inline));
 inline float pow2f_approx(float x) {
   // From: https://gist.github.com/petrsm/079de9396d63e00d5994a7cc936ae9c7
 
-  volatile union {
-    float f;
-    unsigned int i;
-  } cvt;
-
   const float pi = static_cast<int>(x);
   const float pf = x - pi;
-  cvt.i = (1 << 23) * (static_cast<int>(x) + 127);
-  const float pow2i = cvt.f;
+  // __builtin_bit_cast lets the compiler use a single VMOV between
+  // integer and float registers instead of a memory round-trip
+  // through volatile.
+  const float pow2i = __builtin_bit_cast(float,
+      static_cast<unsigned int>((1 << 23) * (static_cast<int>(x) + 127)));
   float pow2f = 7.9204240219773237e-2f;
 
   pow2f = pow2f * pf + 2.2433836478672357e-1f;

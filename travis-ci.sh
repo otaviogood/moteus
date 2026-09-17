@@ -2,5 +2,6 @@
 
 set -ev
 
-./tools/bazel test --config=host //:host
+./tools/bazel test --test_size_filters= --test_tag_filters=-manual --config=host //:host
+./tools/bazel test --test_size_filters= --test_tag_filters=-manual,-no_ubsan --config=host_ubsan //:host
 ./tools/bazel build --config=target //:target

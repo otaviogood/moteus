@@ -14,12 +14,19 @@
 
 #pragma once
 
+#include <chrono>
 #include <memory>
 #include <optional>
 
 #include <boost/asio/awaitable.hpp>
+#include <boost/asio/co_spawn.hpp>
+#include <boost/asio/detached.hpp>
+#include <boost/asio/redirect_error.hpp>
+#include <boost/asio/steady_timer.hpp>
+#include <boost/asio/use_awaitable.hpp>
+#include <boost/date_time/posix_time/posix_time_types.hpp>
 
-#include "mjlib/io/deadline_timer.h"
+#include "mjlib/io/now.h"
 
 namespace moteus {
 namespace tool {
@@ -35,16 +42,24 @@ auto RunFor(const boost::asio::any_io_executor& executor,
 
   struct Context {
     bool done = false;
+    std::optional<boost::asio::steady_timer> timer;
   };
 
+  // boost::asio::deadline_timer was removed; use steady_timer with a
+  // chrono duration computed from the existing ptime-based deadline.
+  const auto wait_duration = std::chrono::microseconds(
+      (expires_at - mjlib::io::Now(executor.context())).total_microseconds());
+
   auto ctx = std::make_shared<Context>();
+  ctx->timer.emplace(executor);
+  ctx->timer->expires_after(wait_duration);
 
   boost::asio::co_spawn(
       executor,
-      [ctx, &executor, &object, expires_at]() -> boost::asio::awaitable<void> {
-        boost::asio::deadline_timer timer{executor};
-        timer.expires_at(expires_at);
-        co_await timer.async_wait(boost::asio::use_awaitable);
+      [ctx, &object]() -> boost::asio::awaitable<void> {
+        boost::system::error_code ec;
+        co_await ctx->timer->async_wait(
+            boost::asio::redirect_error(boost::asio::use_awaitable, ec));
         if (ctx->done) { co_return; }
 
         ctx->done = true;
@@ -52,9 +67,19 @@ auto RunFor(const boost::asio::any_io_executor& executor,
       },
       boost::asio::detached);
 
-  auto result = co_await f();
-  ctx->done = true;
-  co_return result;
+  // Ensure that whether @f returns normally or throws, we mark the
+  // watchdog as done and cancel its timer so it cannot fire a stale
+  // cancel() on @object after we return.
+  struct Guard {
+    std::shared_ptr<Context> ctx;
+    ~Guard() {
+      ctx->done = true;
+      ctx->timer->cancel();
+    }
+  };
+  Guard guard{ctx};
+
+  co_return co_await f();
 }
 
 }

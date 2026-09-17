@@ -36,7 +36,7 @@ bazel_toolchain_dependencies()
 load("@com_github_mjbots_bazel_toolchain//toolchain:rules.bzl", "llvm_toolchain")
 llvm_toolchain(
     name = "llvm_toolchain",
-    llvm_version = "10.0.0",
+    llvm_version = "20.1.8",
     urls = {
         "windows" : ["https://github.com/mjbots/bazel-toolchain/releases/download/0.5.6-mj20201011/LLVM-10.0.0-win64.tar.xz"],
     },
@@ -105,3 +105,32 @@ mbed_repository(
 load("@com_github_mjbots_bazel_deps//tools/workspace:default.bzl",
      bazel_deps_add = "add_default_repositories")
 bazel_deps_add()
+
+# Rust toolchain via rules_rust
+load("@rules_rust//rust:repositories.bzl", "rules_rust_dependencies", "rust_register_toolchains")
+
+rules_rust_dependencies()
+
+rust_register_toolchains(
+    edition = "2021",
+    versions = ["1.82.0"],
+)
+
+# Rust crate dependencies via crates_repository
+load("@rules_rust//crate_universe:repositories.bzl", "crate_universe_dependencies")
+
+crate_universe_dependencies()
+
+load("@rules_rust//crate_universe:defs.bzl", "crates_repository")
+load("//lib/rust:crates.bzl", "moteus_crate_packages")
+
+crates_repository(
+    name = "crate_index",
+    cargo_lockfile = "//lib/rust:Cargo.lock",
+    lockfile = "//lib/rust:Cargo.bazel.lock",
+    packages = moteus_crate_packages(),
+)
+
+load("@crate_index//:defs.bzl", "crate_repositories")
+
+crate_repositories()

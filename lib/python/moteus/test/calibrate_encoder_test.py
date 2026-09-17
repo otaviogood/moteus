@@ -16,7 +16,10 @@
 
 import asyncio
 import io
+import json
+import math
 import unittest
+import unittest.mock
 
 import moteus.calibrate_encoder as ce
 
@@ -2293,6 +2296,328 @@ class CalibrateEncoderTest(unittest.TestCase):
         self.assertEqual(result.offset, -4)
         self.assertEqual(result.sign, -1)
         self.assertEqual(result.phase_invert, 0)
+
+    def test_hall_bits_to_count_identity(self):
+        # With polarity=0, offset=0, sign=1 the helper must agree with
+        # the firmware's bits->count mapping verbatim.
+        cases = {1: 0, 3: 1, 2: 2, 6: 3, 4: 4, 5: 5}
+        for bits, expected in cases.items():
+            self.assertEqual(
+                ce.hall_bits_to_count(bits, offset=0, sign=1, polarity=0),
+                expected, f"bits={bits}")
+
+    def test_compute_hall_offset_table_perfect(self):
+        # When boundaries land exactly at the ideal angles, every
+        # table entry must be zero.
+        boundaries = [k / 6.0 * 2 * math.pi for k in range(6)]
+        table = ce.compute_hall_offset_table(boundaries, cpr=42)
+        self.assertEqual(len(table), 64)
+        for v in table:
+            self.assertAlmostEqual(v, 0.0, places=6)
+
+    def test_compute_hall_offset_table_misaligned(self):
+        # Two adjacent boundaries shifted in opposite directions
+        # (representative of a single misplaced sensor).  The offset
+        # table must put the boundary deltas at the corresponding
+        # table positions.
+        shifts = [0.0, 0.06, -0.06, 0.0, 0.0, 0.0]  # fractions of cycle
+        boundaries = [(k / 6.0 + s) * 2 * math.pi
+                      for k, s in enumerate(shifts)]
+        table = ce.compute_hall_offset_table(boundaries, cpr=42)
+
+        # At table index i=1 the lookup falls almost entirely on
+        # delta_1: ratio=1.5/64, filtered=ratio*cpr=63/64, so frac is
+        # 63/64 and the lerp leaks 1/64 of delta_0.
+        delta_0 = shifts[0] * 2 * math.pi
+        delta_1 = shifts[1] * 2 * math.pi
+        frac = (1.5 / 64) * 42  # 63/64 exactly
+        expected = (1.0 - frac) * delta_0 + frac * delta_1
+        self.assertAlmostEqual(table[1], expected, places=10)
+
+    @staticmethod
+    def _synthesize_hall_sweep(bounds_fn, cycles, steps_per_cycle,
+                               reverse=False):
+        """Generate (phase, sector) samples across `cycles` electrical
+        cycles.  bounds_fn(cycle) returns the 6 ascending boundary
+        phases (radians, within [0, 2*pi)) for that cycle; sector k
+        occupies [bounds[k], bounds[k+1]).
+        """
+        def sector_of(local, bounds):
+            s = -1
+            for k in range(6):
+                if local >= bounds[k]:
+                    s = k
+            return s % 6   # below bounds[0] wraps into sector 5
+
+        total = steps_per_cycle * cycles
+        order = range(total, -1, -1) if reverse else range(total + 1)
+        samples = []
+        for i in order:
+            phase = i / steps_per_cycle * 2 * math.pi
+            local = phase % (2 * math.pi)
+            cycle = min(int(phase / (2 * math.pi)), cycles - 1)
+            samples.append((phase, sector_of(local, bounds_fn(cycle))))
+        return samples
+
+    def test_find_hall_boundary_phases_multi_clean_sweep(self):
+        # A perfectly-aligned two-cycle forward sweep must locate
+        # every boundary at its ideal angle, observing each boundary
+        # once per cycle.  (The boundary-0 transition appears between
+        # consecutive cycles, so a single cycle would miss it.)
+        STEPS = 90
+        two_cycles = [
+            (i / STEPS * 2 * math.pi,
+             int(((i / STEPS * 2 * math.pi) % (2 * math.pi)) /
+                 (2 * math.pi / 6)) % 6)
+            for i in range(2 * STEPS + 1)]
+        multi, observations = ce.find_hall_boundary_phases_multi(
+            [two_cycles])
+        for k in range(6):
+            ideal = k * 2 * math.pi / 6
+            err = ((multi[k] - ideal + math.pi) %
+                   (2 * math.pi)) - math.pi
+            self.assertLess(abs(err), 2 * math.pi / STEPS,
+                            f"boundary {k}: got {multi[k]}, "
+                            f"ideal {ideal}, err {err}")
+            self.assertEqual(len(observations[k]), 2)
+
+    def test_find_hall_boundary_phases_multi_lag_cancels(self):
+        # The rotor lags the commanded phase by the load angle, in
+        # opposite senses for the two sweep directions: a forward
+        # sweep observes each boundary late, a reverse sweep early.
+        # The circular mean over both directions must recover the true
+        # boundary, and the per-direction observations must expose the
+        # hysteresis.
+        STEPS = 360
+        LAG = 0.06   # radians, ~3.4 deg
+        true_deltas = [0.02, -0.03, 0.01, 0.04, -0.02, 0.03]
+        true_bounds = [k * math.pi / 3 + d + 0.1
+                       for k, d in enumerate(true_deltas)]
+
+        fwd = self._synthesize_hall_sweep(
+            lambda c: [b + LAG for b in true_bounds], 2, STEPS)
+        rev = self._synthesize_hall_sweep(
+            lambda c: [b - LAG for b in true_bounds], 2, STEPS,
+            reverse=True)
+
+        multi, observations = ce.find_hall_boundary_phases_multi([fwd, rev])
+        tol = 2 * math.pi / STEPS
+        for k in range(6):
+            err = ((multi[k] - true_bounds[k] + math.pi) %
+                   (2 * math.pi)) - math.pi
+            self.assertLess(abs(err), tol,
+                            f"boundary {k}: err {err}")
+            # Two cycles in each direction.
+            self.assertEqual(len(observations[k]), 4)
+            # Per-direction means must straddle the true boundary by
+            # ~LAG each.
+            for direction, expected in ((1, LAG), (-1, -LAG)):
+                obs = [((w - true_bounds[k] + math.pi) % (2 * math.pi))
+                       - math.pi
+                       for w, d in observations[k] if d == direction]
+                self.assertEqual(len(obs), 2)
+                mean = sum(obs) / len(obs)
+                self.assertLess(abs(mean - expected), tol)
+
+    def test_find_hall_boundary_phases_multi_percycle_average(self):
+        # A boundary whose location varies from electrical cycle to
+        # electrical cycle (magnet placement) must come out at the
+        # average location, with the per-cycle values visible in the
+        # observations.
+        STEPS = 360
+        JITTER = 0.05
+        base = [k * math.pi / 3 + 0.1 for k in range(6)]
+
+        def bounds_fn(cycle):
+            b = list(base)
+            b[2] += JITTER if (cycle % 2) == 0 else -JITTER
+            return b
+
+        fwd = self._synthesize_hall_sweep(bounds_fn, 4, STEPS)
+        multi, observations = ce.find_hall_boundary_phases_multi([fwd])
+        tol = 2 * math.pi / STEPS
+        err = ((multi[2] - base[2] + math.pi) % (2 * math.pi)) - math.pi
+        self.assertLess(abs(err), tol)
+        # The individual observations alternate about the mean.
+        devs = sorted(((w - base[2] + math.pi) % (2 * math.pi)) - math.pi
+                      for w, d in observations[2])
+        self.assertEqual(len(devs), 4)
+        self.assertLess(abs(devs[0] - -JITTER), tol)
+        self.assertLess(abs(devs[-1] - JITTER), tol)
+
+    def test_find_hall_boundary_phases_multi_missing_raises(self):
+        # A sweep that never visits some sectors must fail with the
+        # missing ones named.
+        samples = [(0.0, 0), (1.0, 1), (2.0, 2),
+                   (3.0, 2), (4.0, 1), (5.0, 0)]
+        with self.assertRaises(RuntimeError) as cm:
+            ce.find_hall_boundary_phases_multi([samples])
+        msg = str(cm.exception)
+        self.assertIn("3", msg)
+        self.assertIn("4", msg)
+        self.assertIn("5", msg)
+
+    def test_find_hall_boundary_phases_multi_bounce_localized(self):
+        # A hall bounce -- the sampled count briefly re-crossing a
+        # boundary it just crossed -- must contribute a
+        # nearly-canceling pair of observations on the one boundary
+        # it occurred at, and must not perturb any other boundary at
+        # all.  (Attributing by phase direction instead of count
+        # delta would place the re-crossing on a neighboring
+        # boundary, 60 deg-e away.)
+        STEPS = 90
+        base = [k * math.pi / 3 for k in range(6)]
+        clean = self._synthesize_hall_sweep(lambda c: base, 3, STEPS)
+        bounced = list(clean)
+        # After the entry into sector 3 in the second cycle, make the
+        # following sample read sector 2 again.
+        for i in range(STEPS + 1, len(bounced)):
+            if bounced[i][1] == 3 and bounced[i - 1][1] == 2:
+                bounced[i + 1] = (bounced[i + 1][0], 2)
+                break
+        ref, _ = ce.find_hall_boundary_phases_multi([clean])
+        got, obs = ce.find_hall_boundary_phases_multi([bounced])
+        step = 2 * math.pi / STEPS
+        for k in range(6):
+            err = ((got[k] - ref[k] + math.pi) % (2 * math.pi)) - math.pi
+            # The bounced boundary may shift by a fraction of the
+            # rotor's actual wander; every other boundary's
+            # observations are untouched.
+            tol = 2 * step if k == 3 else 1e-9
+            self.assertLess(abs(err), tol, f"boundary {k}: err {err}")
+            # Boundary 3 saw its 3 per-cycle crossings plus the
+            # +1/-1 pair from the bounce.
+            self.assertEqual(len(obs[k]), 5 if k == 3 else 3)
+        self.assertEqual(
+            sum(1 for _, d in obs[3] if d == -1), 1)
+
+    def test_build_hall_offset_table_multi_invalid_bits_raises(self):
+        # Hall bits 0 and 7 are impossible with 120 degree sensors;
+        # an occurrence (loose wire, glitch) anywhere -- including in
+        # sweeps that calibrate_hall never validates -- must abort
+        # rather than be silently folded into the boundary estimates.
+        STEPS = 60
+        canon = [1, 3, 2, 6, 4, 5]
+        clean = []
+        for i in range(2 * STEPS + 1):
+            phase = i / STEPS * 2 * math.pi
+            local = phase % (2 * math.pi)
+            count = int(local / (2 * math.pi / 6)) % 6
+            clean.append((phase, canon[count]))
+        cal = ce.calibrate_hall(clean, desired_direction=1)
+        corrupt = list(clean)
+        corrupt[7] = (corrupt[7][0], 7)
+        with self.assertRaises(RuntimeError) as cm:
+            ce.build_hall_offset_table_multi([clean, corrupt], cal,
+                                             poles=14)
+        self.assertIn("invalid", str(cm.exception))
+        self.assertIn("sweep 1", str(cm.exception))
+
+    def test_summarize_hall_observations(self):
+        # The reporting helper must recover per-boundary delta,
+        # fwd/rev hysteresis, spread, and observation counts from a
+        # synthetic forward/reverse scan with a known lag.
+        STEPS = 360
+        LAG = 0.06
+        OFFSET = 0.1
+        true_deltas = [0.02, -0.03, 0.01, 0.04, -0.02, 0.03]
+        true_bounds = [k * math.pi / 3 + d + OFFSET
+                       for k, d in enumerate(true_deltas)]
+        fwd = self._synthesize_hall_sweep(
+            lambda c: [b + LAG for b in true_bounds], 2, STEPS)
+        rev = self._synthesize_hall_sweep(
+            lambda c: [b - LAG for b in true_bounds], 2, STEPS,
+            reverse=True)
+        bounds, obs = ce.find_hall_boundary_phases_multi([fwd, rev])
+        summaries = ce.summarize_hall_observations(bounds, obs)
+        tol = 2 * math.pi / STEPS
+        for k, s in enumerate(summaries):
+            self.assertLess(abs(s.delta - (true_deltas[k] + OFFSET)),
+                            tol, f"boundary {k} delta")
+            self.assertLess(abs(s.hysteresis - 2 * LAG), 2 * tol,
+                            f"boundary {k} hysteresis")
+            # Both cycles of each direction observe identical
+            # boundary placements, so the within-direction spread is
+            # negligible.
+            self.assertLess(s.spread, tol, f"boundary {k} spread")
+            self.assertEqual(s.count_up, 2)
+            self.assertEqual(s.count_down, 2)
+
+    def test_hall_calibration_result_to_json_boundaries(self):
+        # The calibration report is often the only artifact users
+        # share, so once populated the boundary statistics must make
+        # it through to_json and remain plain-JSON serializable.
+        result = ce.HallCalibrationResult()
+        result.sweep_cycles = 2
+        result.boundary_summaries = [
+            ce.HallBoundarySummary(
+                delta=0.1, hysteresis=0.2, spread=0.05,
+                count_up=2, count_down=2)
+            for _ in range(6)]
+        result.noisy_boundaries = [3]
+
+        report = json.loads(json.dumps(result.to_json()))
+        self.assertEqual(report['sweep_cycles'], 2)
+        self.assertEqual(report['noisy_boundaries'], [3])
+        self.assertEqual(len(report['boundaries']), 6)
+
+    def test_build_hall_offset_table_multi_invert_matches_forward(self):
+        # The motor.offset[] table reflects the physical hall layout
+        # and therefore must be the same regardless of whether
+        # --cal-invert was requested.  Build forward and reverse
+        # sweeps of a sign=-1 natural motor and verify the tables
+        # match for both desired_direction values.
+        STEPS = 60
+        canon = [1, 3, 2, 6, 4, 5]
+
+        def make_sweep(reverse):
+            order = range(2 * STEPS, -1, -1) if reverse \
+                else range(2 * STEPS + 1)
+            out = []
+            for i in order:
+                phase = i / STEPS * 2 * math.pi
+                local = phase % (2 * math.pi)
+                count = (6 - int(local / (2 * math.pi / 6))) % 6
+                out.append((phase, canon[count]))
+            return out
+
+        sweeps = [make_sweep(False), make_sweep(True)]
+
+        cal_fwd = ce.calibrate_hall(
+            sweeps[0], desired_direction=+1, allow_phase_invert=True)
+        cal_inv = ce.calibrate_hall(
+            sweeps[0], desired_direction=-1, allow_phase_invert=True)
+
+        table_fwd, _, _ = ce.build_hall_offset_table_multi(
+            sweeps, cal_fwd, poles=14)
+        table_inv, _, _ = ce.build_hall_offset_table_multi(
+            sweeps, cal_inv, poles=14)
+        for a, b in zip(table_fwd, table_inv):
+            self.assertAlmostEqual(a, b, places=10)
+
+    def test_calibrate_optimizer_failure_records_message(self):
+        # When scipy.optimize.minimize reports success=False, the
+        # optimizer's diagnostic message must be appended to
+        # result.errors.  Previously the code read the message off
+        # the wrong object (the local CalibrationResult, which has
+        # no `message` attribute) and aborted with AttributeError.
+        f = ce.parse_file(io.BytesIO(SOURCE_DATA))
+
+        real_minimize = ce.scipy.optimize.minimize
+
+        def failing_minimize(*args, **kwargs):
+            res = real_minimize(*args, **kwargs)
+            res.success = False
+            res.message = 'precision loss simulated'
+            return res
+
+        with unittest.mock.patch.object(
+                ce.scipy.optimize, 'minimize', failing_minimize):
+            r = ce.calibrate(f, force_optimize=True)
+
+        self.assertTrue(
+            any('precision loss simulated' in e for e in r.errors),
+            f'expected optimizer message in r.errors, got {r.errors!r}')
 
 
 if __name__ == '__main__':

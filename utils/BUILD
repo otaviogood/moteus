@@ -16,9 +16,17 @@
 
 package(default_visibility = ["//visibility:public"])
 
-py_binary(
-    name = "calibrate_encoder",
-    srcs = ["calibrate_encoder.py"],
+py_library(
+    name = "encoder_math",
+    srcs = ["encoder_math.py"],
+    imports = ["."],
+)
+
+py_test(
+    name = "encoder_math_test",
+    srcs = ["test/encoder_math_test.py"],
+    deps = [":encoder_math"],
+    size = "small",
 )
 
 py_binary(
@@ -49,7 +57,6 @@ cc_test(
     ],
     data = [
         # Just so they are built.
-        ":calibrate_encoder",
         ":dynamometer_drive",
         ":dyno_static_torque_ripple",
         ":firmware_validate",
@@ -94,7 +101,7 @@ py_binary(
     ],
 )
 
-py_binary(
+py_test(
     name = "firmware_validate",
     srcs = ["firmware_validate.py"],
     deps = [
@@ -104,12 +111,48 @@ py_binary(
         ":dynamometer_drive",
         ":dyno_static_torque_ripple",
     ],
+    tags = ["manual"],
 )
 
 test_suite(
     name = "host",
     tests = [
         "test",
+        "encoder_math_test",
+        "mpat_test",
+        "firmware_validate",
         "//utils/gui:host",
+    ],
+)
+
+py_test(
+    name = "mpat_test",
+    srcs = ["test/mpat_test.py"],
+    main = "test/mpat_test.py",
+    data = [":mpat"],
+    deps = [
+        "@bazel_tools//tools/python/runfiles",
+    ],
+    size = "small",
+)
+
+# Extract core computation logic from mpat.html for CLI use
+genrule(
+    name = "mpat_core",
+    srcs = ["//docs:mpat.html"],
+    outs = ["mpat_core.mjs"],
+    tools = ["extract_mpat_core.sh"],
+    cmd = "$(location extract_mpat_core.sh) $(location //docs:mpat.html) $@",
+)
+
+py_binary(
+    name = "mpat",
+    srcs = ["mpat.py"],
+    data = [
+        "mpat_cli.mjs",
+        ":mpat_core",
+    ],
+    deps = [
+        "@bazel_tools//tools/python/runfiles",
     ],
 )

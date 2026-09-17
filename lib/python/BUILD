@@ -24,12 +24,13 @@ test_suite(
     tests = [
         "//lib/python/moteus:test",
         ":bdist_test",
+        ":mypy_test",
     ],
 )
 
 template_file(
-    name = "setup.py",
-    src = "setup.py.TPL",
+    name = "pyproject.toml",
+    src = "pyproject.toml.TPL",
     substitutions = {
         "{{VERSION}}" : '"{}"'.format(VERSION),
     },
@@ -38,7 +39,7 @@ template_file(
 genrule(
     name = "bdist_wheel",
     srcs = [
-        "setup.py",
+        "pyproject.toml",
         "README.md",
         "//lib/python/moteus",
         "//lib/python/moteus:version.py",
@@ -52,11 +53,10 @@ genrule(
         "RELOUT=$$(realpath --relative-to $$(dirname $(location README.md)) " +
         "          $$(dirname $(location moteus-{ver}.tar.gz))) && " +
         "SRCROOT=$$(dirname $(location README.md)) && " +
-        "ln -s $$(realpath $(location setup.py)) $$SRCROOT/setup.py && " +
+        "ln -s $$(realpath $(location pyproject.toml)) $$SRCROOT/pyproject.toml && " +
         "ln -s $$(realpath $(location //lib/python/moteus:version.py)) $$SRCROOT/moteus/version.py && " +
         "cd $$SRCROOT && " +
-        "python3 setup.py sdist --dist-dir $$RELOUT 1>/dev/null && " +
-        "python3 setup.py bdist_wheel --dist-dir $$RELOUT 1> /dev/null " +
+        "python3 -m build --no-isolation --outdir $$RELOUT 1>/dev/null " +
         ""
     ).format(ver=VERSION),
 )
@@ -65,4 +65,17 @@ sh_test(
     name = "bdist_test",
     data = [":bdist_wheel"],
     srcs = ["test/bdist_test.sh"],
+)
+
+sh_test(
+    name = "mypy_test",
+    srcs = ["test/mypy_test.sh"],
+    data = [
+        "//lib/python/moteus:libfiles",
+        "//lib/python/moteus:version.py",
+        "//lib/python/moteus:__init__.py",
+        "pyproject.toml",
+        "//lib/python/moteus:py.typed",
+    ],
+    size = "small",
 )

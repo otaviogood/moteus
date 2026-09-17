@@ -30,10 +30,9 @@ class BldcServoPosition {
   static void DoVelocityModeLimits(
       BldcServoStatus* status,
       const BldcServoConfig* config,
-      float rate_hz,
+      float period_s,
       BldcServoCommandData* data,
       float velocity) MOTEUS_CCM_ATTRIBUTE {
-    const float period_s = 1.0f / rate_hz;
 
     if (!std::isnan(data->velocity_limit)) {
       if (velocity > data->velocity_limit) { velocity = data->velocity_limit; }
@@ -47,15 +46,18 @@ class BldcServoPosition {
       const float initial_sign = (dv > 0.0f) ? 1.0f : -1.0f;
       const float acceleration = data->accel_limit * initial_sign;
 
+      status->control_acceleration = acceleration;
       *status->control_velocity += acceleration * period_s;
       const float final_sign =
           (velocity > *status->control_velocity) ? 1.0f : -1.0f;
       if (final_sign != initial_sign) {
+        status->control_acceleration = 0.0f;
         status->control_velocity = velocity;
         status->trajectory_done = true;
       }
     } else {
       // We must have only a velocity limit.  This is easy.
+      status->control_acceleration = 0.0f;
       status->control_velocity = velocity;
       status->trajectory_done = true;
     }
@@ -68,6 +70,7 @@ class BldcServoPosition {
       float velocity,
       float period_s) MOTEUS_CCM_ATTRIBUTE {
     const float initial_sign = dx < 0.0f ? 1.0f : -1.0f;
+    status->control_acceleration = 0.0f;
     status->control_velocity = -initial_sign * data->velocity_limit;
 
     const float next_dx = dx - *status->control_velocity * period_s;
@@ -82,21 +85,31 @@ class BldcServoPosition {
     }
   }
 
+  // Compute deceleration needed to reach target position starting
+  // from a given velocity.
+  //
+  // v_abs: absolute velocity relative to target
+  // inv_2dx: precomputed 1.0f / (2.0f * dx_abs) for efficiency
+  static float ComputeRequiredDecel(float v_abs, float inv_2dx) {
+    return (v_abs * v_abs) * inv_2dx;
+  }
+
   static float CalculateAcceleration(
       BldcServoCommandData* data,
       float a,
       float v0,
       float vf,
       float dx,
-      float dv) MOTEUS_CCM_ATTRIBUTE {
+      float dt) MOTEUS_CCM_ATTRIBUTE {
     // This logic is broken out primarily so that early-return can be
     // used as a control flow mechanism to aid factorization.
 
+    const float v0_abs = std::abs(v0);
 
     // If we are overspeed, we always slow down to the velocity
     // limit first.
     if (std::isfinite(data->velocity_limit) &&
-        std::abs(v0) > data->velocity_limit) {
+        v0_abs > data->velocity_limit) {
       return std::copysign(a, -v0);
     }
 
@@ -105,19 +118,61 @@ class BldcServoPosition {
     // 0.
 
     const auto v_frame = v0 - vf;
+    const float v_frame_abs = std::abs(v_frame);
 
     if ((v_frame * dx) >= 0.0f && dx != 0.0f) {
-      // The target is stationary and we are moving towards it.
-      const float decel_distance = (v_frame * v_frame) / (2.0f * a);
-      if (std::abs(dx) >= decel_distance) {
+      // We are moving towards the target (in the target frame).
+      const float inv_2a = 1.0f / (2.0f * a);
+      const float stop_distance = (v_frame * v_frame) * inv_2a;
+      const float dx_abs = std::abs(dx);
+
+      // Precompute reciprocal for ComputeRequiredDecel calls.
+      const float inv_2dx = 1.0f / (2.0f * dx_abs);
+
+      if (dx_abs > stop_distance) {
+        // We have not yet reached the point of needing to decelerate,
+        // which would normally mean accelerating.
+
+        // However, check if we should switch early: if next step
+        // would overshoot the ideal switch point, switch now.
+        const float v_next = v_frame_abs + a * dt;
+        const float dx_step = (v_frame_abs + v_next) * 0.5f * dt;
+        const float dx_after = dx_abs - dx_step;
+        const float stop_distance_next = (v_next * v_next) * inv_2a;
+
+        if (dx_after < stop_distance_next) {
+          // We would switch in the middle of the next cycle, so
+          // instead start decelerating now.
+          const float required_decel = ComputeRequiredDecel(v_frame_abs, inv_2dx);
+
+          if (required_decel > a) {
+            // This really shouldn't happen, but if it does, limit our
+            // deceleration to the intended limit.
+            return std::copysign(a, -v_frame);
+          } else {
+            return std::copysign(required_decel, -v_frame);
+          }
+        }
+
+        // With those checks out of the way, we should be good to
+        // accelerate now.
         if (std::isnan(data->velocity_limit) ||
-            std::abs(v0) < data->velocity_limit) {
+            v0_abs < data->velocity_limit) {
           return std::copysign(a, dx);
         } else {
-          return 0.0f;
+          return 0.0f;  // At velocity limit - cruise
         }
       } else {
-        return std::copysign(a, -v_frame);
+        // We are in the region where we should be decelerating.
+        // Decelerate as much as necessary but no more than our limit.
+
+        const float required_decel =
+            ComputeRequiredDecel(v_frame_abs, inv_2dx);
+        if (required_decel > a) {
+          return std::copysign(a, -v_frame);
+        } else {
+          return std::copysign(required_decel, -v_frame);
+        }
       }
     }
 
@@ -128,10 +183,9 @@ class BldcServoPosition {
   static void DoVelocityAndAccelLimits(
       BldcServoStatus* status,
       const BldcServoConfig* config,
-      float rate_hz,
+      float period_s,
       BldcServoCommandData* data,
       float velocity) MOTEUS_CCM_ATTRIBUTE {
-    const float period_s = 1.0f / rate_hz;
 
     // This is the most general case.  We decide whether to
     // accelerate, remain constant, or decelerate, then advance the
@@ -145,9 +199,9 @@ class BldcServoPosition {
 
     // What is the delta between our current control state and the
     // command.
-    float dx = MotorPosition::IntToFloat(
-        (*data->position_relative_raw - *status->control_position_raw));
-    const float dv = vf - v0;
+    const float dx = MotorPosition::IntToFloat(
+        MotorPosition::WrappingSub(
+            *data->position_relative_raw, *status->control_position_raw));
 
     if (std::isnan(data->accel_limit)) {
       // We only have a velocity limit, not an acceleration limit.
@@ -157,8 +211,9 @@ class BldcServoPosition {
     }
 
     const float acceleration = CalculateAcceleration(
-        data, a, v0, vf, dx, dv);
+        data, a, v0, vf, dx, period_s);
 
+    status->control_acceleration = acceleration;
     *status->control_velocity += acceleration * period_s;
     const float v1 = *status->control_velocity;
 
@@ -168,23 +223,47 @@ class BldcServoPosition {
     // If this velocity would exceed the velocity limit, or pass
     // through it while decelerating, make sure we have at least one
     // cycle exactly at the velocity limit so we will properly enter
-    // the "cruise" phase.
+    // the "cruise" phase.  The cruise direction is the direction the
+    // controller is heading (v1); v0 may be zero, or even oppositely
+    // signed if a single step crossed zero.
     if (std::isfinite(data->velocity_limit) &&
         vel_lower < data->velocity_limit &&
         vel_upper > data->velocity_limit) {
-      status->control_velocity = std::copysign(data->velocity_limit, v0);
+      status->control_acceleration = 0.0f;
+      status->control_velocity = std::copysign(data->velocity_limit, v1);
     }
 
-    const float signed_vel_lower = std::min(v0, v1);
-    const float signed_vel_upper = std::max(v0, v1);
+    const float v1_final = *status->control_velocity;
 
-    // Did we span the target velocity this cycle?
+    const float signed_vel_lower = std::min(v0, v1_final);
+    const float signed_vel_upper = std::max(v0, v1_final);
+
+    // Precompute values that will be used multiple times below.
+    const float dx_abs = std::abs(dx);
+    const float v_frame_final = v1_final - vf;
+    const float v_frame_final_abs = std::abs(v_frame_final);
+
+    // We will consider this trajectory completed if both:
+    // 1. The velocity crossed or reached target velocity
+    // 2. The position is close enough to target
     const bool target_cross = signed_vel_lower <= vf && signed_vel_upper >= vf;
-    const bool target_near = std::abs(v1 - vf) < (a * 0.5f * period_s);
-    const bool position_near = (std::abs(dx / v1) <= (10.0f * period_s));
+    const bool target_near = v_frame_final_abs < (a * 0.5f * period_s);
+
+    // When evaluating velocity "closeness" as the gate for checking
+    // position, we use closing rate when it's larger than target
+    // velocity.  This ensures we complete even if the current closing
+    // rate is small because of numerical precision.
+    const float v_for_threshold = std::max(v_frame_final_abs, std::abs(vf));
+
+    // For the position portion, we're done if our position is close
+    // enough to complete.  We consider within 10 timesteps as "close
+    // enough".
+    const bool position_near = (dx_abs <= v_for_threshold * 10.0f * period_s);
+
     if ((target_cross || target_near) && position_near) {
       data->position = std::numeric_limits<float>::quiet_NaN();
       data->position_relative_raw.reset();
+      status->control_acceleration = 0.0f;
       status->control_velocity = vf;
       status->trajectory_done = true;
     }
@@ -193,7 +272,7 @@ class BldcServoPosition {
   static void UpdateTrajectory(
       BldcServoStatus* status,
       const BldcServoConfig* config,
-      float rate_hz,
+      float period_s,
       BldcServoCommandData* data,
       float velocity) MOTEUS_CCM_ATTRIBUTE {
     // Clamp the desired velocity to our limit if we have one.
@@ -204,10 +283,10 @@ class BldcServoPosition {
 
     if (!data->position_relative_raw) {
       DoVelocityModeLimits(
-          status, config, rate_hz, data, velocity);
+          status, config, period_s, data, velocity);
     } else {
       DoVelocityAndAccelLimits(
-          status, config, rate_hz, data, velocity);
+          status, config, period_s, data, velocity);
     }
   }
 
@@ -217,7 +296,7 @@ class BldcServoPosition {
       const BldcServoPositionConfig* position_config,
       const MotorPosition::Status* position,
       int64_t absolute_relative_delta,
-      float rate_hz,
+      float period_s,
       BldcServoCommandData* data,
       float velocity) MOTEUS_CCM_ATTRIBUTE {
 
@@ -233,6 +312,7 @@ class BldcServoPosition {
     if (std::isnan(data->velocity_limit) &&
         std::isnan(data->accel_limit)) {
       status->trajectory_done = true;
+      status->control_acceleration = 0.0f;
       status->control_velocity = velocity;
     } else if (!!data->position_relative_raw ||
                !std::isnan(velocity)) {
@@ -247,10 +327,12 @@ class BldcServoPosition {
       status->control_position_raw = *data->position_relative_raw;
       data->position = std::numeric_limits<float>::quiet_NaN();
       data->position_relative_raw.reset();
+      status->control_acceleration = 0.0f;
       status->control_velocity = velocity;
     } else if (!status->control_position_raw) {
       status->control_position_raw = position->position_relative_raw;
 
+      status->control_acceleration = 0.0f;
       if (std::abs(status->velocity_filt) <
           config->velocity_zero_capture_threshold) {
         status->control_velocity = 0.0f;
@@ -259,35 +341,58 @@ class BldcServoPosition {
       }
     }
 
+    // Capture the velocity before we update the trajectory
+    const float v0 = status->control_velocity.value_or(0.0f);
+
     if (!status->trajectory_done) {
-      UpdateTrajectory(status, config, rate_hz, data, velocity);
+      UpdateTrajectory(status, config, period_s, data, velocity);
     }
 
+    // v1 will be the velocity after the trajectory update, before max
+    // velocity clamp.
+    const float v1 = status->control_velocity.value_or(0.0f);
+
     if (*status->control_velocity > status->motor_max_velocity) {
+      status->control_acceleration = 0.0f;
       status->control_velocity = status->motor_max_velocity;
     } else if (*status->control_velocity < -status->motor_max_velocity) {
+      status->control_acceleration = 0.0f;
       status->control_velocity = -status->motor_max_velocity;
     }
 
     auto velocity_command = *status->control_velocity;
 
-    // This limits our usable velocity to 20kHz modulo the position
-    // scale at a 40kHz switching frequency.  1.2 million RPM should
-    // be enough for anybody?
-    const float step = velocity_command / rate_hz;
+    // Perform our position integration.
+    const float step = [&]() {
+      // When acceleration is non-zero, velocity is ramping - use average
+      // for exact kinematic integration.
+      if (status->control_acceleration != 0.0f) {
+        return (v0 + v1) * 0.5f * period_s;
+      }
+      // When acceleration is zero (velocity-only mode or at limit),
+      // use final velocity for the full timestep.
+      return velocity_command * period_s;
+    }();
+
+    // This fixed point formulation limits our usable velocity to
+    // 20kHz modulo the position scale at a 40kHz switching frequency.
+    // 1.2 million RPM should be enough for anybody?
     const int64_t int64_step =
         (static_cast<int64_t>(
             static_cast<int32_t>((static_cast<float>(1ll << 32) * step))) <<
          16);
-    status->control_position_raw = *status->control_position_raw + int64_step;
+    status->control_position_raw =
+        MotorPosition::WrappingAdd(*status->control_position_raw, int64_step);
 
     if (data->position_relative_raw && !std::isnan(velocity)) {
-      const float tstep = velocity / rate_hz;
+      const float tstep = velocity * period_s;
       const int64_t tint64_step =
         (static_cast<int64_t>(
             static_cast<int32_t>((static_cast<float>(1ll << 32) * tstep))) <<
          16);
-      data->position_relative_raw = *data->position_relative_raw + tint64_step;
+      data->position_relative_raw =
+          MotorPosition::WrappingAdd(
+              *data->position_relative_raw, tint64_step);
     }
 
     if (std::isfinite(config->max_position_slip) && !data->synthetic_theta) {
@@ -296,12 +401,15 @@ class BldcServoPosition {
           MotorPosition::FloatToInt(config->max_position_slip);
 
       const int64_t error =
-          current_position - *status->control_position_raw;
+          MotorPosition::WrappingSub(
+              current_position, *status->control_position_raw);
       if (error < -slip) {
-        *status->control_position_raw = current_position + slip;
+        *status->control_position_raw =
+            MotorPosition::WrappingAdd(current_position, slip);
       }
       if (error > slip) {
-        *status->control_position_raw = current_position - slip;
+        *status->control_position_raw =
+            MotorPosition::WrappingSub(current_position, slip);
       }
     }
 
@@ -309,9 +417,11 @@ class BldcServoPosition {
       const float slip = config->max_velocity_slip;
       const float error = status->velocity - *status->control_velocity;
       if (error < -slip) {
+        status->control_acceleration = 0.0f;
         status->control_velocity = status->velocity + slip;
       }
       if (error > slip) {
+        status->control_acceleration = 0.0f;
         status->control_velocity = status->velocity - slip;
       }
     }
@@ -321,8 +431,11 @@ class BldcServoPosition {
 
     const auto saturate = [&](auto value, auto compare) MOTEUS_CCM_ATTRIBUTE {
       if (std::isnan(value)) { return; }
-      const auto limit_value = MotorPosition::FloatToInt(value) - delta;
-      if (compare(*status->control_position_raw - limit_value, 0)) {
+      const auto limit_value =
+          MotorPosition::WrappingSub(MotorPosition::FloatToInt(value), delta);
+      if (compare(MotorPosition::WrappingSub(
+                      *status->control_position_raw, limit_value),
+                  0)) {
         status->control_position_raw = limit_value;
         hit_limit = true;
       }
@@ -342,11 +455,13 @@ class BldcServoPosition {
         if (value > 0) { return 1.0f; }
         return 0.0f;
       };
-      if (sign(*status->control_position_raw -
-               stop_position_raw) * velocity_command > 0.0f) {
+      if (sign(MotorPosition::WrappingSub(
+                   *status->control_position_raw,
+                   stop_position_raw)) * velocity_command > 0.0f) {
         // We are moving away from the stop position.  Force it to be
         // there and zero out our velocity command.
         status->control_position_raw = stop_position_raw;
+        status->control_acceleration = 0.0f;
         status->control_velocity = 0.0f;
         status->trajectory_done = true;
         data->position = std::numeric_limits<float>::quiet_NaN();
@@ -359,6 +474,7 @@ class BldcServoPosition {
     if (hit_limit) {
       // We have hit a limit.  Assume a velocity of 0.
       velocity_command = 0.0f;
+      status->control_acceleration = 0.0f;
       status->control_velocity = 0.0f;
     }
 
@@ -366,7 +482,8 @@ class BldcServoPosition {
         !status->control_position_raw ?
         std::numeric_limits<float>::quiet_NaN() :
         MotorPosition::IntToFloat(
-            *status->control_position_raw + absolute_relative_delta);
+            MotorPosition::WrappingAdd(
+                *status->control_position_raw, absolute_relative_delta));
 
     return velocity_command;
   }

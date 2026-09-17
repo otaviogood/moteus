@@ -57,6 +57,7 @@ import sys
 import time
 
 import histogram
+from encoder_math import wrap_half, wrap_zero_one, circular_mean
 
 
 PRINT_DURATION = 0.1
@@ -120,24 +121,10 @@ def unpack_plot(items):
     return [[x[0] for x in items], [x[1] for x in items]]
 
 
-def wrap_half(value):
-    while value > 0.5:
-        value -= 1.0
-    while value < -0.5:
-        value += 1.0
-    return value
-
-
-def wrap_zero_one(value):
-    while value > 1.0:
-        value -= 1.0
-    while value < 0.0:
-        value += 1.0
-    return value
-
-
 def get_encoder(item, number):
-    if number == 0:
+    if number == -1:
+        return item.values[moteus.Register.POSITION]
+    elif number == 0:
         return item.values[moteus.Register.ENCODER_0_POSITION]
     elif number == 1:
         return item.values[moteus.Register.ENCODER_1_POSITION]
@@ -186,7 +173,8 @@ async def run_reference_compensation(args, m, s, ax):
     reference_values = [get_encoder(x, args.reference_encoder) for x in results]
     measure_values = [get_encoder(x, args.encoder_channel) for x in results]
 
-    offset = numpy.mean([wrap_zero_one(r - m) for r, m in zip(reference_values, measure_values)])
+    offset = circular_mean(
+        [wrap_zero_one(r - m) for r, m in zip(reference_values, measure_values)])
 
     error_values = [-wrap_half(r - offset - m) for r, m in zip(reference_values, measure_values)]
 

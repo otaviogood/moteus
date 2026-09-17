@@ -105,6 +105,35 @@ class ReaderTest(unittest.TestCase):
         actual_value = actual_type.read(reader.Stream(io.BytesIO(bytes([10]))))
         self.assertEqual(actual_value, 10)
 
+    def test_modern_keyword_field_name(self):
+        # Regression test: a schema with a field named after a hard
+        # keyword introduced after Python 3.0 (here `async`, made
+        # hard in 3.7) must still parse.  `_escape_python3_identifier`
+        # used to consult a frozen local set that didn't list these.
+        for keyword_name in ('async', 'await'):
+            name_bytes = keyword_name.encode('utf8')
+            schema = bytes([
+                16, 0,                       # ObjectType, object_flags=0
+                  0,                         # field_flags=0
+                  len(name_bytes),
+                ]) + name_bytes + bytes([
+                  0,                         # naliases=0
+                  2,                         # BooleanType
+                  0,                         # no default
+                  0,                         # terminator: field_flags=0
+                  0,                         # name length 0
+                  0,                         # naliases=0
+                  0,                         # FinalType
+                  0,                         # no default
+            ])
+
+            actual_type = reader.Type.from_binary(io.BytesIO(schema))
+            self.assertIsInstance(actual_type, reader.ObjectType)
+
+            value = actual_type.read(reader.Stream(io.BytesIO(bytes([1]))))
+            # The escaped namedtuple field must carry the read value.
+            self.assertEqual(getattr(value, 'py_' + keyword_name), True)
+
 
 if __name__ == '__main__':
     unittest.main()

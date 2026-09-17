@@ -200,8 +200,12 @@ FamilyAndVersion DetectMoteusFamily(MillisecondTimer* timer) {
                   (hwrev1.read() << 1) |
                   (hwrev2.read() << 2)));
     result.hw_pins = this_hw_pins;
-    const uint8_t measured_hw_rev =
-        [&]() {
+    // result.hw_version is signed so that an unmatched encoding can
+    // travel as -1 to the compatibility check in moteus.cc; assign
+    // the lambda result directly rather than going through a uint8_t
+    // local.
+    result.hw_version =
+        [&]() -> int {
           int i = 0;
           for (auto rev_pins : kFamily0HardwareInterlock) {
             if (rev_pins == this_hw_pins) { return i; }
@@ -209,7 +213,6 @@ FamilyAndVersion DetectMoteusFamily(MillisecondTimer* timer) {
           }
           return -1;
         }();
-    result.hw_version = measured_hw_rev;
   } else if (result.family == 1 || result.family == 2 || result.family == 3) {
     __HAL_RCC_ADC12_CLK_ENABLE();
 
@@ -226,8 +229,10 @@ FamilyAndVersion DetectMoteusFamily(MillisecondTimer* timer) {
         (17 << ADC_SQR1_SQ1_Pos) |  // IN17
         (0 << ADC_SQR1_L_Pos);  // length 1
 
-    EnableAdc(timer, ADC2, 16, 0);
+    // Use software trigger for one-time measurement during detection
+    EnableAdc(timer, ADC2, 16, 0, AdcTriggerMode::kSoftware);
 
+    // Trigger ADC2 using software mode
     ADC2->CR |= ADC_CR_ADSTART;
     while ((ADC2->ISR & ADC_ISR_EOC) == 0);
 
@@ -286,9 +291,6 @@ MoteusHwPins FindHardwarePins(FamilyAndVersion fv) {
 
     result.vsense_adc_scale =
         (hv <= 5 ? 0.00884f : 0.017947f);
-
-    result.uart_tx = PC_10_ALT0;
-    result.uart_rx = PC_11_ALT0;
 
     result.drv8323_enable = PA_3;
     result.drv8323_hiz = PB_7;
@@ -358,9 +360,6 @@ MoteusHwPins FindHardwarePins(FamilyAndVersion fv) {
 
     result.vsense_adc_scale = 0.017947f;
 
-    result.uart_tx = NC;
-    result.uart_rx = NC;
-
     result.as5047_cs = PB_2;
 
     result.can_td = PB_6;
@@ -403,18 +402,28 @@ MoteusHwPins FindHardwarePins(FamilyAndVersion fv) {
   return result;
 }
 
+// NOTE: This must remain safe to call from a HardFault context.  That
+// means: no dynamic allocation, no locks, no recursion, no reliance on
+// C++ static constructors that may not yet have run, and no calls into
+// mbed helpers that assert on `NC` pins.  If `g_hw_pins` has not been
+// populated yet, all DRV8323 control pins are `NC` -- but in that
+// window the GPIOs are still in MCU reset state and the on-board
+// pull-downs hold the driver off, so there is nothing to disable.
 void MoteusEnsureOff() {
-  gpio_t power;
-  gpio_init_out(&power, moteus::g_hw_pins.drv8323_hiz);
-  gpio_write(&power, 0);
+  if (moteus::g_hw_pins.drv8323_enable != NC) {
+    gpio_t power;
+    gpio_init_out(&power, moteus::g_hw_pins.drv8323_hiz);
+    gpio_write(&power, 0);
 
-  // Also, disable the DRV8323 entirely, because, hey, why not.
-  gpio_t enable;
-  gpio_init_out(&enable, moteus::g_hw_pins.drv8323_enable);
-  gpio_write(&enable, 0);
+    // Also, disable the DRV8323 entirely, because, hey, why not.
+    gpio_t enable;
+    gpio_init_out(&enable, moteus::g_hw_pins.drv8323_enable);
+    gpio_write(&enable, 0);
+  }
 
   // We want to ensure that our primary interrupt is not running.
   // Which one it is could vary, so just turn them all off.
+  NVIC_DisableIRQ(TIM1_UP_TIM16_IRQn);
   NVIC_DisableIRQ(TIM2_IRQn);
   NVIC_DisableIRQ(TIM3_IRQn);
   NVIC_DisableIRQ(TIM4_IRQn);

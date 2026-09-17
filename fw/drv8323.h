@@ -31,6 +31,41 @@
 
 namespace moteus {
 
+// Determine the current-shunt amplifier settling time.  This is
+// gain-dependent because the amp's closed-loop bandwidth scales
+// inversely with gain.  The DRV8323/DRV8353 datasheet §7.5 (CSA,
+// t_SET, V_O_step = 0.5 V) gives:
+//
+//     gain (V/V) | datasheet t_SET (0.5 V step)
+//          5     |   250 ns
+//         10     |   500 ns
+//         20     |  1000 ns
+//         40     |  2000 ns
+//
+// The 0.5 V test condition is ~3× smaller than what the amp actually
+// sees in this application: the PWM ripple at the shunt is V_bus / (4
+// × L × f_pwm) × R_shunt × G, which for a typical 24 V / 30 µH / 30
+// kHz / 5 mΩ / 20 V/V combination is ~0.7 V — and worst-case
+// high-current transients can push that several times higher.
+// Empirically, with G=20 we needed ≥1.5 µs (a 500ns margin over the
+// datasheet) to suppress the residual q_A bursts that remain after
+// the limiter is switched to proportional clipping; below that the
+// loop visibly hunts at the rail boundary.  We extend the same 500ns
+// margin to the other gains as well.
+//
+// This is combined with kIsrSampleTime via std::max at the call site
+// to produce the value that RateConfig bakes into min_pwm/max_pwm.
+constexpr float CsaSettlingTime(int csa_gain) {
+  switch (csa_gain) {
+    case 5:  return 0.75e-6f;  // datasheet + 500ns
+    case 10: return 1.00e-6f;  // datasheet + 500ns
+    case 20: return 1.50e-6f;  // datasheet + 500ns
+    case 40: return 2.50e-6f;  // datasheet + 500ns
+  }
+  // Conservative fallback — covers any unrecognized csa_gain.
+  return 3.00e-6f;
+}
+
 class Drv8323 : public MotorDriver {
  public:
   struct Options {
@@ -58,13 +93,8 @@ class Drv8323 : public MotorDriver {
   // Return true for success, false for failure.
   EnableResult StartEnable(bool) override;
 
-  void PowerOn() override {
-    hiz_.set();
-  }
-
-  void PowerOff() override {
-    hiz_.clear();
-  }
+  void PowerOn() override MOTEUS_CCM_ATTRIBUTE;
+  void PowerOff() override MOTEUS_CCM_ATTRIBUTE;
 
   bool fault() override MOTEUS_CCM_ATTRIBUTE;
 
@@ -77,6 +107,12 @@ class Drv8323 : public MotorDriver {
 
   // The current configured sense amplifier gain.
   float i_gain() override;
+
+  // The CSA settling time at the configured gain.
+  float csa_settling_time() override;
+
+  void SetConfigUpdateCallback(
+      mjlib::base::inplace_function<void()>) override;
 
   struct Status {
     // Fault Status Register 1
@@ -210,7 +246,7 @@ class Drv8323 : public MotorDriver {
           (g_measured_hw_rev <= 7) ? 50 :
           100) :
         g_measured_hw_family == 1 ? 150 :
-        g_measured_hw_family == 2 ? 80 :
+        g_measured_hw_family == 2 ? 60 :
         g_measured_hw_family == 3 ? 300 :
         invalid_int();
     uint16_t idriven_hs_ma =
@@ -218,8 +254,8 @@ class Drv8323 : public MotorDriver {
          ((g_measured_hw_rev <= 6) ? 740 :
           (g_measured_hw_rev <= 7) ? 100 :
           200) :
-        g_measured_hw_family == 1 ? 300 :
-        g_measured_hw_family == 2 ? 60 :
+        g_measured_hw_family == 1 ? 200 :
+        g_measured_hw_family == 2 ? 20 :
         g_measured_hw_family == 3 ? 200 :
         invalid_int();
 
@@ -239,11 +275,11 @@ class Drv8323 : public MotorDriver {
     uint16_t idriven_ls_ma =
         g_measured_hw_family == 0 ?
          ((g_measured_hw_rev <= 6) ? 740 :
-          (g_measured_hw_rev <= 7) ? 100 :
-          200) :
-        g_measured_hw_family == 1 ? 300 :
+          (g_measured_hw_rev <= 7) ? 200 :
+          600) :
+        g_measured_hw_family == 1 ? 100 :
         g_measured_hw_family == 2 ? 20 :
-        g_measured_hw_family == 3 ? 600 :
+        g_measured_hw_family == 3 ? 1200 :
         invalid_int();
 
 
@@ -259,7 +295,7 @@ class Drv8323 : public MotorDriver {
         g_measured_hw_family == 3 ? 50 :
         invalid_int();
     OcpMode ocp_mode = OcpMode::kLatchedFault;
-    uint8_t ocp_deg_us = 4;  // valid options of 2, 4, 6, 8
+    uint8_t ocp_deg_us = 4;
 
     // hw rev 6 boards and later use a FET with roughly double the
     // Rdson.  We set a threshold that will trip only if we get well
@@ -270,7 +306,7 @@ class Drv8323 : public MotorDriver {
           (g_measured_hw_rev <= 7) ? 450 :
           700) :
         g_measured_hw_family == 1 ? 700 :
-        g_measured_hw_family == 2 ? 700 :
+        g_measured_hw_family == 2 ? 940 :
         g_measured_hw_family == 3 ? 700 :
         invalid_int();
 

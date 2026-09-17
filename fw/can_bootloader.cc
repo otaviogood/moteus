@@ -716,7 +716,7 @@ class BootloaderServer {
     const auto err = flash_.ProgramByte(address, byte);
     if (err) {
       writer.write("ERR program error ");
-      char buf[5] = {};
+      char buf[9] = {};
       uint32_hex(err, buf);
       writer.write(buf);
       writer.write("\r\n");

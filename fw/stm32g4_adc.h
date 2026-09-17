@@ -21,6 +21,11 @@
 
 namespace moteus {
 
+enum class AdcTriggerMode {
+  kSoftware,      // Software trigger (manual ADSTART)
+  kLptim1,        // Hardware trigger from LPTIM1_OUT
+};
+
 inline void DisableAdc(ADC_TypeDef* adc) {
   if (adc->CR & ADC_CR_ADEN) {
     adc->CR |= ADC_CR_ADDIS;
@@ -29,5 +34,6 @@ inline void DisableAdc(ADC_TypeDef* adc) {
 }
 
 // This function needs to be in CCM memory to achieve deterministic timings.
-void EnableAdc(MillisecondTimer* timer, ADC_TypeDef* adc, int prescaler, int offset) MOTEUS_CCM_ATTRIBUTE;
+void EnableAdc(MillisecondTimer* timer, ADC_TypeDef* adc, int prescaler, int offset,
+               AdcTriggerMode trigger_mode = AdcTriggerMode::kSoftware) MOTEUS_CCM_ATTRIBUTE;
 }

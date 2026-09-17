@@ -21,6 +21,8 @@
 #include "fw/math.h"
 #include "fw/moteus_hw.h"
 #include "fw/motor_position.h"
+#include "fw/multi_transport_datagram_server.h"
+#include "fw/uart_fdcanusb_micro_server.h"
 
 namespace micro = mjlib::micro;
 namespace multiplex = mjlib::multiplex;
@@ -316,12 +318,21 @@ enum class Register {
   kAux2AnalogIn4 = 0x06b,
   kAux2AnalogIn5 = 0x06c,
 
+  // Fork-specific (not in upstream mjbots/moteus).  Kept below 0x80 so
+  // the register number still encodes as a single varuint byte, and
+  // sequential so all three can be read as one block.  These were
+  // 0x072-0x074 before upstream claimed that range for PWM input.
+  kAux2QuaternionX = 0x06d,
+  kAux2QuaternionY = 0x06e,
+  kAux2QuaternionZ = 0x06f,
+
   kMillisecondCounter = 0x070,
   kClockTrim = 0x071,
 
-  kAux2QuaternionX = 0x072,
-  kAux2QuaternionY = 0x073,
-  kAux2QuaternionZ = 0x074,
+  kAux1PwmInputPeriod = 0x072,
+  kAux1PwmInputDutyCycle = 0x073,  // Reserved for future
+  kAux2PwmInputPeriod = 0x074,
+  kAux2PwmInputDutyCycle = 0x075,  // Reserved for future
 
   kAux1Pwm1 = 0x076,
   kAux1Pwm2 = 0x077,
@@ -360,6 +371,8 @@ enum class Register {
   kUuidMask2 = 0x155,
   kUuidMask3 = 0x156,
   kUuidMask4 = 0x157,
+
+  kUuidMaskCapable = 0x158,
 };
 
 aux::AuxHardwareConfig GetAux1HardwareConfig() {
@@ -421,8 +434,17 @@ aux::AuxHardwareConfig GetAux2HardwareConfig() {
           //          ADC#  CHN    I2C      SPI      USART    TIMER
           { 0, PB_8,   -1,   0,    I2C1,    nullptr, USART3,  nullptr },
           { 1, PB_9,   -1,   0,    I2C1,    nullptr, USART3,  nullptr },
+          // Select which two stm32 pins are used for the
+          // non-connectorized aux2 pins for moteus-r4.  By default,
+          // the DBG1/DBG2, but if MOTEUS_R4_AUX2_RT is
+          // defined, then they will be the R and T pads.
+#ifndef MOTEUS_R4_AUX2_RT
           { 2, PC_14,  -1,   0,    nullptr, nullptr, nullptr, nullptr },
           { 3, PC_15,  -1,   0,    nullptr, nullptr, nullptr, nullptr },
+#else
+          { 2, PC_10,  -1,   0,    nullptr, nullptr, USART3, nullptr },
+          { 3, PC_11,  -1,   0,    nullptr, nullptr, USART3, nullptr },
+#endif
           { -1, NC, },
               }},
           aux_options,
@@ -459,6 +481,7 @@ class MoteusController::Impl : public multiplex::MicroServer::Server {
        micro::CommandManager* command_manager,
        micro::TelemetryManager* telemetry_manager,
        multiplex::MicroServer* multiplex_protocol,
+       MultiTransportDatagramServer* multi_transport,
        ClockManager* clock_manager,
        SystemInfo* system_info,
        MillisecondTimer* timer,
@@ -472,14 +495,20 @@ class MoteusController::Impl : public multiplex::MicroServer::Server {
                    g_measured_hw_family != 3 ?
                    AuxPort::kDefaultOnboardSpi :
                    AuxPort::kDefaultOnboardMa600,
-                   {DMA1_Channel3, DMA1_Channel4, DMA1_Channel5, DMA1_Channel6}),
+                   (g_measured_hw_family == 1 ||
+                    g_measured_hw_family == 3) ?
+                   AuxPort::kDefaultUartSerial : AuxPort::kDefaultUartDisabled,
+                   {DMA1_Channel3, DMA1_Channel4, DMA1_Channel5, DMA1_Channel6, DMA1_Channel7}),
         aux2_port_("aux2", "ic_pz2", GetAux2HardwareConfig(),
                    &aux_adc_.aux_info[1],
                    persistent_config, command_manager, telemetry_manager,
                    multiplex_protocol->MakeTunnel(3),
                    timer,
                    AuxPort::kNoDefaultSpi,
-                   {DMA1_Channel7, DMA1_Channel8, DMA2_Channel1, DMA2_Channel2}),
+                   (g_measured_hw_family == 0 ||
+                    g_measured_hw_family == 2) ?
+                   AuxPort::kDefaultUartSerial : AuxPort::kDefaultUartDisabled,
+                   {DMA1_Channel8, DMA2_Channel1, DMA2_Channel2, DMA2_Channel3, DMA2_Channel4}),
         motor_position_(persistent_config, telemetry_manager,
                         aux1_port_.status(),
                         aux2_port_.status(),
@@ -515,14 +544,32 @@ class MoteusController::Impl : public multiplex::MicroServer::Server {
             options.debug_dac = g_hw_pins.debug_dac;
             options.debug_out = g_hw_pins.debug1;
             options.debug_out2 = g_hw_pins.debug2;
-            options.debug_uart_out = g_hw_pins.uart_tx;
+
+            options.lptim_trigger_dma = DMA2_Channel5;
 
             return options;
           }()),
         clock_manager_(clock_manager),
         system_info_(system_info),
         firmware_(firmware),
-        uuid_(uuid) {}
+        uuid_(uuid),
+        multi_transport_(multi_transport) {
+    // Register for notifications when the UART servers change in aux
+    // ports.  aux1 takes priority over aux2 when both are available.
+    aux1_port_.SetUartServerChangedCallback([this](auto* server) {
+      // server is aux1's new state (nullptr if destroyed)
+      auto* const active =
+          server ? server : aux2_port_.uart_micro_server();
+      multi_transport_->SetActiveUartServer(active);
+    });
+
+    aux2_port_.SetUartServerChangedCallback([this](auto* server) {
+      // aux1 always takes priority if available
+      auto* const aux1 = aux1_port_.uart_micro_server();
+      auto* const active = aux1 ? aux1 : server;
+      multi_transport_->SetActiveUartServer(active);
+    });
+  }
 
   void Start() {
     bldc_.Start();
@@ -559,160 +606,160 @@ class MoteusController::Impl : public multiplex::MicroServer::Server {
     return kAccept;
   }
 
-  uint32_t Write(multiplex::MicroServer::Register reg,
-                 const multiplex::MicroServer::Value& value) override
+  WriteAction Write(multiplex::MicroServer::Register reg,
+                    const multiplex::MicroServer::Value& value) override
       __attribute__ ((optimize("O3"))){
-    if (discard_all_) { return 0; }
+    if (discard_all_) { return kDiscardRemaining; }
 
     switch (static_cast<Register>(reg)) {
       case Register::kMode: {
         const auto new_mode_int = ReadIntMapping(value);
-        if (new_mode_int > static_cast<int8_t>(BldcServo::Mode::kNumModes)) {
-          return 3;
+        if (new_mode_int >= static_cast<int8_t>(BldcServo::Mode::kNumModes)) {
+          return kUnknownRegister;
         }
         command_valid_ = true;
         const auto new_mode = static_cast<BldcServo::Mode>(new_mode_int);
         command_ = {};
         command_.mode = new_mode;
-        return 0;
+        return kSuccess;
       }
 
       case Register::kPwmPhaseA: {
         command_.pwm.a = ReadPwm(value);
-        return 0;
+        return kSuccess;
       }
       case Register::kPwmPhaseB: {
         command_.pwm.b = ReadPwm(value);
-        return 0;
+        return kSuccess;
       }
       case Register::kPwmPhaseC: {
         command_.pwm.c = ReadPwm(value);
-        return 0;
+        return kSuccess;
       }
       case Register::kVoltagePhaseA: {
         command_.phase_v.a = ReadVoltage(value);
-        return 0;
+        return kSuccess;
       }
       case Register::kVoltagePhaseB: {
         command_.phase_v.b = ReadVoltage(value);
-        return 0;
+        return kSuccess;
       }
       case Register::kVoltagePhaseC: {
         command_.phase_v.c = ReadVoltage(value);
-        return 0;
+        return kSuccess;
       }
       case Register::kVFocTheta: {
         command_.theta = ReadPwm(value) * kPi;
-        return 0;
+        return kSuccess;
       }
       case Register::kVFocVoltage: {
         command_.voltage = ReadVoltage(value);
-        return 0;
+        return kSuccess;
       }
       case Register::kVoltageDqD: {
         command_.d_V = ReadVoltage(value);
-        return 0;
+        return kSuccess;
       }
       case Register::kVoltageDqQ: {
         command_.q_V = ReadVoltage(value);
-        return 0;
+        return kSuccess;
       }
       case Register::kCommandQCurrent: {
         command_.i_q_A = ReadCurrent(value);
-        return 0;
+        return kSuccess;
       }
       case Register::kCommandDCurrent: {
         command_.i_d_A = ReadCurrent(value);
-        return 0;
+        return kSuccess;
       }
       case Register::kVFocThetaRate: {
         command_.theta_rate = ReadVelocity(value) * kPi;
-        return 0;
+        return kSuccess;
       }
       case Register::kCommandPosition: {
         command_.position = ReadPosition(value);
-        return 0;
+        return kSuccess;
       }
       case Register::kCommandVelocity: {
         command_.velocity = ReadVelocity(value);
-        return 0;
+        return kSuccess;
       }
       case Register::kCommandPositionMaxTorque:
       case Register::kStayWithinMaxTorque: {
         command_.max_torque_Nm = ReadTorque(value);
-        return 0;
+        return kSuccess;
       }
       case Register::kCommandStopPosition: {
         command_.stop_position = ReadPosition(value);
-        return 0;
+        return kSuccess;
       }
       case Register::kCommandTimeout:
       case Register::kStayWithinTimeout: {
         command_.timeout_s = ReadTime(value);
-        return 0;
+        return kSuccess;
       }
       case Register::kCommandAccelLimit: {
         command_.accel_limit = ReadAcceleration(value);
-        return 0;
+        return kSuccess;
       }
       case Register::kCommandVelocityLimit: {
         command_.velocity_limit = ReadVelocity(value);
-        return 0;
+        return kSuccess;
       }
       case Register::kCommandFixedVoltageOverride: {
         command_.fixed_voltage_override = ReadVoltage(value);
-        return 0;
+        return kSuccess;
       }
       case Register::kCommandFeedforwardTorque:
       case Register::kStayWithinFeedforward: {
         command_.feedforward_Nm = ReadTorque(value);
-        return 0;
+        return kSuccess;
       }
       case Register::kCommandKpScale:
       case Register::kStayWithinKpScale: {
         command_.kp_scale = ReadPwm(value);
-        return 0;
+        return kSuccess;
       }
       case Register::kCommandKdScale:
       case Register::kStayWithinKdScale: {
         command_.kd_scale = ReadPwm(value);
-        return 0;
+        return kSuccess;
       }
       case Register::kCommandIlimitScale:
       case Register::kStayWithinIlimitScale: {
         command_.ilimit_scale = ReadPwm(value);
-        return 0;
+        return kSuccess;
       }
       case Register::kCommandFixedCurrentOverride: {
         command_.fixed_current_override = ReadCurrent(value);
-        return 0;
+        return kSuccess;
       }
       case Register::kCommandIgnorePositionBounds:
       case Register::kStayWithinIgnorePositionBounds: {
         command_.ignore_position_bounds = ReadIntMapping(value);
-        return 0;
+        return kSuccess;
       }
       case Register::kStayWithinLower: {
         command_.bounds_min = ReadPosition(value);
-        return 0;
+        return kSuccess;
       }
       case Register::kStayWithinUpper: {
         command_.bounds_max = ReadPosition(value);
-        return 0;
+        return kSuccess;
       }
 
       case Register::kAux1GpioCommand: {
         aux1_port_.WriteDigitalOut(ReadIntMapping(value));
-        return 0;
+        return kSuccess;
       }
       case Register::kAux2GpioCommand: {
         aux2_port_.WriteDigitalOut(ReadIntMapping(value));
-        return 0;
+        return kSuccess;
       }
 
       case Register::kClockTrim: {
         clock_manager_->SetTrim(ReadIntMapping(value));
-        return 0;
+        return kSuccess;
       }
 
       case Register::kAux1Pwm1:
@@ -723,7 +770,7 @@ class MoteusController::Impl : public multiplex::MicroServer::Server {
         const int pin =
             static_cast<int>(reg) - static_cast<int>(Register::kAux1Pwm1);
         aux1_port_.WritePwmOut(pin, ReadPwm(value));
-        return 0;
+        return kSuccess;
       }
 
       case Register::kAux2Pwm1:
@@ -734,26 +781,26 @@ class MoteusController::Impl : public multiplex::MicroServer::Server {
         const int pin =
             static_cast<int>(reg) - static_cast<int>(Register::kAux2Pwm1);
         aux2_port_.WritePwmOut(pin, ReadPwm(value));
-        return 0;
+        return kSuccess;
       }
 
       case Register::kSetOutputNearest: {
         const float position = ReadPosition(value);
         bldc_.SetOutputPositionNearest(position);
-        return 0;
+        return kSuccess;
       }
       case Register::kSetOutputExact: {
         const float position = ReadPosition(value);
         bldc_.SetOutputPosition(position);
-        return 0;
+        return kSuccess;
       }
       case Register::kRequireReindex: {
         bldc_.RequireReindex();
-        return 0;
+        return kSuccess;
       }
       case Register::kRecapturePositionVelocity: {
         bldc_.RecapturePositionVelocity();
-        return 0;
+        return kSuccess;
       }
 
       case Register::kUuidMask1:
@@ -769,8 +816,9 @@ class MoteusController::Impl : public multiplex::MicroServer::Server {
         const auto written = ReadInt32Mapping(value);
         if (expected != written) {
           discard_all_ = true;
+          return kDiscardRemaining;
         }
-        return 0;
+        return kSuccess;
       }
 
       case Register::kPosition:
@@ -820,6 +868,10 @@ class MoteusController::Impl : public multiplex::MicroServer::Server {
       case Register::kAux2QuaternionY:
       case Register::kAux2QuaternionZ:
       case Register::kMillisecondCounter:
+      case Register::kAux1PwmInputPeriod:
+      case Register::kAux1PwmInputDutyCycle:
+      case Register::kAux2PwmInputPeriod:
+      case Register::kAux2PwmInputDutyCycle:
       case Register::kModelNumber:
       case Register::kSerialNumber1:
       case Register::kSerialNumber2:
@@ -828,18 +880,19 @@ class MoteusController::Impl : public multiplex::MicroServer::Server {
       case Register::kUuid2:
       case Register::kUuid3:
       case Register::kUuid4:
+      case Register::kUuidMaskCapable:
       case Register::kRegisterMapVersion:
       case Register::kFirmwareVersion:
       case Register::kMultiplexId:
       case Register::kDriverFault1:
       case Register::kDriverFault2: {
         // Not writeable
-        return 2;
+        return kNotWriteable;
       }
     }
 
     // If we got here, then we had an unknown register.
-    return 1;
+    return kUnknownRegister;
   }
 
   const MotorPosition::SourceStatus& encoder_value(int index) const {
@@ -1117,6 +1170,29 @@ class MoteusController::Impl : public multiplex::MicroServer::Server {
         return IntMapping(clock_manager_->trim(), type);
       }
 
+      case Register::kAux1PwmInputPeriod: {
+        return IntMapping(bldc_.aux1().pwm_input.period_us, type);
+      }
+      case Register::kAux1PwmInputDutyCycle: {
+        const auto& pwm_input = bldc_.aux1().pwm_input;
+        const float duty = (pwm_input.period_us > 0) ?
+            static_cast<float>(pwm_input.pulse_width_us) /
+            static_cast<float>(pwm_input.period_us) :
+            std::numeric_limits<float>::quiet_NaN();
+        return ScalePwm(duty, type);
+      }
+      case Register::kAux2PwmInputPeriod: {
+        return IntMapping(bldc_.aux2().pwm_input.period_us, type);
+      }
+      case Register::kAux2PwmInputDutyCycle: {
+        const auto& pwm_input = bldc_.aux2().pwm_input;
+        const float duty = (pwm_input.period_us > 0) ?
+            static_cast<float>(pwm_input.pulse_width_us) /
+            static_cast<float>(pwm_input.period_us) :
+            std::numeric_limits<float>::quiet_NaN();
+        return ScalePwm(duty, type);
+      }
+
       case Register::kAux1Pwm1:
       case Register::kAux1Pwm2:
       case Register::kAux1Pwm3:
@@ -1201,6 +1277,9 @@ class MoteusController::Impl : public multiplex::MicroServer::Server {
              static_cast<int>(Register::kUuid1)) * 4;
         return Value(*(reinterpret_cast<const int32_t*>(&uuid[index])));
       }
+      case Register::kUuidMaskCapable: {
+        return IntMapping(1, type);
+      }
       case Register::kMultiplexId: {
         break;
       }
@@ -1241,6 +1320,8 @@ class MoteusController::Impl : public multiplex::MicroServer::Server {
   bool discard_all_ = false;
   BldcServo::CommandData command_;
 
+  MultiTransportDatagramServer* multi_transport_ = nullptr;
+
   struct QuaternionValues {
     Value x;
     Value y;
@@ -1275,14 +1356,15 @@ MoteusController::MoteusController(micro::Pool* pool,
                                    micro::CommandManager* command_manager,
                                    micro::TelemetryManager* telemetry_manager,
                                    multiplex::MicroServer* multiplex_protocol,
+                                   MultiTransportDatagramServer* multi_transport,
                                    ClockManager* clock_manager,
                                    SystemInfo* system_info,
                                    MillisecondTimer* timer,
                                    FirmwareInfo* firmware,
                                    Uuid* uuid)
     : impl_(pool, pool, persistent_config, command_manager, telemetry_manager,
-            multiplex_protocol, clock_manager, system_info, timer, firmware,
-            uuid) {}
+            multiplex_protocol, multi_transport, clock_manager, system_info,
+            timer, firmware, uuid) {}
 
 MoteusController::~MoteusController() {}
 

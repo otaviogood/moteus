@@ -31,6 +31,8 @@ filegroup(
     name = "datafiles",
     srcs = [
         "__init__.py",
+        "python_console_ast.py",
+        "registernoop.py",
         "version.py",
 
         "tview_main_window.ui",
@@ -38,14 +40,29 @@ filegroup(
 )
 
 py_library(
+    name = "python_console_ast",
+    srcs = ["python_console_ast.py"],
+    imports = [".."],
+)
+
+py_library(
     name = "tview",
     srcs = [
         "tview.py",
     ],
+    imports = [".."],
     deps = [
+        ":python_console_ast",
         "//lib/python/moteus",
     ],
     data = [
         ":datafiles",
     ],
+)
+
+py_test(
+    name = "python_console_ast_test",
+    srcs = ["test/python_console_ast_test.py"],
+    deps = [":python_console_ast"],
+    size = "small",
 )

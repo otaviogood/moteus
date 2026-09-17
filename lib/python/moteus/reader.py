@@ -14,48 +14,15 @@
 
 import collections
 import enum
+import keyword
 import struct
 
 
-_RESERVED_KEYWORDS = set([
-    'False',
-    'None',
-    'True',
-    'and',
-    'as',
-    'assert',
-    'break',
-    'class',
-    'continue',
-    'def',
-    'del',
-    'elif',
-    'else',
-    'except',
-    'finally',
-    'for',
-    'from',
-    'global',
-    'if',
-    'import',
-    'in',
-    'is',
-    'lambda',
-    'nonlocal',
-    'not',
-    'or',
-    'pass',
-    'raise',
-    'return',
-    'try',
-    'while',
-    'with',
-    'yield',
-])
-
-
 def _escape_python3_identifier(name):
-    if name in _RESERVED_KEYWORDS:
+    # Use the language-supplied keyword table rather than a frozen
+    # local list; otherwise schema fields named after newer keywords
+    # (`async`, `await`, ...) trip namedtuple's keyword check.
+    if keyword.iskeyword(name):
         return 'py_' + name
     return name
 
@@ -456,7 +423,7 @@ TYPES = [
 ]
 
 
-_TYPES_FROM_BINARY = [x.from_binary if x else None for x in TYPES]
+_TYPES_FROM_BINARY = [x.from_binary if x else None for x in TYPES]  # type: ignore[attr-defined]
 
 
 class Type:
