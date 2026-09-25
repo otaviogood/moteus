@@ -123,6 +123,18 @@ class MultiTransportDatagramServer : public mjlib::multiplex::MicroDatagramServe
     return fdcan_->can_reset_count();
   }
 
+  /// True while the frame being processed arrived over CAN-FD, in
+  /// which case last_can_rx_timestamp() is its hardware SOF stamp.
+  bool last_frame_is_can() const {
+    return last_frame_transport_ == kTransportIdCan;
+  }
+  uint16_t last_can_rx_timestamp() const {
+    return fdcan_->last_rx_timestamp();
+  }
+  uint32_t rx_fifo0_fill_level() const {
+    return fdcan_->rx_fifo0_fill_level();
+  }
+
   void SetPrefix(uint32_t prefix) {
     current_prefix_ = prefix;  // Cache for new servers
     fdcan_->SetPrefix(prefix);
@@ -232,10 +244,12 @@ class MultiTransportDatagramServer : public mjlib::multiplex::MicroDatagramServe
     pending_read_header_ = nullptr;
     pending_read_data_ = {};
 
+    last_frame_transport_ = transport_id;
     cb(mjlib::micro::error_code(), copy_size);
   }
 
   FDCanMicroServer* const fdcan_;
+  uint32_t last_frame_transport_ = kTransportIdCan;
 
   // Cached UART server pointer and prefix
   UartFdcanusbMicroServer* uart_server_ = nullptr;

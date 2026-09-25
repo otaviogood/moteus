@@ -826,6 +826,7 @@ class BldcServoControl {
 
   void ISR_DoVoltageDQ(const SinCos& sin_cos,
                        float d_V, float q_V) MOTEUS_CCM_ATTRIBUTE {
+    ISR_Profile(BldcServoStatus::kPerfVoltageDq);
     ISR_DoBalancedVoltageControl(
         ISR_CalculatePhaseVoltage(sin_cos, d_V, q_V));
   }
@@ -855,6 +856,7 @@ class BldcServoControl {
   void ISR_DoCurrent(const SinCos& sin_cos, float i_d_A_in, float i_q_A_in,
                      float feedforward_velocity_rotor,
                      bool ignore_position_bounds) MOTEUS_CCM_ATTRIBUTE {
+    ISR_Profile(BldcServoStatus::kPerfCurrentStart);
     if (self().motor_.poles == 0) {
       self().status_.mode = kFault;
       self().status_.fault = errc::kMotorNotConfigured;
@@ -1210,6 +1212,7 @@ class BldcServoControl {
             self().rate_config_.period_s,
             data,
             velocity);
+    ISR_Profile(BldcServoStatus::kPerfPositionCommand);
 
     // At this point, our control position and velocity are known.
 
@@ -1729,6 +1732,7 @@ class BldcServoControl {
       self().status_.cooldown_count = self().config_.cooldown_brake;
     }
 
+    ISR_Profile(BldcServoStatus::kPerfModeSelected);
     switch (self().status_.mode) {
       case kNumModes:
       case kStopped: {
@@ -1798,6 +1802,16 @@ class BldcServoControl {
   }
 
  protected:
+  /// A control interrupt profile point (MOTEUS_PERFORMANCE_MEASURE
+  /// builds only).
+  void ISR_Profile(BldcServoStatus::PerfPoint point) MOTEUS_CCM_ATTRIBUTE {
+#ifdef MOTEUS_PERFORMANCE_MEASURE
+    self().ISR_Stamp(point);
+#else
+    (void)point;
+#endif
+  }
+
   Impl& self() { return static_cast<Impl&>(*this); }
   const Impl& self() const { return static_cast<const Impl&>(*this); }
 

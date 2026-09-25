@@ -37,12 +37,16 @@
 #include "fw/cui_amt21.h"
 #include "fw/cui_amt22.h"
 #include "fw/ic_pz.h"
+#include "fw/imu_cal.h"
+#include "fw/imu_fusion_storage.h"
+#include "fw/lsm6dsv16x_fusion.h"
 #include "fw/math.h"
 #include "fw/orbis.h"
 #include "fw/ma732.h"
 #include "fw/mbed_util.h"
 #include "fw/millisecond_timer.h"
 #include "fw/moteus_hw.h"
+#include "fw/scope_markers.h"
 #include "fw/stm32_i2c.h"
 #include "fw/strtof.h"
 #include "fw/uart_fdcanusb_micro_server.h"
@@ -82,7 +86,8 @@ class AuxPort {
           MillisecondTimer* timer,
           SpiDefault spi_default,
           UartDefault uart_default,
-          std::array<DMA_Channel_TypeDef*, 5> dma_channels)
+          std::array<DMA_Channel_TypeDef*, 5> dma_channels,
+          ImuCalConfig* imu_cal)
       : pin_count_(std::max_element(
                        hw_config.pins.begin(), hw_config.pins.end(),
                        [](const auto& a, const auto& b) {
@@ -93,10 +98,23 @@ class AuxPort {
         hw_config_(hw_config),
         dma_channels_(dma_channels),
         spi_default_(spi_default),
-        uart_default_(uart_default) {
+        uart_default_(uart_default),
+        fusion_owner_id_(aux_name[3] == '1' ? 1 : 2),
+        timer_owner_(fusion_owner_id_ == 1 ?
+                     kAux1TimerOwner : kAux2TimerOwner) {
+    imu_cal_ = imu_cal;
     persistent_config->Register(aux_name, &config_,
                                 std::bind(&AuxPort::HandleConfigUpdate, this));
     telemetry_manager->Register(aux_name, &status_);
+    {
+      // Separate record: keeps the aux schema (and its size) unchanged.
+      const char* const suffix = "_fusion";
+      size_t n = 0;
+      for (; aux_name[n] != 0 && n < 8; n++) { fusion_record_name_[n] = aux_name[n]; }
+      for (size_t i = 0; suffix[i] != 0; i++) { fusion_record_name_[n++] = suffix[i]; }
+      fusion_record_name_[n] = 0;
+      telemetry_manager->Register(fusion_record_name_, &fusion_status_);
+    }
 
     // The ic_pz_ optional may not always be set, but space for it is
     // allocated regardless, so it should be harmless for
@@ -251,7 +269,9 @@ class AuxPort {
     }
   }
 
-  void ISR_I2C_Update() {
+  // Runs every control cycle while the IMU fusion streams, so it lives
+  // in CCM with the rest of the control interrupt.
+  void ISR_I2C_Update() MOTEUS_CCM_ATTRIBUTE {
     if (!i2c_startup_complete_) {
       if (timer_->read_ms() > config_.i2c_startup_delay_ms) {
         i2c_startup_complete_ = true;
@@ -274,6 +294,11 @@ class AuxPort {
         state.pending = false;
         if (read_status == Stm32I2c::ReadStatus::kError) {
           status.error_count++;
+          if (config_.i2c.devices[i].type ==
+              aux::I2C::DeviceConfig::kLsm6dsv16x &&
+              fusion_driver_) {
+            fusion_driver_->ISR_Complete(false);
+          }
           break;
         }
 
@@ -374,6 +399,22 @@ class AuxPort {
   }
 
   void Poll() {
+    if (fusion_storage_) {
+      if (fusion_stall_ms_ > 0) {
+        // Debug hook (docs §7 tests 9, 13): hold the main loop.  The
+        // microsecond timer is 16-bit, so wait in 10 ms chunks.
+        while (fusion_stall_ms_ > 0) {
+          const auto start = timer_->read_us();
+          while (MillisecondTimer::subtract_us(timer_->read_us(), start) <
+                 10000) {}
+          fusion_stall_ms_ = fusion_stall_ms_ > 10 ? fusion_stall_ms_ - 10 : 0;
+        }
+      }
+      scope::Set(scope::kFusionDrain);
+      fusion_storage_->fusion.Drain(16);
+      scope::Clear(scope::kFusionDrain);
+    }
+
     if (tunnel_polling_enabled_) {
       if (tunnel_write_outstanding_) {
         if (uart_->is_dma_write_finished()) {
@@ -423,6 +464,19 @@ class AuxPort {
 
   Status* status() { return &status_; }
   const Config* config() const { return &config_; }
+
+  /// Non-null while this port runs the IMU fusion (type lsm6dsv16x).
+  /// The CAN reply path uses it directly.
+  FusionStorage* fusion_storage() { return fusion_storage_; }
+
+  // The persistent `imu_cal` group was loaded or changed: take it into
+  // the fusion parameters, and into the fusion if one is running here.
+  void ApplyImuCal() {
+    CopyImuCal();
+    if (fusion_storage_) {
+      *fusion_storage_->fusion.params() = fusion_params_;
+    }
+  }
 
   // Returns the UART micro server if kSerial mode is configured, nullptr otherwise.
   UartFdcanusbMicroServer* uart_micro_server() {
@@ -490,6 +544,11 @@ class AuxPort {
       WritePwmOut(pin, *maybe_value);
 
       WriteOk(response);
+      return;
+    }
+
+    if (cmd_text == "fusion") {
+      HandleFusionCommand(tokenizer, response);
       return;
     }
 
@@ -616,6 +675,60 @@ class AuxPort {
     WriteMessage(response, "ERR unknown aux cmd\r\n");
   }
 
+  // aux2 fusion gains <kp> <ki> | latency <us> | halt <0|1> | drop <n> | stall <ms>
+  // (accelerometer calibration is the persistent `imu_cal` config group)
+  void HandleFusionCommand(
+      mjlib::base::Tokenizer& tokenizer,
+      const mjlib::micro::CommandManager::Response& response) {
+    const auto sub = tokenizer.next();
+    if (sub == "gains") {
+      const auto kp = Strtof(tokenizer.next());
+      const auto ki = Strtof(tokenizer.next());
+      if (!kp || !ki) {
+        WriteMessage(response, "ERR missing kp/ki\r\n");
+        return;
+      }
+      fusion_params_.kp = *kp;
+      fusion_params_.ki = *ki;
+    } else if (sub == "latency") {
+      const auto us = Strtof(tokenizer.next());
+      if (!us) {
+        WriteMessage(response, "ERR missing us\r\n");
+        return;
+      }
+      fusion_params_.latency_comp_ticks =
+          static_cast<uint16_t>(*us / kFusionTickUs);
+    } else if (sub == "halt") {
+      const auto value_str = tokenizer.next();
+      if (value_str.empty() || !fusion_driver_) {
+        WriteMessage(response, "ERR missing value or no fusion\r\n");
+        return;
+      }
+      fusion_driver_->set_halt(std::strtol(value_str.data(), nullptr, 0) != 0);
+    } else if (sub == "drop") {
+      const auto value_str = tokenizer.next();
+      if (value_str.empty() || !fusion_driver_) {
+        WriteMessage(response, "ERR missing value or no fusion\r\n");
+        return;
+      }
+      fusion_driver_->set_drop(std::strtol(value_str.data(), nullptr, 0));
+    } else if (sub == "stall") {
+      const auto value_str = tokenizer.next();
+      if (value_str.empty()) {
+        WriteMessage(response, "ERR missing ms\r\n");
+        return;
+      }
+      fusion_stall_ms_ = std::strtol(value_str.data(), nullptr, 0);
+    } else {
+      WriteMessage(response, "ERR unknown fusion command\r\n");
+      return;
+    }
+    if (fusion_storage_) {
+      *fusion_storage_->fusion.params() = fusion_params_;
+    }
+    WriteOk(response);
+  }
+
   void WriteOk(const mjlib::micro::CommandManager::Response& response) {
     WriteMessage(response, "OK\r\n");
   }
@@ -657,9 +770,10 @@ class AuxPort {
         ISR_ParseAs5600(&status);
         break;
       }
-      case DC::kLsm6dsv16x:
-      case DC::kLsm6dsv16xAccel: {
-        ISR_ParseLsm6dsv16x(&status);
+      case DC::kLsm6dsv16x: {
+        status.active = i2c_startup_complete_;
+        status.nonce += 1;
+        if (fusion_driver_) { fusion_driver_->ISR_Complete(true); }
         break;
       }
       case DC::kNone:
@@ -698,20 +812,6 @@ class AuxPort {
     status->ams_mag = 0;
   }
 
-  void ISR_ParseLsm6dsv16x(aux::I2C::DeviceStatus* status) {
-    status->active = i2c_startup_complete_;
-
-    status->nonce += 1;
-
-    // For the LSM6DSV16X quaternions, the numbers are actually in float16 format!!!
-    // (S: 1 sign bit; E: 5 exponent bits; F: 10 fraction bits).
-    // The data comes in as X_low, X_high, Y_low, Y_high, Z_low, Z_high
-    // *** Accelerometer data can also be put in these vars, but that's not float16.
-    status->quat_x = (quaternion_raw_data_[1] << 8) | quaternion_raw_data_[0]; // Bytes 0, 1
-    status->quat_y = (quaternion_raw_data_[3] << 8) | quaternion_raw_data_[2]; // Bytes 2, 3
-    status->quat_z = (quaternion_raw_data_[5] << 8) | quaternion_raw_data_[4]; // Bytes 4, 5
-  }
-
   void ISR_PollI2c() {
     using DC = aux::I2C::DeviceConfig;
 
@@ -719,6 +819,7 @@ class AuxPort {
     if (i2c_->busy()) { return; }
 
     const auto now_us = timer_->read_us();
+    int fusion_slot = -1;
 
     for (size_t i = 0; i < i2c_state_.size(); i++) {
       const auto& config = config_.i2c.devices[i];
@@ -750,16 +851,8 @@ class AuxPort {
                                      encoder_raw_data_), 2));
             break;
           }
-          case DC::kLsm6dsv16x:
-          case DC::kLsm6dsv16xAccel: {
-            // Initialize LSM6DSV16X if needed
-            // This init happens during an interrupt, and it takes almost 1ms,
-            // so that could be bad if you're expecting realtime from the start
-            if (!state.initialized) {
-              if (InitLsm6dsv16x(config)) state.initialized = true;
-              return;
-            }
-            
+          case DC::kLsm6dsv16x: {
+            // The fusion driver runs its own non-blocking init.
             break;
           }
           case DC::kNone:
@@ -771,6 +864,13 @@ class AuxPort {
         // We can initialize at most one device per poll cycle.
         state.initialized = true;
         return;
+      }
+
+      if (config.type == DC::kLsm6dsv16x) {
+        // Polled after the loop so it only takes the bus when no
+        // other device is due.
+        fusion_slot = static_cast<int>(i);
+        continue;
       }
 
       const auto delta_us =
@@ -789,11 +889,7 @@ class AuxPort {
             StartI2cRead<3>(config.address, AS5600_REG_STATUS);
             break;
           }
-          case DC::kLsm6dsv16x:
-          case DC::kLsm6dsv16xAccel: {
-            ReadIMUData(config.address);
-            break;
-          }
+          case DC::kLsm6dsv16x:  // handled above
           case DC::kNone:
           case DC::kNumTypes: {
             MJ_ASSERT(false);
@@ -805,141 +901,14 @@ class AuxPort {
         return;
       }
     }
-  }
 
-  bool InitLsm6dsv16x(const auto config) {
-    // Make sure I2C is in a clean state
-    while (i2c_->busy()) {
-        i2c_->Poll();
-    }
-
-    // // First read WHO_AM_I register (0x0F should return 0x70)
-    // StartI2cRead<1>(config.address, 0x0F);
-
-    // wait_i2c();
-
-    // if (encoder_raw_data_[0] != 0x70) {
-    //     // Device not responding correctly
-    //     DigitalOut db1_led(g_hw_pins.debug_led1, 0);
-    //     return;
-    // }
-
-    // Either gyro or accel can be enabled, but not both.
-    bool gyro_enabled = config.type != aux::I2C::DeviceConfig::kLsm6dsv16xAccel;
-
-    // We have to poll more than twice as fast as the IMU can produce data
-    // See comment at ReadIMUData() function.
-    const int hz = 240;
-    if (config.poll_rate_us >= 1000000 / 120 / 2 ) {
-      DigitalOut db1_led(g_hw_pins.debug_led1, 0);
-      return false;
-    }
-
-    uint8_t ctrl1 = 0x06;  // 0x06->120Hz, 0x07->240Hz, 0x08->480Hz
-    switch (hz) {
-      case 240: ctrl1 = 0x07; break;
-      case 480: ctrl1 = 0x08; break;
-      default: break;  // remain at 0x06 for 120Hz
-    }
-    // Set accelerometer output data rate
-    i2c_->StartWriteMemory(config.address, 0x10, std::string_view(
-        reinterpret_cast<const char*>(&ctrl1), 1));
-    wait_i2c();
-
-    if (!gyro_enabled) {
-
-      // Enable accelerometer FIFO
-      uint8_t fifo_ctrl3 = ctrl1;  // 0x06->120Hz, 0x07->240Hz, 0x08->480Hz
-      i2c_->StartWriteMemory(config.address, 0x09, std::string_view(
-          reinterpret_cast<const char*>(&fifo_ctrl3), 1));
-      wait_i2c();
-
-      uint8_t ctrl8 = 0x03;  // Accel FS ±16g
-      i2c_->StartWriteMemory(config.address, 0x17, std::string_view(
-          reinterpret_cast<const char*>(&ctrl8), 1));
-      wait_i2c();
-
-      // Explicitly disable gyroscope
-      uint8_t ctrl2 = 0;  // 0x06->120Hz, 0x07->240Hz, 0x08->480Hz
-      i2c_->StartWriteMemory(config.address, 0x11, std::string_view(
-          reinterpret_cast<const char*>(&ctrl2), 1));
-      wait_i2c();
-    } else {
-
-      // Set gyroscope ODR
-      uint8_t ctrl2 = ctrl1;  // 0x06->120Hz, 0x07->240Hz, 0x08->480Hz
-      i2c_->StartWriteMemory(config.address, 0x11, std::string_view(
-          reinterpret_cast<const char*>(&ctrl2), 1));
-      wait_i2c();
-
-      uint8_t ctrl6 = 0x04;  // Gyro FS ±2000 dps
-      i2c_->StartWriteMemory(config.address, 0x15, std::string_view(
-          reinterpret_cast<const char*>(&ctrl6), 1));
-      wait_i2c();
-
-      // Switch to embedded functions bank of registers
-      uint8_t func_cfg = 0x80;
-      i2c_->StartWriteMemory(config.address, 0x01, std::string_view(
-          reinterpret_cast<const char*>(&func_cfg), 1));
-      wait_i2c();
-
-      // Enable SFLP game rotation vector (quaternion orientation data)
-      uint8_t emb_func_en = 0x02;
-      i2c_->StartWriteMemory(config.address, 0x04, std::string_view(
-          reinterpret_cast<const char*>(&emb_func_en), 1));
-      wait_i2c();
-
-      // Set SFLP data rate
-      uint8_t sflp_odr = 0x5B;  // 5B->120Hz, 63->240hz, 6B->480hz
-      switch (hz) {
-        case 240: sflp_odr = 0x63; break;
-        case 480: sflp_odr = 0x6B; break;
-        default: break;  // remain at 0x5B for 120Hz
-      }
-      i2c_->StartWriteMemory(config.address, 0x5E, std::string_view(
-          reinterpret_cast<const char*>(&sflp_odr), 1));
-      wait_i2c();
-
-      // Enable SFLP batching
-      uint8_t fifo_en = 0x02;
-      i2c_->StartWriteMemory(config.address, 0x44, std::string_view(
-          reinterpret_cast<const char*>(&fifo_en), 1));
-      wait_i2c();
-
-      // Switch back to main register bank
-      func_cfg = 0x00;
-      i2c_->StartWriteMemory(config.address, 0x01, std::string_view(
-          reinterpret_cast<const char*>(&func_cfg), 1));
-      wait_i2c();
-    }
-
-    // Set FIFO mode to RESET - this clears the FIFO
-    uint8_t fifo_ctrl4 = 0x00;
-    i2c_->StartWriteMemory(config.address, 0x0A, std::string_view(
-        reinterpret_cast<const char*>(&fifo_ctrl4), 1));
-    wait_i2c();
-
-    // Set FIFO mode to continuous
-    fifo_ctrl4 = 0x06;
-    i2c_->StartWriteMemory(config.address, 0x0A, std::string_view(
-        reinterpret_cast<const char*>(&fifo_ctrl4), 1));
-    wait_i2c();
-
-    return true;
-  }
-
-  void wait_i2c() {
-    // Wait for the I2C transaction to complete so we can send the next command
-    while (true) {
-      i2c_->Poll();  // moves the driver's state machine forward
-      auto status = i2c_->CheckRead();
-      if (status == Stm32I2c::ReadStatus::kComplete) {
-        break;
-      } else if (status == Stm32I2c::ReadStatus::kError) {
-        // Re-initialize or handle error
-        DigitalOut db1_led(g_hw_pins.debug_led1, 0);
-        i2c_->Initialize();
-        return;
+    if (fusion_slot >= 0) {
+      // poll_rate_us is ignored: the next transaction starts as soon
+      // as the bus is free (docs §5.2).  The FIFO absorbs the delay
+      // when another device takes a turn.
+      if (i2c_startup_complete_ && fusion_driver_ &&
+          fusion_driver_->ISR_Start()) {
+        i2c_state_[fusion_slot].pending = true;
       }
     }
   }
@@ -952,64 +921,6 @@ class AuxPort {
                               reinterpret_cast<char*>(&encoder_raw_data_[0]),
                               size));
   }
-
-  // Same as above, but writes to pointer variable, and has variable size.
-  void StartI2cRead(uint8_t address, uint8_t reg, uint8_t* data, size_t size) {
-    i2c_->StartReadMemory(address, reg,
-                          mjlib::base::string_span(
-                              reinterpret_cast<char*>(data),
-                              size));
-  }
-
-  // Reads the quaternion "game vector" from the LSM6DSV16X.
-  // This function is a bit weird. Since it is called from inside an interrupt,
-  // we can't take much time at all or we will ruin all the realtime things
-  // happening elsewhere. But I2C is slow *if we wait for it*. So we have to do
-  // one I2C operation per interrupt call, and don't wait for it to finish.
-  // With that, the whole interrupt takes around 3 microseconds. Good.
-  void ReadIMUData(uint8_t address) {
-    // Check how many FIFO samples the last I2C read reported.
-    uint16_t fifo_samples = (((FIFO_raw_data_[1] & 0x01) << 8) | FIFO_raw_data_[0]);
-
-    // If there are no samples, we need to read the FIFO status register, then
-    // return because we only get to do 1 I2C operation per interrupt.
-    if (fifo_samples == 0) {
-      // ReadFIFOStatus(address);
-      StartI2cRead(address, 0x1B, FIFO_raw_data_, 2);
-      return;
-    }
-
-    while (fifo_samples > 0) {
-      // If we did anything but game vector, we'd need to read the tag.
-      // But that would be too much I2C activity.
-      // uint8_t tag = ReadFIFOTag(address);
-      // case 0x13: { // TAG for SFLP quaternion data
-
-      // ReadFIFOData(address, &(quaternion_raw_data_[0]), length);
-      StartI2cRead(address, 0x79, &(quaternion_raw_data_[0]), 6);
-
-      // This is a big fail and I shouldn't let it happen.
-      // If this happens, it means the FIFO is getting filled faster than our
-      // polling rate, so we have to read more than one FIFO per interrupt.
-      // That is bad for realtimeness. I need some way to guarantee that we
-      // poll faster than the FIFO rate.
-      if (fifo_samples > 1) wait_i2c();
-
-      fifo_samples--;
-    }
-
-    // Set FIFO count to 0 since we just cleared it all.
-    FIFO_raw_data_[0] = 0;
-    FIFO_raw_data_[1] = 0;
-  }
-
-  uint8_t ReadFIFOTag(uint8_t address) {
-    uint8_t tag = 0x13;
-    StartI2cRead(address, 0x78, &tag, 1);
-    wait_i2c();
-    return tag >> 3;
-  }
-
 
   void StartTunnelRead() {
     tunnel_stream_->AsyncReadSome(
@@ -1065,6 +976,14 @@ class AuxPort {
       DigitalIn din(hw_config_.options.i2c_pullup);
     }
     i2c_state_ = {};
+    fusion_driver_.reset();
+    fusion_status_ = {};
+    if (fusion_storage_) {
+      ReleaseFusionStorage(fusion_owner_id_);
+      ReleaseTimer(TIM3, kFusionTimerOwner);
+      fusion_storage_ = nullptr;
+    }
+    ReleaseTimer(TIM3, timer_owner_);
 
     as5047_.reset();
     as5047_options_.reset();
@@ -1187,6 +1106,17 @@ class AuxPort {
     ////////////////////////////////////////////
     // Validate our config, one option at a time.
 
+    for (const auto& device : config_.i2c.devices) {
+      // A type this firmware doesn't know (a stale config line from an
+      // older build, e.g. the retired type 4) must not reach the ISR,
+      // which treats it as impossible.
+      if (device.type < aux::I2C::DeviceConfig::kNone ||
+          device.type >= aux::I2C::DeviceConfig::kNumTypes) {
+        status_.error = aux::AuxError::kUnsupported;
+        return;
+      }
+    }
+
     const bool any_i2c =
         [&]() {
           for (const auto& device : config_.i2c.devices) {
@@ -1250,6 +1180,48 @@ class AuxPort {
             return options;
           }());
       updated_any_isr = true;
+
+      for (const auto& device : config_.i2c.devices) {
+        if (device.type != aux::I2C::DeviceConfig::kLsm6dsv16x) {
+          continue;
+        }
+        if (config_.i2c.i2c_hz < 400000) {
+          // The 960 Hz gyro plus accel/timestamp FIFO traffic needs
+          // fast-mode bandwidth, including status reads and ISR pump
+          // delays.  Reject slow buses instead of repeatedly overrunning.
+          status_.error = aux::AuxError::kUnsupported;
+          return;
+        }
+        if (fusion_storage_) {
+          // Only one fusion device per board.
+          status_.error = aux::AuxError::kUnsupported;
+          return;
+        }
+        auto* const storage = ClaimFusionStorage(fusion_owner_id_);
+        if (storage == nullptr) {
+          fusion_status_.init_state = kFusionInitStorageTaken;
+          status_.error = aux::AuxError::kUnsupported;
+          return;
+        }
+        if (!ClaimTimer(TIM3, kFusionTimerOwner)) {
+          // Fusion mode requires TIM3 (docs §5.4); no degraded mode.
+          ReleaseFusionStorage(fusion_owner_id_);
+          fusion_status_.init_state = kFusionInitTimerTaken;
+          status_.error = aux::AuxError::kUnsupported;
+          return;
+        }
+        StartFusionTimer();
+        storage->mailbox.Reset();
+        storage->control.Reset();
+        storage->fusion.Attach(&storage->mailbox, &storage->control,
+                               &storage->history, &fusion_status_);
+        CopyImuCal();
+        *storage->fusion.params() = fusion_params_;
+        fusion_status_.storage_owner = fusion_owner_id_;
+        fusion_driver_.emplace(&*i2c_, device.address, storage,
+                               &fusion_status_);
+        fusion_storage_ = storage;
+      }
     }
 
     if (config_.spi.mode == aux::Spi::Config::kOnboardAs5047 &&
@@ -1406,6 +1378,14 @@ class AuxPort {
         }
       }
       updated_any_isr = true;
+    }
+
+    if (UsesTim3() && !ClaimTimer(TIM3, timer_owner_)) {
+      // TIM3 is the IMU fusion time base and FDCAN timestamp counter
+      // (docs §5.4).  Hardware quadrature, BiSS-C and PWM reprogram
+      // their timer, so they may not share it.
+      status_.error = aux::AuxError::kUnsupported;
+      return;
     }
 
     if (config_.quadrature.enabled) {
@@ -1576,6 +1556,11 @@ class AuxPort {
               if (quad_ && quad_->hwtimer() == pin.timer) {
                 // If a hardware quadrature input is already using
                 // this timer, then we can't.
+                continue;
+              }
+              if (TimerOwner(pin.timer) == kFusionTimerOwner) {
+                // The IMU fusion uses TIM3 as its time base and as
+                // the FDCAN timestamp counter (docs §5.4).
                 continue;
               }
               return pin.timer;
@@ -1798,9 +1783,44 @@ class AuxPort {
   };
 
   std::array<I2cState, 3> i2c_state_;
+
+  // IMU fusion (docs/imu_orientation_redesign.md).
+  static constexpr uint8_t kFusionInitStorageTaken = 253;
+  static constexpr uint8_t kFusionInitTimerTaken = 254;
+  FusionStorage* fusion_storage_ = nullptr;
+  std::optional<Lsm6dsv16xFusionDriver> fusion_driver_;
+  ImuFusion::Params fusion_params_;
+  ImuCalConfig* imu_cal_ = nullptr;
+
+  bool UsesTim3() const {
+    for (size_t i = 0; i < pin_count_; i++) {
+      const auto mode = config_.pins[i].mode;
+      if (mode != aux::Pin::Mode::kQuadratureHardware &&
+          mode != aux::Pin::Mode::kBissC &&
+          mode != aux::Pin::Mode::kPwmOutput) {
+        continue;
+      }
+      for (const auto& pin : hw_config_.pins) {
+        if (pin.number == static_cast<int>(i) && pin.timer == TIM3) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  void CopyImuCal() {
+    if (!imu_cal_) { return; }
+    for (int i = 0; i < 3; i++) {
+      fusion_params_.accel_bias[i] = imu_cal_->bias(i);
+      fusion_params_.accel_scale[i] = imu_cal_->scale(i);
+    }
+  }
+  uint32_t fusion_stall_ms_ = 0;
+  aux::ImuFusionStatus fusion_status_;
+  char fusion_record_name_[16] = {};
+
   uint8_t encoder_raw_data_[6] = {};
-  uint8_t FIFO_raw_data_[2] = {};
-  uint8_t quaternion_raw_data_[6] = {};
   bool i2c_startup_complete_ = false;
 
   static constexpr size_t kTunnelBufSize = 64;
@@ -1822,6 +1842,8 @@ class AuxPort {
   const std::array<DMA_Channel_TypeDef*, 5> dma_channels_;
   const SpiDefault spi_default_;
   const UartDefault uart_default_;
+  const uint8_t fusion_owner_id_;
+  const char* const timer_owner_;
 
   std::array<SampleType, static_cast<int>(SampleType::kLastEntry)> start_sample_types_ = {};
   std::array<SampleType, static_cast<int>(SampleType::kLastEntry)> finish_sample_types_ = {};

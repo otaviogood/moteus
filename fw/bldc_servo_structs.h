@@ -14,6 +14,7 @@
 
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <optional>
 
@@ -212,39 +213,48 @@ struct BldcServoStatus {
   uint16_t cooldown_count = 0;
   uint32_t final_timer = 0;
   uint32_t total_timer = 0;
+  // Longest control cycle (DWT cycles, entry to end of the low
+  // priority part) seen during the previous second.
+  uint32_t isr_max_cycles = 0;
 
   float meas_ind_old_d_A = 0.0f;
   float meas_ind_old_q_A = 0.0f;
   int8_t meas_ind_phase = 0;
   float meas_ind_integrator = 0.0f;
 
+  /// Control interrupt profile, MOTEUS_PERFORMANCE_MEASURE builds only
+  /// (`dwt` below): DWT cycles from the interrupt's entry to each point,
+  /// mean and max over the previous second.  A point not reached during
+  /// that second reads 0.
+  enum PerfPoint : uint8_t {
+    kPerfAdcSampled,       // current ADCs sampled (DBG1 rises)
+    kPerfLowPriority,      // PendSV entered
+    kPerfAuxStarted,       // aux ISR_MaybeStartSample (encoder SPI started)
+    kPerfAdcDone,          // current conversions complete
+    kPerfAdcRead,          // all ADC results read
+    kPerfAux1Done,         // aux1 ISR_MaybeFinishSample (encoder)
+    kPerfAux2Done,         // aux2 ISR_MaybeFinishSample (IMU I2C)
+    kPerfMotorPosition,    // motor_position ISR_Update
+    kPerfSense,            // ISR_DoSense complete (filters, thermistors)
+    kPerfCurrentState,     // ISR_CalculateCurrentState
+    kPerfModeSelected,     // ISR_DoControl, before the mode switch
+    kPerfPositionCommand,  // position mode: UpdateCommand done
+    kPerfCurrentStart,     // ISR_DoCurrent entered
+    kPerfVoltageDq,        // ISR_DoVoltageDQ entered
+    kPerfControl,          // ISR_DoControl complete
+    kPerfDone,             // end of the interrupt
+    kNumPerfPoints,
+  };
+
 #ifdef MOTEUS_PERFORMANCE_MEASURE
   struct Dwt {
-    uint32_t adc_done = 0;
-    uint32_t start_pos_sample = 0;
-    uint32_t done_pos_sample = 0;
-    uint32_t done_temp_sample = 0;
-    uint32_t sense = 0;
-    uint32_t curstate = 0;
-    uint32_t control_sel_mode = 0;
-    uint32_t control_done_pos = 0;
-    uint32_t control_done_cur = 0;
-    uint32_t control = 0;
-    uint32_t done = 0;
+    std::array<uint32_t, kNumPerfPoints> mean = {};
+    std::array<uint32_t, kNumPerfPoints> max = {};
 
     template <typename Archive>
     void Serialize(Archive* a) {
-      a->Visit(MJ_NVP(adc_done));
-      a->Visit(MJ_NVP(start_pos_sample));
-      a->Visit(MJ_NVP(done_pos_sample));
-      a->Visit(MJ_NVP(done_temp_sample));
-      a->Visit(MJ_NVP(sense));
-      a->Visit(MJ_NVP(curstate));
-      a->Visit(MJ_NVP(control_sel_mode));
-      a->Visit(MJ_NVP(control_done_pos));
-      a->Visit(MJ_NVP(control_done_cur));
-      a->Visit(MJ_NVP(control));
-      a->Visit(MJ_NVP(done));
+      a->Visit(MJ_NVP(mean));
+      a->Visit(MJ_NVP(max));
     }
   };
 
@@ -315,6 +325,7 @@ struct BldcServoStatus {
     a->Visit(MJ_NVP(cooldown_count));
     a->Visit(MJ_NVP(final_timer));
     a->Visit(MJ_NVP(total_timer));
+    a->Visit(MJ_NVP(isr_max_cycles));
 
     a->Visit(MJ_NVP(meas_ind_old_d_A));
     a->Visit(MJ_NVP(meas_ind_old_q_A));

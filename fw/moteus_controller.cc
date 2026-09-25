@@ -18,10 +18,13 @@
 
 #include "fw/aux_port.h"
 #include "fw/drv8323.h"
+#include "fw/imu_cal.h"
 #include "fw/math.h"
 #include "fw/moteus_hw.h"
 #include "fw/motor_position.h"
 #include "fw/multi_transport_datagram_server.h"
+#include "fw/quat48.h"
+#include "fw/scope_markers.h"
 #include "fw/uart_fdcanusb_micro_server.h"
 
 namespace micro = mjlib::micro;
@@ -91,6 +94,10 @@ Value ScalePosition(float value, size_t type) {
 
 Value ScaleVelocity(float value, size_t type) {
   return ScaleMapping(value, 0.1f, 0.00025f, 0.00001f, type);
+}
+
+Value ScaleGyroRate(float value, size_t type) {
+  return ScaleMapping(value, 0.1f, 0.001f, 0.000001f, type);
 }
 
 Value ScaleAcceleration(float value, size_t type) {
@@ -312,6 +319,12 @@ enum class Register {
   kAux1AnalogIn4 = 0x063,
   kAux1AnalogIn5 = 0x064,
 
+  // Fork-specific: the aux2 fusion's bias-corrected gyro rate, rad/s
+  // about the quaternion's body axes.
+  kAux2GyroX = 0x065,
+  kAux2GyroY = 0x066,
+  kAux2GyroZ = 0x067,
+
   kAux2AnalogIn1 = 0x068,
   kAux2AnalogIn2 = 0x069,
   kAux2AnalogIn3 = 0x06a,
@@ -498,7 +511,8 @@ class MoteusController::Impl : public multiplex::MicroServer::Server {
                    (g_measured_hw_family == 1 ||
                     g_measured_hw_family == 3) ?
                    AuxPort::kDefaultUartSerial : AuxPort::kDefaultUartDisabled,
-                   {DMA1_Channel3, DMA1_Channel4, DMA1_Channel5, DMA1_Channel6, DMA1_Channel7}),
+                   {DMA1_Channel3, DMA1_Channel4, DMA1_Channel5, DMA1_Channel6, DMA1_Channel7},
+                   &imu_cal_),
         aux2_port_("aux2", "ic_pz2", GetAux2HardwareConfig(),
                    &aux_adc_.aux_info[1],
                    persistent_config, command_manager, telemetry_manager,
@@ -508,7 +522,8 @@ class MoteusController::Impl : public multiplex::MicroServer::Server {
                    (g_measured_hw_family == 0 ||
                     g_measured_hw_family == 2) ?
                    AuxPort::kDefaultUartSerial : AuxPort::kDefaultUartDisabled,
-                   {DMA1_Channel8, DMA2_Channel1, DMA2_Channel2, DMA2_Channel3, DMA2_Channel4}),
+                   {DMA1_Channel8, DMA2_Channel1, DMA2_Channel2, DMA2_Channel3, DMA2_Channel4},
+                   &imu_cal_),
         motor_position_(persistent_config, telemetry_manager,
                         aux1_port_.status(),
                         aux2_port_.status(),
@@ -556,6 +571,11 @@ class MoteusController::Impl : public multiplex::MicroServer::Server {
         multi_transport_(multi_transport) {
     // Register for notifications when the UART servers change in aux
     // ports.  aux1 takes priority over aux2 when both are available.
+    persistent_config->Register("imu_cal", &imu_cal_, [this]() {
+        aux1_port_.ApplyImuCal();
+        aux2_port_.ApplyImuCal();
+      });
+
     aux1_port_.SetUartServerChangedCallback([this](auto* server) {
       // server is aux1's new state (nullptr if destroyed)
       auto* const active =
@@ -580,6 +600,7 @@ class MoteusController::Impl : public multiplex::MicroServer::Server {
     if (command_valid_) {
       command_valid_ = false;
       bldc_.Command(command_);
+      scope::Clear(scope::kCanFrame);
     }
     aux1_port_.Poll();
     aux2_port_.Poll();
@@ -594,16 +615,25 @@ class MoteusController::Impl : public multiplex::MicroServer::Server {
   }
 
   void StartFrame() override {
+    // Held until the frame's command reaches the servo (Poll()), or the
+    // end of the frame if it carries none.
+    scope::Set(scope::kCanFrame);
     command_valid_ = false;
     discard_all_ = false;
+    quaternion_words_valid_ = false;
+    if (auto* storage = aux2_port_.fusion_storage()) {
+      scope::Set(scope::kFusionFrame);
+      storage->fusion.BeginFrame(multi_transport_->rx_fifo0_fill_level());
+      scope::Clear(scope::kFusionFrame);
+    }
   }
 
   Action CompleteFrame() override {
     if (discard_all_) {
       command_valid_ = false;
-      return kDiscard;
     }
-    return kAccept;
+    if (!command_valid_) { scope::Clear(scope::kCanFrame); }
+    return discard_all_ ? kDiscard : kAccept;
   }
 
   WriteAction Write(multiplex::MicroServer::Register reg,
@@ -864,6 +894,9 @@ class MoteusController::Impl : public multiplex::MicroServer::Server {
       case Register::kAux2AnalogIn3:
       case Register::kAux2AnalogIn4:
       case Register::kAux2AnalogIn5:
+      case Register::kAux2GyroX:
+      case Register::kAux2GyroY:
+      case Register::kAux2GyroZ:
       case Register::kAux2QuaternionX:
       case Register::kAux2QuaternionY:
       case Register::kAux2QuaternionZ:
@@ -907,9 +940,6 @@ class MoteusController::Impl : public multiplex::MicroServer::Server {
       multiplex::MicroServer::Register reg,
       size_t type) const override
       __attribute__ ((optimize("O3"))) {
-    
-    // Clear any cached values at the start of a new read
-    quaternion_cache_valid_ = false;
 
     if (discard_all_) {
       // report unknown register for anything else
@@ -1213,30 +1243,22 @@ class MoteusController::Impl : public multiplex::MicroServer::Server {
         return ScalePwm(bldc_.aux2().pwm[pin], type);
       }
 
+      case Register::kAux2GyroX:
+      case Register::kAux2GyroY:
+      case Register::kAux2GyroZ: {
+        return ScaleGyroRate(
+            GyroRate(static_cast<int>(reg) -
+                     static_cast<int>(Register::kAux2GyroX)), type);
+      }
+
       case Register::kAux2QuaternionX: {
-        // For any quaternion read, get all values atomically
-        // The cache is valid for all component reads within a single CAN frame request
-        if (!quaternion_cache_valid_) {
-          quaternion_cache_ = ReadQuaternionAtomic();
-          quaternion_cache_valid_ = true;
-        }
-        return quaternion_cache_.x;
+        return Value(static_cast<int16_t>(QuaternionWords().w0));
       }
       case Register::kAux2QuaternionY: {
-        // Reuse cached value if another quaternion component was already read in this frame
-        if (!quaternion_cache_valid_) {
-          quaternion_cache_ = ReadQuaternionAtomic();
-          quaternion_cache_valid_ = true;
-        }
-        return quaternion_cache_.y;
+        return Value(static_cast<int16_t>(QuaternionWords().w1));
       }
       case Register::kAux2QuaternionZ: {
-        // Reuse cached value if another quaternion component was already read in this frame
-        if (!quaternion_cache_valid_) {
-          quaternion_cache_ = ReadQuaternionAtomic();
-          quaternion_cache_valid_ = true;
-        }
-        return quaternion_cache_.z;
+        return Value(static_cast<int16_t>(QuaternionWords().w2));
       }
 
       case Register::kModelNumber: {
@@ -1306,6 +1328,7 @@ class MoteusController::Impl : public multiplex::MicroServer::Server {
   }
 
   AuxADC aux_adc_;
+  ImuCalConfig imu_cal_;
   AuxPort aux1_port_;
   AuxPort aux2_port_;
   MotorPosition motor_position_;
@@ -1322,32 +1345,39 @@ class MoteusController::Impl : public multiplex::MicroServer::Server {
 
   MultiTransportDatagramServer* multi_transport_ = nullptr;
 
-  struct QuaternionValues {
-    Value x;
-    Value y;
-    Value z;
-  };
+  // The quaternion reply of the current frame (reset in StartFrame()):
+  // all three registers of a reply carry one sample.
+  mutable Quat48Words quaternion_words_;
+  mutable bool quaternion_words_valid_ = false;
 
-  // Cache for atomic quaternion reads
-  // This cache is valid only within a single Read method call (one CAN frame)
-  // and is automatically invalidated at the start of each new Read
-  mutable QuaternionValues quaternion_cache_;
-  mutable bool quaternion_cache_valid_ = false;
+  // This frame's arrival instant in TIM3 ticks (docs §5.4).  Frames
+  // from the UART transport carry no hardware stamp; the current tick is
+  // used and the reply flagged.
+  uint16_t FrameStamp() const {
+    return multi_transport_->last_frame_is_can() ?
+        multi_transport_->last_can_rx_timestamp() :
+        static_cast<uint16_t>(TIM3->CNT);
+  }
 
-  QuaternionValues ReadQuaternionAtomic() const {
-    QuaternionValues result;
-    
-    __disable_irq();  // Disable interrupts to ensure atomic reads
-    auto* status = const_cast<AuxPort&>(aux2_port_).status();
-    
-    // The LSM6DSV16X provides quaternion values in float16 format
-    // We use signed int16_t casting to ensure proper interpretation of the data
-    result.x = Value(static_cast<int16_t>(status->i2c.devices[0].quat_x));
-    result.y = Value(static_cast<int16_t>(status->i2c.devices[0].quat_y));
-    result.z = Value(static_cast<int16_t>(status->i2c.devices[0].quat_z));
-    
-    __enable_irq();  // Re-enable interrupts
-    return result;
+  const Quat48Words& QuaternionWords() const {
+    if (quaternion_words_valid_) { return quaternion_words_; }
+    quaternion_words_valid_ = true;
+    // No fusion on aux2: the "no data" sentinel.
+    quaternion_words_ = {};
+    auto* storage = const_cast<AuxPort&>(aux2_port_).fusion_storage();
+    if (storage) {
+      scope::Set(scope::kFusionFrame);
+      quaternion_words_ = storage->fusion.Reply(
+          FrameStamp(), multi_transport_->last_frame_is_can());
+      scope::Clear(scope::kFusionFrame);
+    }
+    return quaternion_words_;
+  }
+
+  float GyroRate(int axis) const {
+    auto* storage = const_cast<AuxPort&>(aux2_port_).fusion_storage();
+    if (!storage) { return std::numeric_limits<float>::quiet_NaN(); }
+    return storage->fusion.RateAt(FrameStamp(), axis);
   }
 };
 

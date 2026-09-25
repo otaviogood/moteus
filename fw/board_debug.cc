@@ -30,6 +30,7 @@
 #include "fw/bootloader.h"
 #include "fw/drv8323.h"
 #include "fw/moteus_hw.h"
+#include "fw/scope_markers.h"
 #include "fw/strtof.h"
 
 namespace base = mjlib::base;
@@ -432,6 +433,29 @@ class BoardDebug::Impl {
       WriteOk(response);
 
       data_update_();
+      return;
+    }
+
+    if (cmd_text == "mark") {
+      // Logic-analyzer markers (fw/scope_markers.h); no-ops unless built
+      // with MOTEUS_SCOPE_MARKERS.  `d mark 0|1` drives the phase marker,
+      // `d mark phase|can|fusion` selects what DBG2 shows.
+      const auto arg = tokenizer.next();
+      if (arg == "phase") {
+        scope::SelectDbg2(scope::Dbg2::kPhase);
+      } else if (arg == "can") {
+        scope::SelectDbg2(scope::Dbg2::kCan);
+      } else if (arg == "fusion") {
+        scope::SelectDbg2(scope::Dbg2::kFusion);
+      } else if (arg == "1") {
+        scope::Set(scope::kPhase);
+      } else if (arg == "0") {
+        scope::Clear(scope::kPhase);
+      } else {
+        WriteMessage(response, "ERR expected 0|1|phase|can|fusion\r\n");
+        return;
+      }
+      WriteOk(response);
       return;
     }
 

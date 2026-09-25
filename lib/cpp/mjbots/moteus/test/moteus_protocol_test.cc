@@ -16,6 +16,7 @@
 
 #include <boost/test/auto_unit_test.hpp>
 
+#include <cmath>
 #include <string>
 
 using namespace mjbots;
@@ -145,6 +146,36 @@ BOOST_AUTO_TEST_CASE(QueryMaximal) {
   BOOST_TEST(result.extra[1].register_number == moteus::Register::kEncoder0Velocity);
   BOOST_TEST(result.extra[1].value == 0.012);
   BOOST_TEST(result.extra[2].register_number == std::numeric_limits<int16_t>::max());
+}
+
+BOOST_AUTO_TEST_CASE(QueryImuRegisters) {
+  // Fork-specific IMU registers: the gyro rate scales at 0.001 rad/s and
+  // keeps the int16 NaN code; the quat48 words come back verbatim, so a
+  // valid 0x8000 word is not mistaken for NaN.
+  moteus::CanData query_data{
+    {
+      0x27, 0x65,
+      0xd2, 0x04,  // gyro x: 1234 -> 1.234 rad/s
+      0x00, 0x80,  // gyro y: NaN code
+      0x06, 0xff,  // gyro z: -250 -> -0.25 rad/s
+      0x27, 0x6d,
+      0x00, 0x80,  // quaternion word 0: 0x8000
+      0xff, 0x7f,  // word 1: 0x7fff
+      0x34, 0x12,  // word 2: 0x1234
+    },
+    16,
+  };
+
+  const auto result = moteus::Query::Parse(&query_data);
+  BOOST_TEST(result.extra[0].register_number == moteus::Register::kAux2GyroX);
+  BOOST_TEST(std::abs(result.extra[0].value - 1.234) < 1e-9);
+  BOOST_TEST(result.extra[1].register_number == moteus::Register::kAux2GyroY);
+  BOOST_TEST(std::isnan(result.extra[1].value));
+  BOOST_TEST(std::abs(result.extra[2].value + 0.25) < 1e-9);
+  BOOST_TEST(result.extra[3].register_number == moteus::Register::kAux2QuaternionX);
+  BOOST_TEST(static_cast<uint16_t>(static_cast<int16_t>(result.extra[3].value)) == 0x8000);
+  BOOST_TEST(result.extra[4].value == 0x7fff);
+  BOOST_TEST(result.extra[5].value == 0x1234);
 }
 
 BOOST_AUTO_TEST_CASE(GenericQueryMake) {

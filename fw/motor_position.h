@@ -667,6 +667,63 @@ class MotorPosition {
           (1.0f / static_cast<float>(source_config.cpr)) : 0.0f;
     }
 
+    // The PLL gains depend only on the source configs, so set them
+    // before any of the motor checks below can bail out: a board with
+    // no motor (poles 0) still filters its encoders.
+    for (size_t i = 0; i < pll_filter_constants_.size(); i++) {
+      const auto& config = config_.sources[i];
+      auto& constants = pll_filter_constants_[i];
+
+      // w_n = natural frequency, not the 3dB cutoff frequency
+      //
+      // They are related by w_3db / w_n = r(zeta)
+      //
+      // Where r(zeta) = sqrt((2 + 4 * zeta**2 + sqrt((2 + 4 * zeta**2)**2 + r)) / 2)
+      //
+      // Derived from: https://www.dsprelated.com/showarticle/973.php
+      // Appendix B.
+      //
+      // In the s domain, the closed loop response is:
+      //
+      // CL(s) = (2 * zeta * w_n * s + w_n ** 2) / (s**2 + 2 * zeta * w_n + w_n ** 2)
+      //
+      // For a test frequency ω, substitute jω in for s and
+      // taking the magnitude squared yields:
+      //
+      //  |CL(jω)|**2 = ((2 * zeta * w_n * ω) ** 2 + ω ** 4) / ((w_n ** 2 - ω ** 2) ** 2 + (2 *  zeta * w_n * ω) ** 2)
+      //
+      // r = ω / w_n
+      //
+      //  |CL(jω)|**2 = ((2 * zeta * r) ** 2 + 1) / ((1 - r ** 2) ** 2 + (2 * zeta * r) ** 2)
+      //
+      // The 3dB point is where |CL(j * w_3db)| ** 2 = 1/2
+      // and set r_c = w_3db / w_n
+      //
+      //  2 * ((2 * zeta * r_c) ** 2 + 1) = (1 - r_c ** 2) ** 2 + (2 * zeta * r_c) ** 2
+      //
+      // Solve for r_c:
+      //
+      //  -r_c ** 4 + (2 + r * zeta ** 2) * r_c ** 2 + 1 = 0
+      //
+      // Let x = r_c ** 2
+      //
+      //  x ** 2 - (2 + 4 * zeta ** 2) * x - 1 = 0
+      //
+      // Solve for x with quadratic formula:
+      //
+      //   x= (2 + 4 * zeta ** 2 + sqrt((2 + 4 * zeta ** 2) ** 2 + 4)) / 2
+      //
+      // and r(zeta) = sqrt(x)
+      //
+      //  r(zeta) = sqrt((2 + 4 * zeta ** 2 + sqrt((2 + 4 * zeta ** 2) ** 2 + 4)) / 2)
+      //
+      // r(1.0) ~= 2.48
+      const float w_n = (config.pll_filter_hz / 2.48f) * k2Pi;
+      const float zeta = 1.0f;
+      constants.kp = 2.0f * zeta * w_n;
+      constants.ki = w_n * w_n;
+    }
+
     if (config_.commutation_source < 0 ||
         (config_.commutation_source >=
          static_cast<int>(config_.sources.size()))) {
@@ -780,60 +837,6 @@ class MotorPosition {
         (output_encoder_step_ / 4 * 1) >> 32;
     output_encoder_step_hb_3_4_ =
         (output_encoder_step_ / 4 * 3) >> 32;
-
-    for (size_t i = 0; i < pll_filter_constants_.size(); i++) {
-      const auto& config = config_.sources[i];
-      auto& constants = pll_filter_constants_[i];
-
-      // w_n = natural frequency, not the 3dB cutoff frequency
-      //
-      // They are related by w_3db / w_n = r(zeta)
-      //
-      // Where r(zeta) = sqrt((2 + 4 * zeta**2 + sqrt((2 + 4 * zeta**2)**2 + r)) / 2)
-      //
-      // Derived from: https://www.dsprelated.com/showarticle/973.php
-      // Appendix B.
-      //
-      // In the s domain, the closed loop response is:
-      //
-      // CL(s) = (2 * zeta * w_n * s + w_n ** 2) / (s**2 + 2 * zeta * w_n + w_n ** 2)
-      //
-      // For a test frequency ω, substitute jω in for s and
-      // taking the magnitude squared yields:
-      //
-      //  |CL(jω)|**2 = ((2 * zeta * w_n * ω) ** 2 + ω ** 4) / ((w_n ** 2 - ω ** 2) ** 2 + (2 *  zeta * w_n * ω) ** 2)
-      //
-      // r = ω / w_n
-      //
-      //  |CL(jω)|**2 = ((2 * zeta * r) ** 2 + 1) / ((1 - r ** 2) ** 2 + (2 * zeta * r) ** 2)
-      //
-      // The 3dB point is where |CL(j * w_3db)| ** 2 = 1/2
-      // and set r_c = w_3db / w_n
-      //
-      //  2 * ((2 * zeta * r_c) ** 2 + 1) = (1 - r_c ** 2) ** 2 + (2 * zeta * r_c) ** 2
-      //
-      // Solve for r_c:
-      //
-      //  -r_c ** 4 + (2 + r * zeta ** 2) * r_c ** 2 + 1 = 0
-      //
-      // Let x = r_c ** 2
-      //
-      //  x ** 2 - (2 + 4 * zeta ** 2) * x - 1 = 0
-      //
-      // Solve for x with quadratic formula:
-      //
-      //   x= (2 + 4 * zeta ** 2 + sqrt((2 + 4 * zeta ** 2) ** 2 + 4)) / 2
-      //
-      // and r(zeta) = sqrt(x)
-      //
-      //  r(zeta) = sqrt((2 + 4 * zeta ** 2 + sqrt((2 + 4 * zeta ** 2) ** 2 + 4)) / 2)
-      //
-      // r(1.0) ~= 2.48
-      const float w_n = (config.pll_filter_hz / 2.48f) * k2Pi;
-      const float zeta = 1.0f;
-      constants.kp = 2.0f * zeta * w_n;
-      constants.ki = w_n * w_n;
-    }
   }
 
   void ISR_UpdateState() MOTEUS_CCM_ATTRIBUTE {

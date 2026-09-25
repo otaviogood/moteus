@@ -1,144 +1,72 @@
 #!/usr/bin/python3 -B
 
 """
-This example reads the quaternion values from a LSM6DSV16X IMU connected
-to the Aux2 port of a moteus controller with ID #1.
+This example reads the orientation of a LSM6DSV16X IMU connected to the
+Aux2 port of a moteus controller (aux2.i2c.devices.0.type 3).  Registers
+0x06d-0x06f carry a 48-bit "smallest three" quaternion; see
+docs/protocol/registers.md.
 """
 
+import argparse
 import asyncio
 import math
+
 import moteus
-import struct
+from moteus.multiplex import INT16
 
-# Import the resolution types from the multiplex module
-from moteus.multiplex import INT16, F32
+QUAT48_LEVELS = 32767
 
-# Helper function to convert the 16-bit values into float16 format
-def float16_to_float32(value):
-    # Extract sign, exponent, and mantissa from the 16-bit value
-    sign = (value & 0x8000) >> 15
-    exponent = (value & 0x7C00) >> 10
-    mantissa = value & 0x03FF
 
-    # Handle special cases
-    if exponent == 0:
-        if mantissa == 0:
-            return -0.0 if sign else 0.0
-        else:
-            # Denormalized number
-            return (-1.0 if sign else 1.0) * (mantissa / 1024.0) * (2.0 ** -14)
-    elif exponent == 31:
-        if mantissa == 0:
-            return float('-inf') if sign else float('inf')
-        else:
-            return float('nan')
+def decode_quat48(w0, w1, w2):
+    """Three register words -> (w, x, y, z), or None for the "no data"
+    sentinel.  Also returns the freshness toggle (bit 47)."""
+    v = (w0 & 0xffff) | ((w1 & 0xffff) << 16) | ((w2 & 0xffff) << 32)
+    toggle = (v >> 47) & 1
+    v &= (1 << 47) - 1
+    if v == 0:
+        return None, toggle
+    omitted = (v >> 45) & 0x3
+    others = [((v >> (15 * j)) & 0x7fff) / QUAT48_LEVELS * 2.0 - 1.0
+              for j in range(3)]
+    others = [c / math.sqrt(2.0) for c in others]
+    largest = math.sqrt(max(0.0, 1.0 - sum(c * c for c in others)))
+    q = others[:omitted] + [largest] + others[omitted:]
+    return q, toggle
 
-    # Normalized number
-    result = (-1.0 if sign else 1.0) * (1.0 + mantissa / 1024.0) * (2.0 ** (exponent - 15))
-    return result
 
 async def main():
-    # Parse command line arguments to get target
-    import argparse
-    parser = argparse.ArgumentParser(description='Query quaternion data from moteus controller')
-    parser.add_argument('--target', type=int, default=1, help='ID of the target controller')
-    parser.add_argument('--component', choices=['all', 'x', 'y', 'z'], default='all',
-                      help='Which quaternion component to query (to diagnose I2C issues)')
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--target', type=int, default=1,
+                        help='ID of the target controller')
     moteus.make_transport_args(parser)
     args = parser.parse_args()
 
-    # Create a query resolution that specifies which quaternion registers to read
     qr = moteus.QueryResolution()
-    qr._extra = {}
-
-    # Configure which components to query based on command-line options
-    if args.component == 'x':
-        qr._extra[moteus.Register.AUX2_QUATERNIONX] = INT16
-    elif args.component == 'y':
-        qr._extra[moteus.Register.AUX2_QUATERNIONY] = INT16
-    elif args.component == 'z':
-        qr._extra[moteus.Register.AUX2_QUATERNIONZ] = INT16
-    else:  # Default to 'all'
-        qr._extra = {
-            moteus.Register.AUX2_QUATERNIONX: INT16,
-            moteus.Register.AUX2_QUATERNIONY: INT16,
-            moteus.Register.AUX2_QUATERNIONZ: INT16,
-        }
-    # Also query the absolute position from the Aux1 SPI encoder
-    qr._extra[0x006] = F32  # Register.ABS_POSITION
-
-    # Create a controller with our specific query resolution and target ID
+    qr._extra = {
+        moteus.Register.AUX2_QUATERNIONX: INT16,
+        moteus.Register.AUX2_QUATERNIONY: INT16,
+        moteus.Register.AUX2_QUATERNIONZ: INT16,
+    }
     transport = moteus.get_singleton_transport(args)
-    controller = moteus.Controller(id=args.target, query_resolution=qr, transport=transport)
+    controller = moteus.Controller(
+        id=args.target, query_resolution=qr, transport=transport)
 
-    print(f"Reading quaternion values from LSM6DSV16X IMU on Aux2 (controller ID: {args.target}). Press Ctrl+C to exit.")
-    print()
+    print(f"Reading the Aux2 IMU orientation of controller {args.target}. "
+          "Press Ctrl+C to exit.")
+    while True:
+        result = await controller.query()
+        q, toggle = decode_quat48(
+            result.values[moteus.Register.AUX2_QUATERNIONX],
+            result.values[moteus.Register.AUX2_QUATERNIONY],
+            result.values[moteus.Register.AUX2_QUATERNIONZ])
+        if q is None:
+            print("no data (IMU not configured or filter warming up)")
+        else:
+            w, x, y, z = q
+            print(f"wxyz = [{w:+.4f}, {x:+.4f}, {y:+.4f}, {z:+.4f}]  "
+                  f"toggle {toggle}")
+        await asyncio.sleep(0.1)
 
-    try:
-        while True:
-            # Query the controller for the custom registers
-            result = await controller.query()
-
-            # Extract the quaternion values, defaulting to 0 if not queried
-            quat_x = result.values.get(moteus.Register.AUX2_QUATERNIONX, 0) if args.component in ['all', 'x'] else 0
-            quat_y = result.values.get(moteus.Register.AUX2_QUATERNIONY, 0) if args.component in ['all', 'y'] else 0
-            quat_z = result.values.get(moteus.Register.AUX2_QUATERNIONZ, 0) if args.component in ['all', 'z'] else 0
-
-            # Extract the absolute position value
-            abs_pos = result.values.get(0x006, 0.0)
-
-            # Print raw values for debugging
-            if args.component in ['all', 'x']:
-                print(f"Raw X: {quat_x & 0xFFFF} (0x{quat_x & 0xFFFF:04x})")
-            if args.component in ['all', 'y']:
-                print(f"Raw Y: {quat_y & 0xFFFF} (0x{quat_y & 0xFFFF:04x})")
-            if args.component in ['all', 'z']:
-                print(f"Raw Z: {quat_z & 0xFFFF} (0x{quat_z & 0xFFFF:04x})")
-
-            # Convert from int16 to float16 (IEEE 754 half-precision format)
-            x = float16_to_float32(quat_x) if args.component in ['all', 'x'] else 0.0
-            y = float16_to_float32(quat_y) if args.component in ['all', 'y'] else 0.0
-            z = float16_to_float32(quat_z) if args.component in ['all', 'z'] else 0.0
-
-            # Print the individual components
-            if args.component in ['all', 'x']:
-                print(f"Converted X: {x:.6f}")
-            if args.component in ['all', 'y']:
-                print(f"Converted Y: {y:.6f}")
-            if args.component in ['all', 'z']:
-                print(f"Converted Z: {z:.6f}")
-
-            # Only do the quaternion calculations if we're querying all components
-            if args.component == 'all':
-                # Check if the quaternion is valid (w² + x² + y² + z² = 1)
-                square_sum = x*x + y*y + z*z
-                print(f"Sum of squares (x² + y² + z²): {square_sum:.6f}")
-
-                # Make sure the value inside sqrt is not negative
-                w_squared = 1.0 - square_sum
-                if w_squared < 0:
-                    print(f"Warning: Invalid quaternion (sum of squares > 1): {square_sum:.6f}")
-                    w = 0.0
-                else:
-                    # Calculate w component: In a proper quaternion, x² + y² + z² + w² = 1
-                    # So w = sqrt(1 - (x² + y² + z²))
-                    w = math.sqrt(w_squared)
-
-                # The LSM6DSV16X "Game Rotation Vector" outputs quaternion in the order (x,y,z)
-                # with w calculated as above. For consistency with typical quaternion notation,
-                # print in the order (w,x,y,z).
-                print(f"Quaternion: [{w:.4f}, {x:.4f}, {y:.4f}, {z:.4f}]")
-                print("")
-
-            # Print the absolute position
-            print(f"Absolute Position (Aux1 SPI): {abs_pos:.4f} revolutions")
-            print("")
-
-            # Wait before the next reading
-            await asyncio.sleep(0.1)
-
-    except KeyboardInterrupt:
-        print("\nExiting...")
 
 if __name__ == '__main__':
-    asyncio.run(main()) 
+    asyncio.run(main())

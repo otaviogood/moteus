@@ -391,8 +391,8 @@ What I2C device to expect.
 * 0 - disabled
 * 1 - AS5048
 * 2 - AS5600
-* 3 - LSM6DSV16X gyroscope quaternion orientation
-* 4 - LSM6DSV16XAccel accelerometer-only mode
+* 3 - LSM6DSV16X IMU, orientation fused on the board (reported in
+  registers 0x06d-0x06f; accelerometer calibration in `imu_cal`)
 
 ## `aux[12].i2c.devices.X.address`
 

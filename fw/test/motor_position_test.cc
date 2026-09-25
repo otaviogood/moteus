@@ -800,6 +800,35 @@ BOOST_AUTO_TEST_CASE(MotorPositionInfrequentUpdates) {
   BOOST_TEST(ctx.dut.status().sources[0].time_since_update == 0.0f);
 }
 
+BOOST_AUTO_TEST_CASE(MotorPositionPllWithoutMotor) {
+  // A sensor-only board (no motor, poles 0) reports
+  // kMotorNotConfigured, but its encoder PLL must still run.
+  Context ctx;
+  ctx.dut.motor()->poles = 0;
+  ctx.dut.config()->sources[0].pll_filter_hz = 248.0f;
+  ctx.pcf.persistent_config.Load();
+
+  ctx.aux1_status.spi.active = true;
+  ctx.aux1_status.spi.value = 4096;
+  ctx.aux1_status.spi.nonce = 1;
+  ctx.dut.ISR_Update();
+  BOOST_TEST(ctx.dut.status().error ==
+             MotorPosition::Status::kMotorNotConfigured);
+
+  // 1 count per 10 cycles = 1 count/ms = 1000 counts/s.
+  for (int i = 0; i < 2000; i++) {
+    if (i % 10 == 0) {
+      ctx.aux1_status.spi.value++;
+      ctx.aux1_status.spi.nonce++;
+    }
+    ctx.dut.ISR_Update();
+  }
+  const auto& source = ctx.dut.status().sources[0];
+  BOOST_TEST(std::abs(source.velocity - 1000.0f) < 20.0f);
+  BOOST_TEST(std::abs(source.filtered_value -
+                      static_cast<float>(ctx.aux1_status.spi.value)) < 2.0f);
+}
+
 BOOST_AUTO_TEST_CASE(WrapBalancedCpr) {
   BOOST_TEST(MotorPosition::WrapBalancedCpr(40.0f, 100.0f) == 40.0f);
   BOOST_TEST(MotorPosition::WrapBalancedCpr(-40.0f, 100.0f) == -40.0f);

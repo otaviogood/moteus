@@ -91,7 +91,10 @@ mbed_repository(
         # isrs, persistent storage, and the bootloader.
 
         "MBED_APP_START": "0x8010000",
-        "MBED_APP_SIZE":  "0x0070000",
+        # 0x08010000-0x0807f000: the last two pages hold the persistent
+        # config (fw/stm32g4_flash.h); an image that does not fit must fail
+        # to link rather than overwrite them when flashed.
+        "MBED_APP_SIZE":  "0x006f000",
 
         "MBED_US_TIMER_TIM": "TIM15",
         "MBED_US_TIMER_TIM_USCORE": "TIM15_",

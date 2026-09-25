@@ -15,6 +15,7 @@
 #include "fw/drv8323.h"
 
 #include <functional>
+#include <optional>
 
 #include "mbed.h"
 #include "pinmap.h"
@@ -24,6 +25,7 @@
 #include "fw/ccm.h"
 #include "fw/moteus_hw.h"
 #include "fw/stm32_bitbang_spi.h"
+#include "fw/stm32_spi.h"
 
 namespace micro = mjlib::micro;
 
@@ -31,6 +33,61 @@ namespace moteus {
 
 namespace {
 constexpr int kPollRate = 10;
+
+/// The gate driver's SPI bus.  moteus r4.x (family 0) wires it to
+/// SPI1's pins, so the peripheral shifts the bits and a transfer can
+/// run while the main loop does other work.  The other families' pins
+/// have no SPI peripheral; their bit-banged transfer completes inside
+/// start_write().
+class DriverSpi {
+ public:
+  DriverSpi(MillisecondTimer* timer, const Drv8323::Options& options) {
+    // I observed 2MHz being unreliable with the built-in pullup on
+    // MISO, but 1MHz seemed OK.  Thus, lets just do a bit lower for
+    // safety.
+    //
+    // Silk 4.1 and below lacked a pullup resistor on MISO.  Newer
+    // versions have a pullup resistor and can go faster.
+    const int frequency = (g_measured_hw_family == 0 &&
+                           g_measured_hw_rev <= 3) ? 500000 : 1000000;
+    if (g_measured_hw_family == 0) {
+      Stm32Spi::Options out;
+      out.mosi = options.mosi;
+      out.miso = options.miso;
+      out.sck = options.sck;
+      out.cs = options.cs;
+      // From the 85 MHz APB2 clock: 664 kHz (1 MHz requested) or
+      // 332 kHz (500 kHz requested).
+      out.frequency = frequency;
+      hw_.emplace(out);
+    } else {
+      Stm32BitbangSpi::Options out;
+      out.mosi = options.mosi;
+      out.miso = options.miso;
+      out.sck = options.sck;
+      out.cs = options.cs;
+      out.frequency = frequency;
+      bitbang_.emplace(timer, out);
+    }
+  }
+
+  void start_write(uint16_t value) {
+    if (hw_) {
+      hw_->start_write(value);
+    } else {
+      bitbang_result_ = bitbang_->write(value);
+    }
+  }
+
+  uint16_t finish_write() {
+    return hw_ ? hw_->finish_write() : bitbang_result_;
+  }
+
+ private:
+  std::optional<Stm32Spi> hw_;
+  std::optional<Stm32BitbangSpi> bitbang_;
+  uint16_t bitbang_result_ = 0;
+};
 }
 
 class Drv8323::Impl {
@@ -41,26 +98,7 @@ class Drv8323::Impl {
        const Options& options,
        Stm32DigitalOutput* hiz)
       : timer_(timer),
-        spi_(
-            timer,
-            [&]() {
-              Stm32BitbangSpi::Options out;
-              out.mosi = options.mosi;
-              out.miso = options.miso;
-              out.sck = options.sck;
-              out.cs = options.cs;
-              // I observed 2MHz being unreliable with the built-in
-              // pullup on MISO, but 1MHz seemed OK.  Thus, lets just do
-              // a bit lower for safety.
-
-              // Silk 4.1 and below lacked a pullup resistor on MISO.
-              // Newer versions have a pullup resistor and can go
-              // faster.
-              out.frequency = (g_measured_hw_family == 0 &&
-                               g_measured_hw_rev <= 3) ? 500000 : 1000000;
-
-              return out;
-            }()),
+        spi_(timer, options),
         enable_(options.enable, 0),
         hiz_(hiz),
         fault_(options.fault, PullUp) {
@@ -124,19 +162,68 @@ class Drv8323::Impl {
     return enable_state_;
   }
 
-  uint16_t Read(int reg) {
-    const uint16_t result = spi_.write(0x8000 | (reg << 11)) & 0x7ff;
+  /// A blocking transfer, for configuration and calibration.  An
+  /// in-flight status read is completed and dropped first.
+  uint16_t Transfer(uint16_t value) {
+    if (status_step_ == kReg0InFlight || status_step_ == kReg1InFlight) {
+      spi_.finish_write();
+      timer_->wait_us(1);
+    }
+    status_step_ = kStatusIdle;
+    spi_.start_write(value);
+    const uint16_t result = spi_.finish_write();
+    // nSCS must stay high for 400 ns between words.
     timer_->wait_us(1);
     return result;
   }
 
+  uint16_t Read(int reg) {
+    return Transfer(ReadCommand(reg)) & 0x7ff;
+  }
+
   void Write(int reg, uint16_t value) {
-    spi_.write((reg << 11) | (value & 0x7ff));
-    timer_->wait_us(1);
+    Transfer((reg << 11) | (value & 0x7ff));
+  }
+
+  static uint16_t ReadCommand(int reg) {
+    return 0x8000 | (reg << 11);
   }
 
   void PollMillisecond() {
     loop_count_++;
+
+    // The status registers are read over the following milliseconds,
+    // one step each: each transfer runs in the SPI peripheral between
+    // two calls, so the main loop never waits on the bus, and nSCS is
+    // high for a whole millisecond between the words (400 ns needed).
+    switch (status_step_) {
+      case kStatusIdle: {
+        break;
+      }
+      case kReg0InFlight: {
+        status_words_[0] = spi_.finish_write() & 0x7ff;
+        status_step_ = kReg1Next;
+        return;
+      }
+      case kReg1Next: {
+        if (enable_state_ != kEnabled) {
+          status_step_ = kStatusIdle;
+          return;
+        }
+        spi_.start_write(ReadCommand(1));
+        status_step_ = kReg1InFlight;
+        return;
+      }
+      case kReg1InFlight: {
+        status_words_[1] = spi_.finish_write() & 0x7ff;
+        status_step_ = kStatusIdle;
+        // Disabled mid-read (the ISR's hard stop): the words are not
+        // valid.
+        if (enable_state_ == kEnabled) { PublishStatus(); }
+        return;
+      }
+    }
+
     if (loop_count_ < kPollRate) { return; }
 
     loop_count_ = 0;
@@ -152,10 +239,13 @@ class Drv8323::Impl {
       return;
     }
 
-    const uint16_t status[2] = {
-      Read(0),
-      Read(1),
-    };
+    spi_.start_write(ReadCommand(0));
+    status_step_ = kReg0InFlight;
+  }
+
+  void PublishStatus() {
+    auto& s = status_;
+    const uint16_t* const status = status_words_;
 
     const auto bit = [&](int reg, int b) {
       return (status[reg] & (1 << b)) != 0;
@@ -246,14 +336,14 @@ class Drv8323::Impl {
     //
     // MJ_ASSERT((old_reg6 & 0x1c) == 0);
 
-    spi_.write((6 << 11) | (old_reg6 | 0x1c));
+    Write(6, old_reg6 | 0x1c);
   }
 
   void StopCalibrate() {
     const uint16_t old_reg6 = Read(6);
 
     // Now unset the cal bits.
-    spi_.write((6 << 11) | (old_reg6 & ~0x1c));
+    Write(6, old_reg6 & ~0x1c);
   }
 
   bool FinishCalibrate() {
@@ -420,12 +510,20 @@ class Drv8323::Impl {
   Status status_;
   Config config_;
 
-  Stm32BitbangSpi spi_;
+  DriverSpi spi_;
   Stm32DigitalOutput enable_;
   Stm32DigitalOutput* const hiz_;
   DigitalIn fault_;
 
   uint16_t loop_count_ = 0;
+  enum StatusStep : uint8_t {
+    kStatusIdle,
+    kReg0InFlight,
+    kReg1Next,
+    kReg1InFlight,
+  };
+  StatusStep status_step_ = kStatusIdle;
+  uint16_t status_words_[2] = {};
   uint32_t enable_start_us_ = 0;
   EnableResult enable_state_ = kDisabled;
 

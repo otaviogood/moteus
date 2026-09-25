@@ -33,6 +33,7 @@
 #include "fw/millisecond_timer.h"
 #include "fw/moteus_controller.h"
 #include "fw/moteus_hw.h"
+#include "fw/scope_markers.h"
 #include "fw/system_info.h"
 #include "fw/uuid.h"
 
@@ -228,6 +229,10 @@ int main(void) {
       return options;
     }());
   FDCanMicroServer fdcan_micro_server(&fdcan);
+  if (g_otavio_flags & 1) {
+    // A sensor board: broadcast requests get only its encoder and IMU.
+    fdcan_micro_server.SetBroadcastReads(kSensorBoardBroadcastReads);
+  }
 
   MultiTransportDatagramServer multi_transport(&fdcan_micro_server);
 
@@ -267,6 +272,10 @@ int main(void) {
       &timer,
       &firmware_info,
       &uuid);
+
+  // The robot's fixed-layout telemetry reply (fw/telemetry_block.h).
+  fdcan_micro_server.SetTelemetryBlock(moteus_controller.multiplex_server(),
+                                       (g_otavio_flags & 1) != 0);
 
   BoardDebug board_debug(
       &pool, &command_manager, &telemetry_manager, &multiplex_protocol,
@@ -342,6 +351,8 @@ int main(void) {
   persistent_config.Load();
 
   moteus_controller.Start();
+  // After the config load: the aux ports have configured their pins.
+  scope::Init();
   command_manager.AsyncStart();
   multiplex_protocol.Start(moteus_controller.multiplex_server());
 

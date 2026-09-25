@@ -453,6 +453,11 @@ class MultiplexParser {
   static constexpr int8_t kTheta = 9;
   static constexpr int8_t kPower = 10;
   static constexpr int8_t kAcceleration = 11;
+  // Fork-specific: the IMU fusion gyro rate (rad/s), and register words
+  // that must come back verbatim (the quat48 quaternion words, where
+  // 0x8000 is a valid word, not NaN).
+  static constexpr int8_t kGyroRate = 12;
+  static constexpr int8_t kRawInt = 13;
 
   double ReadConcrete(Resolution res, int8_t concrete_type) {
 #ifndef ARDUINO
@@ -472,7 +477,20 @@ class MultiplexParser {
       1.0 / 127.0 * M_PI, 1.0 / 32767.0 * M_PI, 1.0 / 2147483647.0 * M_PI, // kTheta
       10.0, 0.05, 0.0001,      // kPower
       0.05, 0.001, 0.00001,    // kAcceleration
+      0.1, 0.001, 0.000001,    // kGyroRate
+      1.0, 1.0, 1.0,           // kRawInt
     };
+
+    if (concrete_type == kRawInt) {
+      switch (res) {
+        case Resolution::kInt8: { return Read<int8_t>(); }
+        case Resolution::kInt16: { return Read<int16_t>(); }
+        case Resolution::kInt32: { return Read<int32_t>(); }
+        case Resolution::kFloat: { return Read<float>(); }
+        default: { break; }
+      }
+      abort();
+    }
 
 #ifndef ARDUINO
     const double int8_scale = kMappingValues[concrete_type * 3 + 0];

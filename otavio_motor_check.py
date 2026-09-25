@@ -2,7 +2,8 @@
 
 """
 This program performs health checks on a moteus controller:
-- Reads quaternion values and verifies they are non-zero
+- Reads the Aux2 IMU orientation and verifies it is valid (not the
+  "no data" sentinel)
 - Reads the encoder value and verifies it's non-zero
 - Checks the FET temperature, ensures it's between 20.0 and 40.0
 - Checks the motor temperature, ensures it's between 20.0 and 40.0
@@ -11,34 +12,21 @@ This program performs health checks on a moteus controller:
 import asyncio
 import math
 import moteus
-import struct
 
 # Import the resolution types from the multiplex module
 from moteus.multiplex import INT16, F32
 
-# Helper function to convert the 16-bit values into float16 format
-def float16_to_float32(value):
-    # Extract sign, exponent, and mantissa from the 16-bit value
-    sign = (value & 0x8000) >> 15
-    exponent = (value & 0x7C00) >> 10
-    mantissa = value & 0x03FF
-
-    # Handle special cases
-    if exponent == 0:
-        if mantissa == 0:
-            return -0.0 if sign else 0.0
-        else:
-            # Denormalized number
-            return (-1.0 if sign else 1.0) * (mantissa / 1024.0) * (2.0 ** -14)
-    elif exponent == 31:
-        if mantissa == 0:
-            return float('-inf') if sign else float('inf')
-        else:
-            return float('nan')
-
-    # Normalized number
-    result = (-1.0 if sign else 1.0) * (1.0 + mantissa / 1024.0) * (2.0 ** (exponent - 15))
-    return result
+def decode_quat48(w0, w1, w2):
+    """Registers 0x06d-0x06f -> (w, x, y, z), or None for the "no data"
+    sentinel (docs/protocol/registers.md)."""
+    v = ((w0 & 0xffff) | ((w1 & 0xffff) << 16) | ((w2 & 0xffff) << 32)) & ((1 << 47) - 1)
+    if v == 0:
+        return None
+    omitted = (v >> 45) & 0x3
+    others = [(((v >> (15 * j)) & 0x7fff) / 32767 * 2.0 - 1.0) / math.sqrt(2.0)
+              for j in range(3)]
+    largest = math.sqrt(max(0.0, 1.0 - sum(c * c for c in others)))
+    return others[:omitted] + [largest] + others[omitted:]
 
 async def main():
     # Parse command line arguments to get target
@@ -71,34 +59,26 @@ async def main():
 
     print(f"Performing health check on moteus controller (ID: {args.target})...")
 
-    # Query the controller for the registers
-    result = await controller.query()
+    # Query the controller for the registers.  Right after a boot the IMU
+    # sends the "no data" sentinel for up to ~1 s, so retry briefly.
+    for _ in range(20):
+        result = await controller.query()
+        q = decode_quat48(
+            result.values.get(moteus.Register.AUX2_QUATERNIONX, 0),
+            result.values.get(moteus.Register.AUX2_QUATERNIONY, 0),
+            result.values.get(moteus.Register.AUX2_QUATERNIONZ, 0))
+        if q is not None:
+            break
+        await asyncio.sleep(0.1)
 
     all_passed = True
 
-    # Check quaternion values
-    quat_x = result.values.get(moteus.Register.AUX2_QUATERNIONX, 0)
-    quat_y = result.values.get(moteus.Register.AUX2_QUATERNIONY, 0)
-    quat_z = result.values.get(moteus.Register.AUX2_QUATERNIONZ, 0)
-
-    # Convert from int16 to float16
-    x = float16_to_float32(quat_x)
-    y = float16_to_float32(quat_y)
-    z = float16_to_float32(quat_z)
-
-    # Calculate the magnitude of the quaternion components
-    quat_magnitude = math.sqrt(x*x + y*y + z*z)
-
-    print(f"Quaternion X: {x:.6f}")
-    print(f"Quaternion Y: {y:.6f}")
-    print(f"Quaternion Z: {z:.6f}")
-    print(f"Quaternion magnitude: {quat_magnitude:.6f}")
-
-    if quat_magnitude == 0:
-        print("ERROR: Quaternion values are all zero!")
+    if q is None:
+        print("ERROR: IMU orientation not available (no data for 2 s)!")
         all_passed = False
     else:
-        print("PASS: Quaternion values are non-zero.")
+        print("Orientation wxyz: [{:+.4f}, {:+.4f}, {:+.4f}, {:+.4f}]".format(*q))
+        print("PASS: IMU orientation is valid.")
 
     # Check encoder value
     encoder_pos = result.values.get(0x050, float('nan'))
@@ -150,4 +130,4 @@ async def main():
         print("FAILURE: One or more health checks failed!")
 
 if __name__ == '__main__':
-    asyncio.run(main()) 
+    asyncio.run(main())

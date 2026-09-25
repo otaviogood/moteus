@@ -122,6 +122,13 @@ class FDCan {
 
   void RecoverBusOff();
 
+  /// TIM3 value captured by the peripheral at the SOF of the frame most
+  /// recently returned by Poll() (docs §5.4).
+  uint16_t last_rx_timestamp() const { return last_rx_timestamp_; }
+
+  /// Frames still queued in RX FIFO 0.
+  uint32_t rx_fifo0_fill_level() const;
+
   FDCAN_ProtocolStatusTypeDef status();
 
   struct Config {
@@ -144,6 +151,9 @@ class FDCan {
   FDCAN_HandleTypeDef hfdcan1_;
   FDCAN_ProtocolStatusTypeDef status_result_ = {};
   uint32_t last_tx_request_ = 0;
+  uint16_t last_rx_timestamp_ = 0;
+  gpio_t tx_led_ = {};
+  bool tx_led_valid_ = false;
 };
 
 }

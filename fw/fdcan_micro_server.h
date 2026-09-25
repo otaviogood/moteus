@@ -15,8 +15,11 @@
 #pragma once
 
 #include "mjlib/multiplex/micro_datagram_server.h"
+#include "mjlib/multiplex/micro_server.h"
 
+#include "fw/broadcast_reply_filter.h"
 #include "fw/fdcan.h"
+#include "fw/telemetry_block.h"
 
 namespace moteus {
 
@@ -30,6 +33,22 @@ class FDCanMicroServer : public mjlib::multiplex::MicroDatagramServer {
 
   void SetPrefix(uint32_t can_prefix) {
     can_prefix_ = can_prefix;
+  }
+
+  /// Answer only the broadcast (destination 0x7F) reads that touch
+  /// these register ranges (fw/broadcast_reply_filter.h).
+  template <size_t N>
+  void SetBroadcastReads(const RegisterRange (&ranges)[N]) {
+    broadcast_reads_begin_ = ranges;
+    broadcast_reads_end_ = ranges + N;
+  }
+
+  /// Answer telemetry block requests (fw/telemetry_block.h) with the
+  /// values read through server; sensor selects the sensor-board layout.
+  void SetTelemetryBlock(mjlib::multiplex::MicroServer::Server* server,
+                         bool sensor) {
+    block_server_ = server;
+    block_sensor_ = sensor;
   }
 
   void AsyncRead(Header* header,
@@ -49,7 +68,26 @@ class FDCanMicroServer : public mjlib::multiplex::MicroDatagramServer {
     // larger payload would overrun buf_ and silently get sent as a
     // zero-length frame (RoundUpDlc returns 0 above 64).
     MJ_ASSERT(data.size() <= sizeof(buf_));
-    const auto actual_dlc = RoundUpDlc(data.size());
+    std::string_view payload = data;
+    if (block_pending_) {
+      // The block goes first, then as much of the normal reply as fits.
+      // This runs inside the request's frame (mjlib writes the response
+      // before it reads the next frame), so every value is this frame's.
+      block_pending_ = false;
+      auto* out = reinterpret_cast<uint8_t*>(block_buf_);
+      const size_t n = WriteTelemetryBlock(
+          block_sensor_,
+          [&](uint16_t reg, size_t type) {
+            return block_server_->Read(reg, type);
+          },
+          out);
+      const size_t keep = FitReplyItems(
+          reinterpret_cast<const uint8_t*>(data.data()), data.size(),
+          sizeof(block_buf_) - n);
+      std::memcpy(out + n, data.data(), keep);
+      payload = std::string_view(block_buf_, n + keep);
+    }
+    const auto actual_dlc = RoundUpDlc(payload.size());
     const uint32_t id =
         ((header.source & 0xff) << 8) |
         (header.destination & 0xff) |
@@ -60,14 +98,14 @@ class FDCanMicroServer : public mjlib::multiplex::MicroDatagramServer {
         (query_header.flags & kBrsFlag) ?
         FDCan::Override::kRequire : FDCan::Override::kDisable;
     send_options.fdcan_frame =
-        ((query_header.flags & kFdcanFlag) == 0 && data.size() <= 8) ?
+        ((query_header.flags & kFdcanFlag) == 0 && payload.size() <= 8) ?
         FDCan::Override::kDisable : FDCan::Override::kRequire;
 
-    if (actual_dlc == data.size()) {
-      fdcan_->Send(id, data, send_options);
+    if (actual_dlc == payload.size()) {
+      fdcan_->Send(id, payload, send_options);
     } else {
-      std::memcpy(buf_, data.data(), data.size());
-      for (size_t i = data.size(); i < actual_dlc; i++) {
+      std::memcpy(buf_, payload.data(), payload.size());
+      for (size_t i = payload.size(); i < actual_dlc; i++) {
         buf_[i] = 0x50;
       }
       fdcan_->Send(id, std::string_view(buf_, actual_dlc), send_options);
@@ -104,21 +142,37 @@ class FDCanMicroServer : public mjlib::multiplex::MicroDatagramServer {
     // wasn't working.
 
     current_read_header_->destination = fdcan_header_.Identifier & 0xff;
-    if (current_read_header_->destination == 0) {
-      // 0 on the CAN bus corresponds to broadcast.  The multiplex layer
-      // uses 0x7f, so translate here so the higher layers see the expected
-      // value and will generate a response.
-      current_read_header_->destination = 0x7f;
-    }
-     current_read_header_->source = (fdcan_header_.Identifier >> 8) & 0xff;
+    current_read_header_->source = (fdcan_header_.Identifier >> 8) & 0xff;
     current_read_header_->size = FDCan::ParseDlc(fdcan_header_.DataLength);
     current_read_header_->flags = 0
         | ((fdcan_header_.BitRateSwitch == FDCAN_BRS_ON) ? kBrsFlag : 0)
         | ((fdcan_header_.FDFormat == FDCAN_FD_CAN) ? kFdcanFlag : 0)
         ;
 
+    size_t bytes = current_read_header_->size;
+    auto* frame = reinterpret_cast<uint8_t*>(current_read_data_.data());
+    // Set for every delivered frame, so a block request that got no
+    // response (no reply flag) cannot leak into the next frame's reply.
+    block_pending_ =
+        block_server_ && StripTelemetryBlockRequest(frame, &bytes);
+    if (broadcast_reads_begin_ &&
+        current_read_header_->destination == kBroadcastId) {
+      bytes = FilterBroadcastReads(
+          broadcast_reads_begin_, broadcast_reads_end_, frame, bytes);
+      // Nothing this board answers: no reply at all, and the read
+      // stays armed for the next frame.
+      if (bytes == 0 && !block_pending_) { return; }
+    }
+    if (bytes == 0) {
+      // A request that was only the block marker: hand mjlib one no-op
+      // byte.  A 0-byte read means "error" to the multi-transport layer,
+      // which then has mjlib re-process the previous frame.
+      frame[0] = 0x50;
+      bytes = 1;
+    }
+    current_read_header_->size = bytes;
+
     auto copy = current_read_callback_;
-    auto bytes = current_read_header_->size;
 
     current_read_callback_ = {};
     current_read_header_ = {};
@@ -152,8 +206,19 @@ class FDCanMicroServer : public mjlib::multiplex::MicroDatagramServer {
 
   uint32_t can_reset_count() const { return can_reset_count_; }
 
+  uint16_t last_rx_timestamp() const { return fdcan_->last_rx_timestamp(); }
+  uint32_t rx_fifo0_fill_level() const { return fdcan_->rx_fifo0_fill_level(); }
+
  private:
+  static constexpr uint8_t kBroadcastId = 0x7f;
+
   FDCan* const fdcan_;
+  const RegisterRange* broadcast_reads_begin_ = nullptr;
+  const RegisterRange* broadcast_reads_end_ = nullptr;
+  mjlib::multiplex::MicroServer::Server* block_server_ = nullptr;
+  bool block_sensor_ = false;
+  bool block_pending_ = false;
+  char block_buf_[64] = {};
 
   mjlib::micro::SizeCallback current_read_callback_;
   Header* current_read_header_ = nullptr;

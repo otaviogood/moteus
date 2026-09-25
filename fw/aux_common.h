@@ -371,8 +371,9 @@ struct I2C {
       kNone,
       kAs5048,
       kAs5600,
+      // On-board orientation fusion from raw gyro + accel FIFO words
+      // (docs/imu_orientation_redesign.md).
       kLsm6dsv16x,
-      kLsm6dsv16xAccel,
       kNumTypes,
     };
     Type type = kNone;
@@ -414,10 +415,6 @@ struct I2C {
     uint8_t ams_diag = 0;
     uint16_t ams_mag = 0;
 
-    uint16_t quat_x = 0;
-    uint16_t quat_y = 0;
-    uint16_t quat_z = 0;
-
     template <typename Archive>
     void Serialize(Archive* a) {
       a->Visit(MJ_NVP(active));
@@ -428,10 +425,6 @@ struct I2C {
       a->Visit(MJ_NVP(ams_agc));
       a->Visit(MJ_NVP(ams_diag));
       a->Visit(MJ_NVP(ams_mag));
-
-      a->Visit(MJ_NVP(quat_x));
-      a->Visit(MJ_NVP(quat_y));
-      a->Visit(MJ_NVP(quat_z));
     }
   };
 
@@ -540,6 +533,78 @@ enum class AuxError {
   kBisscPinError,
 
   kLength,
+};
+
+/// Telemetry for the on-board IMU fusion (docs §5.5).  Written by the
+/// main loop except init_state and i2c_errors (ISR).  Published as its
+/// own record ("aux1_fusion" / "aux2_fusion"): appended to AuxStatus it
+/// pushed the aux schema past the 2 KB telemetry output buffer, and
+/// mjlib asserts (halting the board) on overflow.
+struct ImuFusionStatus {
+  uint8_t init_state = 0;
+  bool initialized = false;
+  bool converged = false;
+  bool timing_degraded = false;
+  uint8_t toggle = 0;
+  uint8_t storage_owner = 0;       // 0 none, 1 aux1, 2 aux2
+  uint8_t last_reinit_reason = 0;
+  int8_t freq_fine = 0;
+  std::array<float, 4> q = {{1.0f, 0.0f, 0.0f, 0.0f}};
+  std::array<float, 3> bias = {{}};
+  std::array<float, 3> omega = {{}};
+  float odr_actual_hz = 0.0f;
+  uint32_t gyro_words = 0;
+  uint32_t accel_words = 0;
+  bool stationary = false;
+  uint32_t stationary_words = 0;
+  std::array<float, 3> accel_raw_g = {{}};
+  uint16_t gyro_gaps = 0;
+  uint32_t gap_slots = 0;
+  uint32_t mailbox_overflow = 0;
+  uint16_t mailbox_max_depth = 0;
+  uint16_t fifo_overruns = 0;
+  uint16_t resyncs = 0;
+  uint16_t reinits = 0;
+  uint16_t i2c_errors = 0;
+  uint16_t stall_passes = 0;
+  uint32_t arrival_unknown = 0;
+  uint32_t sentinel_replies = 0;
+  uint32_t valid_replies = 0;
+  uint32_t phase_unc_us = 0;
+
+  template <typename Archive>
+  void Serialize(Archive* a) {
+    a->Visit(MJ_NVP(init_state));
+    a->Visit(MJ_NVP(initialized));
+    a->Visit(MJ_NVP(converged));
+    a->Visit(MJ_NVP(timing_degraded));
+    a->Visit(MJ_NVP(toggle));
+    a->Visit(MJ_NVP(storage_owner));
+    a->Visit(MJ_NVP(last_reinit_reason));
+    a->Visit(MJ_NVP(freq_fine));
+    a->Visit(MJ_NVP(q));
+    a->Visit(MJ_NVP(bias));
+    a->Visit(MJ_NVP(omega));
+    a->Visit(MJ_NVP(odr_actual_hz));
+    a->Visit(MJ_NVP(gyro_words));
+    a->Visit(MJ_NVP(accel_words));
+    a->Visit(MJ_NVP(stationary));
+    a->Visit(MJ_NVP(stationary_words));
+    a->Visit(MJ_NVP(accel_raw_g));
+    a->Visit(MJ_NVP(gyro_gaps));
+    a->Visit(MJ_NVP(gap_slots));
+    a->Visit(MJ_NVP(mailbox_overflow));
+    a->Visit(MJ_NVP(mailbox_max_depth));
+    a->Visit(MJ_NVP(fifo_overruns));
+    a->Visit(MJ_NVP(resyncs));
+    a->Visit(MJ_NVP(reinits));
+    a->Visit(MJ_NVP(i2c_errors));
+    a->Visit(MJ_NVP(stall_passes));
+    a->Visit(MJ_NVP(arrival_unknown));
+    a->Visit(MJ_NVP(sentinel_replies));
+    a->Visit(MJ_NVP(valid_replies));
+    a->Visit(MJ_NVP(phase_unc_us));
+  }
 };
 
 struct AuxStatus {
@@ -658,7 +723,6 @@ struct IsEnum<moteus::aux::I2C::DeviceConfig::Type> {
         { T::kAs5048, "as5048" },
         { T::kAs5600, "as5600" },
         { T::kLsm6dsv16x, "lsm6dsv16x" },
-        { T::kLsm6dsv16xAccel, "lsm6dsv16xAccel" },
       }};
   }
 };

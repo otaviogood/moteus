@@ -691,6 +691,28 @@ registers are associated with pins 1-5, regardless of whether they are
 configured as an analog input.  Each value is scaled as a PWM from 0
 to 1.
 
+### 0x065/0x067 - Aux2 Gyro Rate
+
+Mode: Read only
+
+The bias-corrected angular rate from the aux2 IMU fusion
+(`aux2.i2c.devices.0.type` = 3, `lsm6dsv16x`), about the X, Y and Z
+axes of the quaternion's body frame (0x06d-0x06f), in rad/s.  Read all
+three in one subframe (`0x17 0x65`).  The value is the newest gyro
+sample (960 Hz), so at most ~1 ms older than the request plus the
+chip's own filter delay.  NaN until the fusion has converged, when the
+newest sample is more than 8 ms older than the request, and when no
+IMU is configured.  Reading these registers does not advance the
+quaternion's freshness toggle; use the quaternion read in the same
+request for that.
+
+| Type  | Unit      |
+|-------|-----------|
+| int8  | 0.1 rad/s |
+| int16 | 0.001 rad/s (range +-32.767 rad/s, ~1877 dps) |
+| int32 | 1e-6 rad/s |
+| float | 1 rad/s   |
+
 ### 0x068/0x06c - Aux2 Analog Inputs
 
 Mode: Read only
@@ -704,21 +726,57 @@ to 1.
 
 Mode: Read only
 
-The X component of the quaternion from the LSM6DSV16X IMU on Aux2. This value is stored as an INT16 that represents a float16 (IEEE 754 half-precision) format. When used with a proper IMU configuration, this provides orientation data of the controller. If the config has aux[1,2]->i2c->devices->0->type set to lsm6dsv16xAccel, the these 3 values will be int16 accelerometer data.
+First of three INT16 registers carrying the orientation of the LSM6DSV16X
+IMU on Aux2 (`aux2.i2c.devices.0.type` = 3, `lsm6dsv16x`, on-board
+fusion).  Read all three in one subframe (`0x17 0x6d`) so they come from
+one sample.
+
+The three registers form a 48-bit little-endian "smallest three"
+quaternion.  Bits 0-14, 15-29 and 30-44 are the three non-omitted
+components as unsigned 15-bit codes over [-1/sqrt2, +1/sqrt2]
+(`x = (code / 32767 * 2 - 1) / sqrt2`), bits 45-46 the index (0 = w,
+1 = x, 2 = y, 3 = z) of the omitted component, which is the largest in
+magnitude and always positive (`q_i = sqrt(1 - sum of the other three
+squared)`), and bit 47 is a freshness toggle that flips on every reply
+carrying a newer IMU sample.  Low 47 bits all zero is the "no data"
+sentinel, also sent while the filter warms up and when no IMU is
+configured.  Worst-case error 0.0086 degrees.  The orientation is
+evaluated at the instant the request frame arrived.  See
+`docs/imu_orientation_redesign.md`.
 
 ### 0x06e - Aux2 Quaternion Y
 
 Mode: Read only
 
-The Y component of the quaternion from the LSM6DSV16X IMU on Aux2. This value is stored as an INT16 that represents a float16 (IEEE 754 half-precision) format. See 0x06d about accelerometer data.
+Second register of the triple; see 0x06d.
 
 ### 0x06f - Aux2 Quaternion Z
 
 Mode: Read only
 
-The Z component of the quaternion from the LSM6DSV16X IMU on Aux2. This value is stored as an INT16 that represents a float16 (IEEE 754 half-precision) format. See 0x06d about accelerometer data.
+Third register of the triple; see 0x06d.  Its bit 15 is the freshness
+toggle (bit 47 of the 48-bit value).
 
-Note: To calculate the W component of the quaternion, use the formula: W = sqrt(1 - (X² + Y² + Z²)). The quaternion represents the rotation of the controller in 3D space, with components in the order [W, X, Y, Z].
+### Telemetry block (fork-specific)
+
+Not a register: a request that starts with the two bytes `0x60 0x01`
+(block request, layout version 1) gets a fixed-layout reply in front of
+the normal reply to the rest of the frame (`fw/telemetry_block.h`).  The
+block is one type byte followed by the values of that board's register
+list, little-endian, with no per-register headers.  Each value is exactly
+what a read of that register and type returns: same scaling, same NaN
+code, and the quaternion's freshness toggle and sentinel hold behave as
+for a read of 0x06d-0x06f.
+
+| Type byte | Board | Values (register, type) | Size |
+|---|---|---|---|
+| `0x61` | motor board | 0x06d-0x06f int16, 0x065-0x067 int16, 0x004 int32, 0x007 int16, 0x00a int8, 0x00d-0x00f int8, 0x000 int8 | 24 bytes |
+| `0x62` | sensor board (no gate driver found at boot) | 0x050-0x051 int16, 0x06d-0x06f int16, 0x065-0x067 int16 | 17 bytes |
+
+Any read subframes after the marker are answered as usual, after the
+block, as many whole reply items as fit in 64 bytes (later ones are
+dropped).  Firmware that does not know the version ignores the request.
+The request works broadcast or addressed; the reply ID is the normal one.
 
 ### 0x070 - Millisecond Counter
 

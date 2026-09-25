@@ -20,6 +20,7 @@
 
 #include "mjlib/base/string_span.h"
 
+#include "fw/ccm.h"
 #include "fw/millisecond_timer.h"
 #include "fw/stm32_i2c_timing.h"
 
@@ -98,7 +99,7 @@ class Stm32I2c {
 
   void StartReadMemory(uint8_t slave_address,
                        uint8_t address,
-                       mjlib::base::string_span data) {
+                       mjlib::base::string_span data) MOTEUS_CCM_ATTRIBUTE {
     if (!valid_) { return; }
     if (mode_ != Mode::kIdle ||
         (i2c_->CR2 & I2C_CR2_START) != 0 ||

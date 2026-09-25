@@ -30,6 +30,7 @@
 #include "fw/bldc_servo_position.h"
 #include "fw/foc.h"
 #include "fw/moteus_hw.h"
+#include "fw/scope_markers.h"
 #include "fw/stm32_dma.h"
 #include "fw/stm32g4_adc.h"
 #include "fw/thermistor.h"
@@ -334,6 +335,13 @@ class BldcServo::Impl : public BldcServoControl<BldcServo::Impl> {
   }
 
   void PollMillisecond() {
+    if (++isr_max_ms_count_ >= 1000) {
+      isr_max_ms_count_ = 0;
+      // An ISR between a separate load and clear would lose its peak.
+      status_.isr_max_cycles =
+          isr_max_cycles_acc_.exchange(0, std::memory_order_relaxed);
+    }
+
     volatile auto* mode_volatile = &status_.mode;
     volatile auto* fault_volatile = &status_.fault;
     Mode mode = *mode_volatile;
@@ -779,6 +787,7 @@ class BldcServo::Impl : public BldcServoControl<BldcServo::Impl> {
 #ifdef MOTEUS_PERFORMANCE_MEASURE
     DWT->CYCCNT = 0;
 #endif
+    isr_start_cycles_ = DWT->CYCCNT;
 
     // No matter what mode we are in, always sample our ADC and
     // position sensors.
@@ -797,17 +806,17 @@ class BldcServo::Impl : public BldcServoControl<BldcServo::Impl> {
 
   void ISR_DoTimerLowerPriority() __attribute__((always_inline)) MOTEUS_CCM_ATTRIBUTE {
     SCB->ICSR |= SCB_ICSR_PENDSVCLR_Msk;
+    ISR_Stamp(Status::kPerfLowPriority);
 
     ISR_DoSense();
-#ifdef MOTEUS_PERFORMANCE_MEASURE
-    status_.dwt.sense = DWT->CYCCNT;
-#endif
+    ISR_Stamp(Status::kPerfSense);
 
     // current_data_ is volatile, so read it out now, and operate on
     // the pointer for the rest of the routine.
     CommandData* data = current_data_;
 
     SinCos sin_cos = ISR_CalculateCurrentState(data->synthetic_theta);
+    ISR_Stamp(Status::kPerfCurrentState);
 
     if (config_.fixed_voltage_mode) {
       // Don't pretend we know where we are.
@@ -817,21 +826,10 @@ class BldcServo::Impl : public BldcServoControl<BldcServo::Impl> {
       status_.torque_error_Nm = 0.0f;
     }
 
-#ifdef MOTEUS_PERFORMANCE_MEASURE
-    status_.dwt.curstate = DWT->CYCCNT;
-#endif
-
     ISR_DoControl(sin_cos, data);
-
-#ifdef MOTEUS_PERFORMANCE_MEASURE
-    status_.dwt.control = DWT->CYCCNT;
-#endif
+    ISR_Stamp(Status::kPerfControl);
 
     ISR_MaybeEmitDebug();
-
-#ifdef MOTEUS_PERFORMANCE_MEASURE
-    status_.dwt.done = DWT->CYCCNT;
-#endif
 
     const uint32_t cnt = timer_->CNT;
     status_.final_timer =
@@ -843,6 +841,21 @@ class BldcServo::Impl : public BldcServoControl<BldcServo::Impl> {
 #ifdef MOTEUS_DEBUG_OUT
     debug_out_ = 0;
 #endif
+    scope::Clear(scope::kIsr);
+    ISR_Stamp(Status::kPerfDone);
+    ISR_LatchProfile();
+
+    {
+      // Whole-cycle duration, published as a 1 s max-hold in
+      // servo_stats.isr_max_cycles (docs §7 test 2).
+      const uint32_t cycles = DWT->CYCCNT - isr_start_cycles_;
+      // Only this ISR raises the maximum; the main loop cannot run
+      // between this load and store.  Keep any exchange retries in
+      // the main loop, not in the control interrupt.
+      if (cycles > isr_max_cycles_acc_.load(std::memory_order_relaxed)) {
+        isr_max_cycles_acc_.store(cycles, std::memory_order_relaxed);
+      }
+    }
 
     NVIC_EnableIRQ(pwm_irqn_);
   }
@@ -862,6 +875,9 @@ class BldcServo::Impl : public BldcServoControl<BldcServo::Impl> {
     // wait until now.
     debug_out_ = 1;
 #endif
+    // Same reason as above: after the current ADCs have sampled.
+    scope::Set(scope::kIsr);
+    ISR_Stamp(Status::kPerfAdcSampled);
 
     // We are now out of the most time critical portion of the ISR,
     // although it is still all pretty time critical since it runs at
@@ -886,6 +902,7 @@ class BldcServo::Impl : public BldcServoControl<BldcServo::Impl> {
     // With sampling done, we can kick off our encoder read.
     aux1_port_->ISR_MaybeStartSample();
     aux2_port_->ISR_MaybeStartSample();
+    ISR_Stamp(Status::kPerfAuxStarted);
 
     if (std::isnan(current_data_->timeout_s) ||
         current_data_->timeout_s != 0.0f) {
@@ -897,9 +914,7 @@ class BldcServo::Impl : public BldcServoControl<BldcServo::Impl> {
     // started ADC3 last, so we just wait for it.
     WaitForAdc(ADC3);
 
-#ifdef MOTEUS_PERFORMANCE_MEASURE
-    status_.dwt.adc_done = DWT->CYCCNT;
-#endif
+    ISR_Stamp(Status::kPerfAdcDone);
 
     if (family0_) {
       status_.adc_cur1_raw = ADC3->DR;
@@ -966,25 +981,20 @@ class BldcServo::Impl : public BldcServoControl<BldcServo::Impl> {
     }
     adc5_phase_ = 1 - adc5_phase_;
 
-#ifdef MOTEUS_PERFORMANCE_MEASURE
-    status_.dwt.start_pos_sample = DWT->CYCCNT;
-#endif
+    ISR_Stamp(Status::kPerfAdcRead);
 
     aux1_port_->ISR_MaybeFinishSample();
+    ISR_Stamp(Status::kPerfAux1Done);
     aux2_port_->ISR_MaybeFinishSample();
+    ISR_Stamp(Status::kPerfAux2Done);
     aux_adc_->ISR_StartSample();
 
-#ifdef MOTEUS_PERFORMANCE_MEASURE
-    status_.dwt.done_pos_sample = DWT->CYCCNT;
-#endif
     motor_position_->ISR_Update();
+    ISR_Stamp(Status::kPerfMotorPosition);
 
     velocity_filter_(position_.velocity, &status_.velocity_filt);
 
 
-#ifdef MOTEUS_PERFORMANCE_MEASURE
-    status_.dwt.done_temp_sample = DWT->CYCCNT;
-#endif
 
     {
       status_.fet_temp_C = fet_thermistor_.Calculate(status_.adc_fet_temp_raw);
@@ -1109,7 +1119,12 @@ class BldcServo::Impl : public BldcServoControl<BldcServo::Impl> {
 
   void ISR_MaybeEmitDebug() MOTEUS_CCM_ATTRIBUTE {
     if (config_.emit_debug == 0 || !debug_uart_) { return; }
+    ISR_EmitDebug();
+  }
 
+  // Only runs with servo.emit_debug set, so it stays in flash and
+  // leaves CCM for the code every control cycle runs.
+  __attribute__((noinline)) void ISR_EmitDebug() {
     debug_buf_[0] = 0x5a;
 
     int pos = 1;
@@ -1378,6 +1393,44 @@ class BldcServo::Impl : public BldcServoControl<BldcServo::Impl> {
   RateConfig rate_config_;
 
   int32_t phase_ = 0;
+
+  uint32_t isr_start_cycles_ = 0;
+
+#ifdef MOTEUS_PERFORMANCE_MEASURE
+  uint32_t perf_sum_[Status::kNumPerfPoints] = {};
+  uint32_t perf_count_[Status::kNumPerfPoints] = {};
+  uint32_t perf_max_[Status::kNumPerfPoints] = {};
+  uint32_t perf_cycles_ = 0;
+#endif
+
+  void ISR_Stamp(Status::PerfPoint point) MOTEUS_CCM_ATTRIBUTE {
+#ifdef MOTEUS_PERFORMANCE_MEASURE
+    const uint32_t cycles = DWT->CYCCNT;
+    perf_sum_[point] += cycles;
+    perf_count_[point]++;
+    if (cycles > perf_max_[point]) { perf_max_[point] = cycles; }
+#else
+    (void)point;
+#endif
+  }
+
+  /// Once a second, publish the profile's means and maxima.
+  void ISR_LatchProfile() MOTEUS_CCM_ATTRIBUTE {
+#ifdef MOTEUS_PERFORMANCE_MEASURE
+    if (++perf_cycles_ < static_cast<uint32_t>(rate_config_.int_rate_hz)) {
+      return;
+    }
+    perf_cycles_ = 0;
+    for (int i = 0; i < Status::kNumPerfPoints; i++) {
+      status_.dwt.mean[i] =
+          perf_count_[i] ? perf_sum_[i] / perf_count_[i] : 0;
+      status_.dwt.max[i] = perf_max_[i];
+      perf_sum_[i] = perf_count_[i] = perf_max_[i] = 0;
+    }
+#endif
+  }
+  std::atomic<uint32_t> isr_max_cycles_acc_{0};
+  uint16_t isr_max_ms_count_ = 0;
 
   // Tracks which ADC5 channel is being sampled (alternates each control cycle).
   // 0 = first channel (vsense/tsense/fet_temp depending on board)

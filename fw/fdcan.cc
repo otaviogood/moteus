@@ -93,6 +93,13 @@ FDCan::Rate ApplyRateOverride(FDCan::Rate base, FDCan::Rate overlay) {
 
 FDCan::FDCan(const Options& options)
     : options_(options) {
+  // Sensor boards flash their yellow LED for each send (debug_led2 is
+  // only set on those boards).  The pin is set up once here, so Send()
+  // only writes it.
+  if (g_hw_pins.debug_led2 != NC) {
+    gpio_init_out(&tx_led_, g_hw_pins.debug_led2);
+    tx_led_valid_ = true;
+  }
   Init();
 }
 
@@ -288,6 +295,15 @@ void FDCan::Init() {
     }
   }
 
+  // Stamp every received element with the external timestamp counter
+  // (TIM3 on the STM32G4, RM0440 §44.4.8).  TIM3 is started by the IMU
+  // fusion when configured; until then the stamps are simply unused.
+  // TSCC is a protected register, so this happens before Start.
+  if (HAL_FDCAN_EnableTimestampCounter(&can, FDCAN_TIMESTAMP_EXTERNAL) !=
+      HAL_OK) {
+    mbed_die();
+  }
+
   if (HAL_FDCAN_Start(&can) != HAL_OK) {
     mbed_die();
   }
@@ -319,15 +335,7 @@ void FDCan::Send(uint32_t dest_id,
     HAL_FDCAN_AbortTxRequest(&hfdcan1_, last_tx_request_);
   }
 
-  // LED Toggling - only toggle if the debug_led2 pin is valid
-  bool toggle_led = g_hw_pins.debug_led2 != NC;
-  
-  // Turn on LED before sending (1 = ON)
-  if (toggle_led) {
-    gpio_t led_pin;
-    gpio_init_out(&led_pin, g_hw_pins.debug_led2);
-    gpio_write(&led_pin, 1); // Turn LED ON
-  }
+  if (tx_led_valid_) { gpio_write(&tx_led_, 1); }
 
   FDCAN_TxHeaderTypeDef tx_header;
   tx_header.Identifier = dest_id;
@@ -355,22 +363,12 @@ void FDCan::Send(uint32_t dest_id,
           &hfdcan1_, &tx_header,
           const_cast<uint8_t*>(
               reinterpret_cast<const uint8_t*>(data.data()))) != HAL_OK) {
-    // If we failed to send, still turn off the LED if it was turned on
-    if (toggle_led) {
-      gpio_t led_pin;
-      gpio_init_out(&led_pin, g_hw_pins.debug_led2);
-      gpio_write(&led_pin, 0); // Turn LED OFF
-    }
+    if (tx_led_valid_) { gpio_write(&tx_led_, 0); }
     mbed_die();
   }
   last_tx_request_ = HAL_FDCAN_GetLatestTxFifoQRequestBuffer(&hfdcan1_);
 
-  // Turn off LED after successful send
-  if (toggle_led) {
-    gpio_t led_pin;
-    gpio_init_out(&led_pin, g_hw_pins.debug_led2);
-    gpio_write(&led_pin, 0); // Turn LED OFF
-  }
+  if (tx_led_valid_) { gpio_write(&tx_led_, 0); }
 }
 
 bool FDCan::Poll(FDCAN_RxHeaderTypeDef* header,
@@ -380,8 +378,14 @@ bool FDCan::Poll(FDCAN_RxHeaderTypeDef* header,
           reinterpret_cast<uint8_t*>(data.data())) != HAL_OK) {
     return false;
   }
+  last_rx_timestamp_ = static_cast<uint16_t>(header->RxTimestamp);
 
   return true;
+}
+
+uint32_t FDCan::rx_fifo0_fill_level() const {
+  return (hfdcan1_.Instance->RXF0S & FDCAN_RXF0S_F0FL_Msk) >>
+      FDCAN_RXF0S_F0FL_Pos;
 }
 
 void FDCan::RecoverBusOff() {

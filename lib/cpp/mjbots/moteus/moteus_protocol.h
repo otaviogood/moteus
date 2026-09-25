@@ -189,6 +189,12 @@ enum Register : uint16_t {
   kAux1AnalogIn4 = 0x063,
   kAux1AnalogIn5 = 0x064,
 
+  // Fork-specific: the aux2 IMU fusion's bias-corrected gyro rate, rad/s
+  // about the quaternion's body axes (NaN until converged).
+  kAux2GyroX = 0x065,
+  kAux2GyroY = 0x066,
+  kAux2GyroZ = 0x067,
+
   kAux2AnalogIn1 = 0x068,
   kAux2AnalogIn2 = 0x069,
   kAux2AnalogIn3 = 0x06a,
@@ -219,7 +225,7 @@ enum Register : uint16_t {
   kAux2Pwm2 = 0x07c,
   kAux2Pwm3 = 0x07d,
   kAux2Pwm4 = 0x07e,
-  kAux2Pwm5 = 0x07f,  
+  kAux2Pwm5 = 0x07f,
 
   kModelNumber = 0x100,
   kFirmwareVersion = 0x101,
@@ -725,15 +731,20 @@ struct Query {
       // { R::kAux1AnalogIn4, 1, MP::kPwm, },
       // { R::kAux1AnalogIn5, 1, MP::kPwm, },
 
+      { R::kAux2GyroX, 3, MP::kGyroRate, },
+      // { R::kAux2GyroY, 1, MP::kGyroRate, },
+      // { R::kAux2GyroZ, 1, MP::kGyroRate, },
+
       { R::kAux2AnalogIn1, 5, MP::kPwm, },
       // { R::kAux2AnalogIn2, 1, MP::kPwm, },
       // { R::kAux2AnalogIn3, 1, MP::kPwm, },
       // { R::kAux2AnalogIn4, 1, MP::kPwm, },
       // { R::kAux2AnalogIn5, 1, MP::kPwm, },
 
-      { R::kAux2QuaternionX, 3, MP::kInt, },
-      // { R::kAux2QuaternionY, 1, MP::kInt, },
-      // { R::kAux2QuaternionZ, 1, MP::kInt, },
+      // Raw quat48 words: never NaN-mapped (0x8000 is a valid word).
+      { R::kAux2QuaternionX, 3, MP::kRawInt, },
+      // { R::kAux2QuaternionY, 1, MP::kRawInt, },
+      // { R::kAux2QuaternionZ, 1, MP::kRawInt, },
 
       { R::kMillisecondCounter, 2, MP::kInt, },
       // { R::kClockTrim, 1, MP::kInt, },

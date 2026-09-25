@@ -120,6 +120,11 @@ class Register(enum.IntEnum):
     AUX1_ANALOG_IN4 = 0x063
     AUX1_ANALOG_IN5 = 0x064
 
+    # Fork-specific: the aux2 fusion's bias-corrected gyro rate, rad/s.
+    AUX2_GYROX = 0x065
+    AUX2_GYROY = 0x066
+    AUX2_GYROZ = 0x067
+
     AUX2_ANALOG_IN1 = 0x068
     AUX2_ANALOG_IN2 = 0x069
     AUX2_ANALOG_IN3 = 0x06a
@@ -368,12 +373,16 @@ def scale_register(register, resolution, value):
     elif (register >= Register.AUX1_PWM1 and
           register <= Register.AUX2_PWM5):
         return _scale_mapped(value, resolution, 1.0 / 127.0, 1.0 / 32767.0, 1.0 / 2147483647.0)
+    elif (register == Register.AUX2_GYROX or
+          register == Register.AUX2_GYROY or
+          register == Register.AUX2_GYROZ):
+        return _scale_mapped(value, resolution, 0.1, 0.001, 0.000001)
     elif (register == Register.AUX2_QUATERNIONX or
           register == Register.AUX2_QUATERNIONY or
           register == Register.AUX2_QUATERNIONZ):
-        # Raw float16 bit patterns (or raw accel counts).  These must
-        # not go through _scale_mapped: its NaN mapping would eat
-        # 0x8000, which is a valid float16 (-0.0).
+        # Raw quat48 register words (docs/protocol/registers.md).  These
+        # must not go through _scale_mapped: its NaN mapping would eat
+        # 0x8000, a valid word.
         return int(value)
     # Command registers (0x020-0x02d)
     elif register == Register.COMMAND_POSITION:
