@@ -49,6 +49,29 @@ for the main loop.  Each further board's reply on the same bus adds
 Motion changes nothing: a 0.5 rev/s spin gives the same numbers as a
 zero-torque hold.
 
+**Re-measured 2026-09-28 with the telemetry block** (block request `60 02`
+at 11-bit `0x07F`, 11-bit block replies; `scope_can_capture.py 2 --phases
+1`, 360 ticks, zero-torque position mode, bench board 2 plus sensor board 3
+on the bus; analysis `utils/imu_fusion_bench/scope_can_turnaround.py`; the
+adapter left 210 µs or more between the command and the request, so here
+too the request never queued behind the command):
+
+| Step (motor board 2, from the request's ack) | Wall median | p90 | max | CPU median |
+|---|---|---|---|---|
+| Frame reaches the main loop | 49 µs | 68 µs | 100 µs | 16 µs |
+| mjlib frame processing (the block leaves it one NOP) | 5 µs | 29 µs | 62 µs | 5 µs |
+| Response start + the block's quaternion evaluation | 35 µs | 59 µs | 61 µs | 13 µs |
+| The other block registers + the send | 95 µs | 98 µs | 99 µs | 29 µs |
+| **Request → reply starts** | **192 µs** | **211 µs** | **238 µs** | **64 µs** |
+
+The sensor board (lighter control interrupt) starts its reply 85 µs after
+the request's ack (p90 96, max 107 µs).  On a robot bus the sensor
+boards' replies therefore lead the burst, and the motor boards' 192 µs is
+hidden behind them: the burst starts ~85 µs after the request.  The
+biggest remaining piece is the 10 register reads after the quaternion
+(29 µs of CPU, ~3x that in wall time under the interrupt), which go
+through the generic register read and its scaling.
+
 ## 3. Where the CPU goes
 
 ### Control interrupt (30 kHz, 33.3 µs period)
@@ -89,7 +112,7 @@ from flash, and CCM (the fast on-chip RAM) has only 2.1 KB free.
 ### Telemetry request (humanoid3, 2026-09-24)
 
 The per-tick request is now the **telemetry block** (`fw/telemetry_block.h`,
-`docs/protocol/registers.md`): two bytes, `0x60 0x01`.  Each board answers
+`docs/protocol/registers.md`): two bytes, `0x60 0x02`.  Each board answers
 one type byte and a fixed list of register values with no per-register
 headers, built by calling the controller's own register reads (same
 scaling and NaN codes):
@@ -97,7 +120,7 @@ scaling and NaN codes):
 | Board | Values | Reply |
 |---|---|---|
 | Motor | quaternion, gyro rate (int16 ×3 each), q current (int32, 0.001 A), power (int16, 0.05 W), motor temperature, bus voltage (0.5 V), board temperature, fault, mode (int8) | 24 bytes, exactly a 24-byte frame |
-| Sensor | 0x050–0x051 encoder position + PLL velocity, quaternion, gyro rate (int16) | 17 bytes, 20-byte frame |
+| Sensor | 0x050 encoder position, quaternion, gyro rate (int16) | 15 bytes, 16-byte frame |
 
 With ordinary register reads the same values took 42 bytes (48-byte frame)
 and 22 bytes (24-byte frame): every read item carries a 2-byte header, and
@@ -147,8 +170,8 @@ request it only matters for reads piggybacked after the block.
 | Scope markers reduced to DBG1/DBG2 with `d mark phase\|can\|fusion` | CAN frames and fusion work visible on one probe |
 | Interrupt profiler: 16 points, per-second mean and max in `servo_stats.dwt` (`MOTEUS_PERFORMANCE_MEASURE` builds) | The §3 breakdown |
 | Fusion gyro rate served at 0x065–0x067 (`ImuFusion::RateAt`, `fw/moteus_controller.cc`) | Item 1 below: the rate is on the wire; the host stores it (`GYROM_*`/`GYROS_*`) |
-| Telemetry block request (`fw/telemetry_block.h`, `FDCanMicroServer`) | Motor reply 48 → 24-byte frame (with int16 power), sensor 24 → 20-byte frame; no per-register protocol work for the robot's request |
-| Encoder PLL gains computed before the motor checks in `MotorPosition::HandleConfigUpdate` (`fw/motor_position.h`) | A board with no motor (poles 0, every sensor board) used to freeze 0x050 and read 0x051 = 0 when its PLL was turned on; now the PLL runs (item 2) |
+| Telemetry block request (`fw/telemetry_block.h`, `FDCanMicroServer`) | Motor reply 48 → 24-byte frame (with int16 power), sensor 24 → 20-byte frame, then 16 once 0x051 was dropped (version 2, 2026-09-28); no per-register protocol work for the robot's request |
+| Encoder PLL gains computed before the motor checks in `MotorPosition::HandleConfigUpdate` (`fw/motor_position.h`) | A board with no motor (poles 0, every sensor board) used to freeze 0x050 and read 0x051 = 0 when its PLL was turned on; now the PLL runs.  Kept as a bug fix; the robot no longer uses the PLL (item 2) |
 
 Known and left alone: each time the gate driver is enabled, one control
 period stretches to 44–47 µs (upstream PWM timer restart).  It happens once
@@ -159,7 +182,7 @@ per enable, not in steady running.
 | # | Where | Now | Fix | Retrain? |
 |---|---|---|---|---|
 | 1 | **Angular-velocity observation**: the host differences quaternions, then low-passes (α = 0.5) | ≈ 4 ms (half-step difference at 120 Hz) + ≈ 8 ms (filter) ≈ **12 ms** | **Done (2026-09-25), needs a retrain:** the fusion's bias-corrected gyro rate of the newest 960 Hz sample, 0x065–0x067, in the per-tick request (bench at rest: 0 ± 0.06 dps).  humanoid3: `--imu-ang-vel-source gyro` trains on it (engine site rate, misalignment, fusion delay + sample age, bias/scale/white noise, int16 wire; no low-pass); the runner reads it from the checkpoint and the chest uses sensord's raw gyro.  The board frame is the quaternion's, so no mounting rotation is needed | yes |
-| 2 | **Joint (post-spring) velocity**: backward difference of the sensor board's output encoder (0x050) at 120 Hz | ≈ **4 ms** | **Done (2026-09-25), needs a retrain:** 0x051 in the per-tick request; PLL fixed for boards with no motor.  humanoid3: `--joint-velocity-source sensor_pll` trains on the firmware PLL at 50 Hz (noise = kp × encoder sigma, 0.17 rad/s median); the runner refuses to take over while a sensor board's 0x051 is exactly 0.  Left: set `pll_filter_hz 50` on the 24 sensor boards after the rollout (it also makes 0x050 the PLL-filtered position) | yes |
+| 2 | **Joint (post-spring) velocity**: backward difference of the sensor board's output encoder (0x050) at 120 Hz | ≈ **4 ms** | **Sensor PLL tried and dropped (2026-09-25 → 09-28):** a 50 Hz PLL (0x051) cut the delay to ≈ 1–2 ms but its noise is kp × encoder sigma (≈ 0.17 rad/s).  Plan now: joint velocity from the difference of the two boards' gyros across the joint (bench rest noise 0.5–1.6 mrad/s), encoder difference as the fallback; sensor boards keep `pll_filter_hz 0` and 0x051 is out of the telemetry block | yes |
 | 3 | **Position staircase**: each command holds for 8.3 ms | ≈ **4 ms** on average | Send a velocity with each position command; position mode then ramps the setpoint between commands | yes |
 | 4 | **Reply burst**: the host waits for every board on its bus | 1.5–2.6 ms per bus (measured earlier from the host) | The board side is ~0.33 ms to the first reply + ~115 µs per board (§2), so over half of this is host/transport.  Board-side levers: fewer or smaller registers (int16 instead of float32), then a faster CAN FD data rate if the transceivers allow it | no |
 | 5 | **Command pickup**: nothing happened for ~1.0 ms after the host sent a frame | ~1 ms | The board takes 175 µs median (260 µs max) from frame to control loop, and the frame itself ~85 µs on the bus, so ~0.7 ms is on the host side (Python loop, socketcan queue, driver).  Next: timestamp both ends on the robot (§6) | — |
@@ -245,18 +268,22 @@ Two more aggressive options:
 - **CAN capture**: `utils/imu_fusion_bench/scope_can_capture.py <id>`.
   Probes: CAN RX/TX on the logic side of the transceiver, DBG1, DBG2.
   Sample at 100 MS/s (the 5 Mbit/s data phase has 200 ns bits).  Phases:
-  1. robot pattern at 120 Hz
+  1. robot pattern at 120 Hz (a position command, then the block request)
   2. the same plus dummy fill frames
   3. back-to-back queries
-  4. a gentle spin (0.5 rev/s, 0.2 N·m max; the rotor must be free)
+  4. a gentle spin (0.5 rev/s, 0.2 N·m max; the rotor must be free), only
+     with `--phases 4`; the default is 1,2,3,5
   5. five zero-torque enable cycles
 
   Each phase ends with a report of `isr_max` and the gate driver's checks.
-- **Capture analysis**: decode CAN FD from RX (standard IDs for ids below
-  0x800, extended above; destuff; BRS at 1/5 Mbit/s); match each frame to
-  its DBG2 pulse (the pulse starts with a 0.1 µs blip before the frame-start
-  notch); subtract DBG1-high time for CPU time.  The scripts used so far
-  live outside the repo.
+- **Capture analysis**: `utils/imu_fusion_bench/scope_can_turnaround.py
+  capture.csv --id <id> --tx <ch> --rx <ch> [--dbg1 <ch> --dbg2 <ch>]` on
+  the Logic 2 CSV export (digital channels, one row per transition).  It
+  reads the 11-bit IDs off RX at the nominal rate (destuffed), takes the
+  board's ack pulse on TX as the reference, and splits each request's
+  turnaround at the DBG2 edges (pickup, frame, quaternion, rest); with
+  DBG1 it also reports the CPU time with the control interrupt subtracted.
+  The §2 block table came from it.
 - **Interrupt profile**: with the profiler build, read `servo_stats.dwt.mean`
   / `.max` (cycles at 170 MHz from interrupt entry to each point in
   `BldcServoStatus::PerfPoint`) after a couple of seconds in each state.

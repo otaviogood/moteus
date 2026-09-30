@@ -599,7 +599,21 @@ class MoteusController::Impl : public multiplex::MicroServer::Server {
     // Check to see if we have a command to send out.
     if (command_valid_) {
       command_valid_ = false;
-      bldc_.Command(command_);
+      if (command_update_ &&
+          bldc_.command().mode == BldcServo::Mode::kStopped) {
+        // A command update re-commands the command the board holds,
+        // but the servo's current command is "stopped" while the copy
+        // here is not: a STOP from the diagnostic console ("d stop",
+        // fw/board_debug.cc) reaches the servo without passing through
+        // command_.  An update must never start a board, so drop it
+        // and forget the stale baseline; the next full command rebuilds
+        // it.  Decided here, when the command is sent, from the command
+        // the servo last received: status().mode would show a STOP only
+        // once the control ISR has applied it.
+        command_ = {};
+      } else {
+        bldc_.Command(command_);
+      }
       scope::Clear(scope::kCanFrame);
     }
     aux1_port_.Poll();
@@ -619,6 +633,7 @@ class MoteusController::Impl : public multiplex::MicroServer::Server {
     // end of the frame if it carries none.
     scope::Set(scope::kCanFrame);
     command_valid_ = false;
+    command_update_ = multi_transport_->frame_is_command_update();
     discard_all_ = false;
     quaternion_words_valid_ = false;
     if (auto* storage = aux2_port_.fusion_storage()) {
@@ -631,6 +646,12 @@ class MoteusController::Impl : public multiplex::MicroServer::Server {
   Action CompleteFrame() override {
     if (discard_all_) {
       command_valid_ = false;
+    } else if (command_update_ &&
+               command_.mode != BldcServo::Mode::kStopped) {
+      // A command update (fw/command_update.h): the registers it wrote
+      // changed the current command; command it again (Poll() drops
+      // it if the servo's own command is stopped).
+      command_valid_ = true;
     }
     if (!command_valid_) { scope::Clear(scope::kCanFrame); }
     return discard_all_ ? kDiscard : kAccept;
@@ -643,6 +664,13 @@ class MoteusController::Impl : public multiplex::MicroServer::Server {
 
     switch (static_cast<Register>(reg)) {
       case Register::kMode: {
+        if (command_update_) {
+          // A command update changes registers of the current command;
+          // a mode write would replace the command and could start a
+          // stopped board.  Refused (write error 2); the frame's other
+          // writes still apply.
+          return kNotWriteable;
+        }
         const auto new_mode_int = ReadIntMapping(value);
         if (new_mode_int >= static_cast<int8_t>(BldcServo::Mode::kNumModes)) {
           return kUnknownRegister;
@@ -1340,6 +1368,7 @@ class MoteusController::Impl : public multiplex::MicroServer::Server {
   Uuid* const uuid_;
 
   bool command_valid_ = false;
+  bool command_update_ = false;
   bool discard_all_ = false;
   BldcServo::CommandData command_;
 

@@ -42,11 +42,23 @@ Format::ReadResult FakeRead(uint16_t reg, size_t type) {
 
 BOOST_AUTO_TEST_CASE(TelemetryBlockSizes) {
   static_assert(TelemetryBlockSize(kMotorTelemetryBlock) == 24);
-  static_assert(TelemetryBlockSize(kSensorTelemetryBlock) == 17);
+  static_assert(TelemetryBlockSize(kSensorTelemetryBlock) == 15);
+}
+
+BOOST_AUTO_TEST_CASE(TelemetryBlockReplyIds) {
+  static_assert(TelemetryBlockReplyId(10) == 0x70a);
+  static_assert(TelemetryBlockReplyId(57) == 0x739);
+  static_assert(TelemetryBlockReplyId(0xff) == 0x77f);
+  // Every reply ID fits 11 bits, and its low byte is only the sender's.
+  for (int id = 1; id < 0x7f; id++) {
+    const uint32_t reply = TelemetryBlockReplyId(id);
+    BOOST_TEST(reply < 0x800u);
+    BOOST_TEST((reply & 0xff) == static_cast<uint32_t>(id));
+  }
 }
 
 BOOST_AUTO_TEST_CASE(TelemetryBlockStripRequest) {
-  Bytes frame = {0x60, 0x01, 0x11, 0x00, 0x50};
+  Bytes frame = {0x60, 0x02, 0x11, 0x00, 0x50};
   size_t size = frame.size();
   BOOST_TEST(StripTelemetryBlockRequest(frame.data(), &size));
   BOOST_TEST(size == 3u);
@@ -54,10 +66,12 @@ BOOST_AUTO_TEST_CASE(TelemetryBlockStripRequest) {
   BOOST_TEST(frame[1] == 0x00);
 
   // An unknown layout version, or no marker: left alone.
-  Bytes future = {0x60, 0x02};
-  size = future.size();
-  BOOST_TEST(!StripTelemetryBlockRequest(future.data(), &size));
-  BOOST_TEST(size == 2u);
+  for (uint8_t version : {0x01, 0x03}) {
+    Bytes other = {0x60, version};
+    size = other.size();
+    BOOST_TEST(!StripTelemetryBlockRequest(other.data(), &size));
+    BOOST_TEST(size == 2u);
+  }
   Bytes plain = {0x11, 0x00};
   size = plain.size();
   BOOST_TEST(!StripTelemetryBlockRequest(plain.data(), &size));
@@ -83,10 +97,10 @@ BOOST_AUTO_TEST_CASE(TelemetryBlockMotorLayout) {
 BOOST_AUTO_TEST_CASE(TelemetryBlockSensorLayout) {
   uint8_t out[64] = {};
   const size_t n = WriteTelemetryBlock(true, FakeRead, out);
-  BOOST_REQUIRE(n == 17u);
+  BOOST_REQUIRE(n == 15u);
   const Bytes expected = {
-    0x62,
-    0x20, 0x03, 0x2a, 0x03,              // 0x050 800, 0x051 810
+    0x63,
+    0x20, 0x03,                          // 0x050: 800
     0x42, 0x04, 0x4c, 0x04, 0x56, 0x04,
     0xf2, 0x03, 0x00, 0x80, 0x06, 0x04,
   };
@@ -102,7 +116,7 @@ BOOST_AUTO_TEST_CASE(TelemetryBlockFloatNanToInt) {
   };
   uint8_t out[64] = {};
   const size_t n = WriteTelemetryBlock(true, nan_read, out);
-  BOOST_REQUIRE(n == 17u);
+  BOOST_REQUIRE(n == 15u);
   BOOST_TEST(out[1] == 0x00);
   BOOST_TEST(out[2] == 0x80);
 }

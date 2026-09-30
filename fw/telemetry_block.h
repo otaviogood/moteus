@@ -35,12 +35,30 @@
 /// per-register headers.  Each value is exactly what a register read of
 /// that type returns (same scaling, same NaN code).  Motor and sensor
 /// boards have their own layouts.
+///
+/// The request is answered whether or not its CAN ID asks for a reply,
+/// so the host can send it with an 11-bit ID (0x07F), and the reply goes
+/// out with the 11-bit ID TelemetryBlockReplyId(): the ID is sent at the
+/// slow arbitration rate, so this saves ~20 us per frame over 29 bits.
 namespace moteus {
 
 constexpr uint8_t kTelemetryBlockRequest = 0x60;  // unused by mjlib
-constexpr uint8_t kTelemetryBlockVersion = 1;
-constexpr uint8_t kTelemetryBlockMotor = 0x61;    // version 1, motor board
-constexpr uint8_t kTelemetryBlockSensor = 0x62;   // version 1, sensor board
+constexpr uint8_t kTelemetryBlockVersion = 2;
+// Each layout has its own type byte; a layout never changes under an
+// existing type byte.  0x62 was the version 1 sensor layout, which also
+// carried 0x051.
+constexpr uint8_t kTelemetryBlockMotor = 0x61;    // motor board
+constexpr uint8_t kTelemetryBlockSensor = 0x63;   // sensor board
+
+// Block replies use 11-bit IDs 0x700 | the board's own id.  The low byte
+// is the sender's id, so no other board's hardware filter (own id or
+// 0x7F) accepts one, and a board never receives its own frame; bits 8-10
+// set keep them apart from host commands, whose IDs are the destination.
+constexpr uint32_t kTelemetryBlockReplyIdBase = 0x700;
+
+constexpr uint32_t TelemetryBlockReplyId(uint8_t board_id) {
+  return kTelemetryBlockReplyIdBase | (board_id & 0x7f);
+}
 
 struct BlockRead {
   uint16_t reg;
@@ -58,7 +76,7 @@ constexpr BlockRead kMotorTelemetryBlock[] = {
 };
 
 constexpr BlockRead kSensorTelemetryBlock[] = {
-  {0x050, 1}, {0x051, 1},              // encoder 0: 0.0001 rev, 0.00025 rev/s
+  {0x050, 1},                          // encoder 0 position, 0.0001 rev
   {0x06d, 1}, {0x06e, 1}, {0x06f, 1},  // quaternion, quat48 words
   {0x065, 1}, {0x066, 1}, {0x067, 1},  // gyro rate, 0.001 rad/s
 };

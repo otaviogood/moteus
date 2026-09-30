@@ -18,9 +18,6 @@ git diff upstream/main            # tracked files
 git status --short                # plus new files
 ```
 
-At the time of writing (2026-09-25) most of the IMU fusion, telemetry and
-latency work below was not yet committed.
-
 ## Summary
 
 | Area | What the fork adds or changes |
@@ -28,7 +25,7 @@ latency work below was not yet committed.
 | Sensor boards | A board with no gate driver boots as a "sensor board": `otavio_flags` bit 0, its own LED pins, a filtered broadcast reply |
 | IMU | LSM6DSV16X on aux I2C with on-board orientation fusion (I2C device type 3), a persistent `imu_cal` config group, and an `aux2_fusion` telemetry record |
 | Registers | 0x065–0x067 gyro rate and 0x06d–0x06f quaternion (both fork-only) |
-| CAN protocol | A fixed-layout "telemetry block" request (`0x60 0x01`); hardware receive timestamps |
+| CAN protocol | A fixed-layout "telemetry block" request (`0x60 0x02`) with 11-bit replies; "command update" frames (`0x64`) that change only some registers of the current command; hardware receive timestamps |
 | Upstream bug fix | Encoder PLL gains are now computed on boards with no motor configured |
 | Latency / CPU | Non-blocking DRV8323 status poll on r4.x, IMU interrupt path in CCM, interrupt profiler, logic-analyzer markers |
 | Build safety | The firmware image can no longer overlap the persistent config pages |
@@ -150,7 +147,7 @@ broadcast address turns it off until the next power cycle.
 subframe (`0x17 0x65`, `0x17 0x6d`) so all three words come from one sample.
 
 **Telemetry block** (`fw/telemetry_block.h`).
-- **Request.** A request whose first two bytes are `0x60 0x01` gets a
+- **Request.** A request whose first two bytes are `0x60 0x02` gets a
   fixed-layout reply: one type byte, then that board's register values
   packed with no per-register headers.
 - **Values.** Each value is exactly what a normal register read returns.
@@ -158,16 +155,40 @@ subframe (`0x17 0x65`, `0x17 0x6d`) so all three words come from one sample.
   | Type byte | Board | Contents | Size |
   |---|---|---|---|
   | `0x61` | Motor board | Quaternion, gyro rate, q current (int32), power (int16), motor temperature, bus voltage, board temperature, fault, mode | 24 bytes |
-  | `0x62` | Sensor board | Encoder position and PLL velocity, quaternion, gyro rate | 17 bytes |
+  | `0x63` | Sensor board | Encoder position, quaternion, gyro rate | 15 bytes |
 
 - **Piggybacked reads.** Ordinary reads that follow the marker are answered
   after the block, as many whole items as fit in 64 bytes.
-- **Unknown versions** are ignored.
+- **CAN IDs.** The request is answered without the reply-request bit, so
+  it can go out as the 11-bit ID `0x07F`, and every block reply uses the
+  11-bit ID `0x700 | board id` instead of a 29-bit one (about 20 µs less
+  per reply frame).
+- **Unknown versions** are ignored, and a layout never changes under an
+  existing type byte.  Version 1 (sensor type `0x62`, which also carried
+  0x051) is no longer served.
 - **Why.** With ordinary reads the same values took a 48-byte motor frame
-  and a 24-byte sensor frame; the block needs 24 and 20.
+  and a 24-byte sensor frame; the block needs 24 and 16.
 - **Implementation detail.** A block-only request hands mjlib a single NOP
   byte, because a 0-byte read makes the multi-transport layer re-process the
   previous frame.
+
+**Command update** (`fw/command_update.h`).
+- **Frame.** A frame whose first byte is `0x64` changes only the command
+  registers it writes and commands the result again; an ordinary frame's
+  mode write still resets the whole command first (upstream behaviour,
+  unchanged for every other tool).
+- **Safety.** An update has no effect while the board's current command is
+  "stopped" (power-up, or a STOP from any source including the console's
+  `d stop`), and a mode write inside an update is refused (write error 2),
+  so it can never start a board.
+- **Implementation.** `FDCanMicroServer` strips the marker and flags the
+  frame; `MoteusController::CompleteFrame` commits the current command if
+  it is not stopped, and `Poll` drops it (and forgets the stale copy) when
+  the servo's last accepted command, `BldcServo::command()`, is stopped.
+- **Use.** The humanoid3 host sends one full command with a read-back of
+  0x020-0x025 / 0x027-0x029, resends it until the echo matches bit for bit,
+  then sends only the registers its control mode changes every tick (torque
+  mode: a 7-byte frame instead of 48).
 
 **Receive timestamps.**
 - `FDCan` enables the external timestamp counter and records each frame's
@@ -263,7 +284,8 @@ Measurements and reasoning: `docs/latency.md`.
 - **`utils/imu_fusion_bench/`**: bench scripts for the fusion. It covers:
   - live status and cold-start timing;
   - persistence tests and the six-position accelerometer calibration;
-  - the CAN and scope captures behind `docs/latency.md`.
+  - the CAN and scope captures behind `docs/latency.md`
+    (`scope_can_capture.py`) and their analysis (`scope_can_turnaround.py`).
 - **`README.md`** has a short note on reading the IMU over an fdcanusb.
 
 ## 8. Documentation added

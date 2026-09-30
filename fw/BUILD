@@ -49,6 +49,7 @@ cc_library(
         "imu_fusion.h",
         "imu_cal.h",
         "broadcast_reply_filter.h",
+        "command_update.h",
         "telemetry_block.h",
     ],
     srcs = [
@@ -236,6 +237,7 @@ cc_test(
         "test/imu_fusion_test.cc",
         "test/imu_cal_test.cc",
         "test/broadcast_reply_filter_test.cc",
+        "test/command_update_test.cc",
         "test/telemetry_block_test.cc",
         "test/test_main.cc",
     ],

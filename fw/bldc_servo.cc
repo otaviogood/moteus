@@ -251,6 +251,8 @@ class BldcServo::Impl : public BldcServoControl<BldcServo::Impl> {
   }
 
   const Status& status() const { return status_; }
+  // Written only by Command() on the main loop, never by the ISR.
+  const CommandData& command() const { return telemetry_data_; }
   const Config& config() const { return config_; }
   const Control& control() const { return control_; }
   const AuxPort::Status& aux1() const { return *aux1_port_->status(); }
@@ -1536,6 +1538,10 @@ void BldcServo::PollMillisecond() {
 
 void BldcServo::Command(const CommandData& data) {
   impl_->Command(data);
+}
+
+const BldcServo::CommandData& BldcServo::command() const {
+  return impl_->command();
 }
 
 const BldcServo::Status& BldcServo::status() const {

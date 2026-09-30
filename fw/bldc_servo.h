@@ -92,6 +92,11 @@ class BldcServo {
 
   void Start();
   void Command(const CommandData&);
+  /// The command Command() last accepted, from whichever source (CAN
+  /// register writes or the diagnostic console).  Its mode says whether
+  /// the board is, or is about to be, stopped, before the control ISR
+  /// has acted on it.
+  const CommandData& command() const;
 
   const Status& status() const;
   const Config& config() const;

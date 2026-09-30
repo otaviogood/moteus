@@ -128,6 +128,11 @@ class MultiTransportDatagramServer : public mjlib::multiplex::MicroDatagramServe
   bool last_frame_is_can() const {
     return last_frame_transport_ == kTransportIdCan;
   }
+  /// True while the frame being processed is a CAN command update
+  /// (fw/command_update.h).
+  bool frame_is_command_update() const {
+    return last_frame_is_can() && fdcan_->frame_is_command_update();
+  }
   uint16_t last_can_rx_timestamp() const {
     return fdcan_->last_rx_timestamp();
   }

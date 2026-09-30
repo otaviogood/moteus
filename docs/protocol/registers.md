@@ -368,8 +368,8 @@ given factor.  Integral types are applied as for PWM.  If unspecified,
 Mode: Read/write
 
 When in Position mode, shrink the derivative control term by the given
-factor.  Integral types are applied as for PWM.  This is internally
-limited to be no more than the kp scale.  If unspecified, 1.0 is used.
+factor.  Integral types are applied as for PWM.  If unspecified, 1.0
+is used.
 
 ### 0x025 - Maximum torque
 
@@ -759,8 +759,8 @@ toggle (bit 47 of the 48-bit value).
 
 ### Telemetry block (fork-specific)
 
-Not a register: a request that starts with the two bytes `0x60 0x01`
-(block request, layout version 1) gets a fixed-layout reply in front of
+Not a register: a request that starts with the two bytes `0x60 0x02`
+(block request, layout version 2) gets a fixed-layout reply in front of
 the normal reply to the rest of the frame (`fw/telemetry_block.h`).  The
 block is one type byte followed by the values of that board's register
 list, little-endian, with no per-register headers.  Each value is exactly
@@ -771,12 +771,53 @@ for a read of 0x06d-0x06f.
 | Type byte | Board | Values (register, type) | Size |
 |---|---|---|---|
 | `0x61` | motor board | 0x06d-0x06f int16, 0x065-0x067 int16, 0x004 int32, 0x007 int16, 0x00a int8, 0x00d-0x00f int8, 0x000 int8 | 24 bytes |
-| `0x62` | sensor board (no gate driver found at boot) | 0x050-0x051 int16, 0x06d-0x06f int16, 0x065-0x067 int16 | 17 bytes |
+| `0x63` | sensor board (no gate driver found at boot) | 0x050 int16, 0x06d-0x06f int16, 0x065-0x067 int16 | 15 bytes |
+
+A layout never changes under an existing type byte.  Version 1 (type
+`0x62` sensor layout, which also carried 0x051) is no longer served.
 
 Any read subframes after the marker are answered as usual, after the
 block, as many whole reply items as fit in 64 bytes (later ones are
 dropped).  Firmware that does not know the version ignores the request.
-The request works broadcast or addressed; the reply ID is the normal one.
+The request works broadcast or addressed.
+
+CAN IDs: a block request is answered even when its ID does not set the
+reply-request bit (0x8000), so a host can send it with the 11-bit ID
+`0x07F` (source 0, broadcast).  The reply always uses the 11-bit ID
+`0x700 | board id` (`TelemetryBlockReplyId`) instead of the usual 29-bit
+`(board id << 8) | requester`: the ID goes out at the arbitration rate, so
+this saves about 20 µs per reply frame at 1 Mbit/s.  The low byte is the
+sender's own id, which no other board's hardware filter accepts; bits 8-10
+tell it apart from host commands, whose 11-bit IDs are just the
+destination.  A block reply names no destination, and a board with id 7
+would make its ordinary replies to 0x00-0x7F look like block replies.
+
+### Command update (fork-specific)
+
+Not a register: a frame whose first byte is `0x64` (`fw/command_update.h`)
+updates the board's current command instead of replacing it.
+
+An ordinary command frame starts with a mode write (0x000), and the
+controller resets every command register (0x020-0x02f: position,
+velocity, feedforward torque, kp/kd scale, maximum torque, watchdog
+timeout, trajectory limits, ...) to its default before the rest of the
+frame writes what it carries.  After `0x64`, the frame's register writes
+change only those registers; the rest keep the values of the board's
+current command, and the result is commanded again, so the watchdog is
+re-armed with the command's own timeout.  An update has no effect while
+the current command is "stopped" (after power-up or a STOP from any
+source, the diagnostic console's `d stop` included), so it can never
+start a board: send one full command, then only the values that change.
+A mode write (0x000) inside an update is refused with write error 2 (not
+writeable) and the frame's other writes still apply, so a frame cannot be
+both an update and a new command.
+
+A host can confirm a board holds a full command by appending a float read
+of the registers it depends on to that command, with the reply-request
+bit: the reply is what the board holds (an int8 write is stored as a
+float, value x scale, so read it back as a float to compare exactly).
+Example, pure torque control after a verified full command: `64 0d 22
+<float>`, a 7-byte frame.
 
 ### 0x070 - Millisecond Counter
 

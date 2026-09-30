@@ -18,6 +18,7 @@
 #include "mjlib/multiplex/micro_server.h"
 
 #include "fw/broadcast_reply_filter.h"
+#include "fw/command_update.h"
 #include "fw/fdcan.h"
 #include "fw/telemetry_block.h"
 
@@ -69,7 +70,8 @@ class FDCanMicroServer : public mjlib::multiplex::MicroDatagramServer {
     // zero-length frame (RoundUpDlc returns 0 above 64).
     MJ_ASSERT(data.size() <= sizeof(buf_));
     std::string_view payload = data;
-    if (block_pending_) {
+    const bool block = block_pending_;
+    if (block) {
       // The block goes first, then as much of the normal reply as fits.
       // This runs inside the request's frame (mjlib writes the response
       // before it reads the next frame), so every value is this frame's.
@@ -88,10 +90,12 @@ class FDCanMicroServer : public mjlib::multiplex::MicroDatagramServer {
       payload = std::string_view(block_buf_, n + keep);
     }
     const auto actual_dlc = RoundUpDlc(payload.size());
-    const uint32_t id =
-        ((header.source & 0xff) << 8) |
-        (header.destination & 0xff) |
-        (can_prefix_ << 16);
+    // A block reply always carries an 11-bit ID (fw/telemetry_block.h).
+    const uint32_t id = block ?
+        TelemetryBlockReplyId(header.source) :
+        (((header.source & 0xff) << 8) |
+         (header.destination & 0xff) |
+         (can_prefix_ << 16));
 
     FDCan::SendOptions send_options;
     send_options.bitrate_switch =
@@ -155,6 +159,13 @@ class FDCanMicroServer : public mjlib::multiplex::MicroDatagramServer {
     // response (no reply flag) cannot leak into the next frame's reply.
     block_pending_ =
         block_server_ && StripTelemetryBlockRequest(frame, &bytes);
+    command_update_ = StripCommandUpdate(frame, &bytes);
+    if (block_pending_) {
+      // A block request is answered even without the reply-request bit
+      // (0x8000 of the ID, the source's 0x80 here), so the host can send
+      // it as the 11-bit ID 0x07F.
+      current_read_header_->source |= 0x80;
+    }
     if (broadcast_reads_begin_ &&
         current_read_header_->destination == kBroadcastId) {
       bytes = FilterBroadcastReads(
@@ -206,6 +217,10 @@ class FDCanMicroServer : public mjlib::multiplex::MicroDatagramServer {
 
   uint32_t can_reset_count() const { return can_reset_count_; }
 
+  /// True while the delivered frame is a command update
+  /// (fw/command_update.h).
+  bool frame_is_command_update() const { return command_update_; }
+
   uint16_t last_rx_timestamp() const { return fdcan_->last_rx_timestamp(); }
   uint32_t rx_fifo0_fill_level() const { return fdcan_->rx_fifo0_fill_level(); }
 
@@ -218,6 +233,7 @@ class FDCanMicroServer : public mjlib::multiplex::MicroDatagramServer {
   mjlib::multiplex::MicroServer::Server* block_server_ = nullptr;
   bool block_sensor_ = false;
   bool block_pending_ = false;
+  bool command_update_ = false;
   char block_buf_[64] = {};
 
   mjlib::micro::SizeCallback current_read_callback_;
