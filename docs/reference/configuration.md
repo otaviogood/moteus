@@ -210,6 +210,28 @@ many degrees Celsius of `servo.motor_fault_temperature`.
 If the motor temperature reaches this value, a fault is triggered and
 all torque is stopped.
 
+## `motor_thermal.mode`
+
+Fork-specific.  For motors whose thermistor cannot be trusted to follow
+the winding (poorly placed, detached, intermittent, dead), the board can
+estimate the winding temperature from the current and the board's FET
+temperature, and protect on it (the derate and fault above).  The
+estimate is updated every millisecond outside the control interrupt.
+Register 0x008 reports the temperature protection acts on.
+
+- 0 (default): the motor thermistor alone.
+- 1: the hotter of the motor thermistor and the estimate.  A faulty
+  thermistor reads low, so the estimate covers it, and a working one
+  still counts.  For a dead thermistor, or one that reads high, also set
+  `servo.enable_motor_temperature` to 0: it then reads 0 and the
+  estimate alone protects.
+
+The motor derate and fault still need `servo.motor_fault_temperature`
+set.  The model needs `motor.resistance_ohm` (a calibrated motor); with
+0 it adds no heat.  Its parameters are compiled in
+(`MotorThermalParams` in `fw/motor_thermal_model.h`), not config: each
+config field costs ~400 bytes of flash.
+
 ## `servo.fault_position_error`
 
 If finite, a fault is triggered when the absolute position control

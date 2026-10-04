@@ -14,6 +14,8 @@
 
 #include "fw/moteus_controller.h"
 
+#include <cmath>
+
 #include "mjlib/base/limit.h"
 
 #include "fw/aux_port.h"
@@ -237,6 +239,10 @@ enum class Register {
   kDCurrent = 0x005,
   kAbsPosition = 0x006,
   kPower = 0x007,
+  // Fork: what the motor derate and fault act on: the hotter of the
+  // filtered motor thermistor and the motor thermal estimate
+  // (fw/motor_thermal_model.h).
+  kProtectMotorTemperature = 0x008,
 
   kMotorTemperature = 0x00a,
   kTrajectoryComplete = 0x00b,
@@ -882,6 +888,7 @@ class MoteusController::Impl : public multiplex::MicroServer::Server {
       case Register::kPosition:
       case Register::kVelocity:
       case Register::kMotorTemperature:
+      case Register::kProtectMotorTemperature:
       case Register::kTemperature:
       case Register::kQCurrent:
       case Register::kDCurrent:
@@ -988,6 +995,12 @@ class MoteusController::Impl : public multiplex::MicroServer::Server {
       }
       case Register::kMotorTemperature: {
         return ScaleTemperature(bldc_.status().motor_temp_C, type);
+      }
+      case Register::kProtectMotorTemperature: {
+        // fmaxf: the thermistor alone while the estimate is NaN (off).
+        return ScaleTemperature(std::fmax(bldc_.status().filt_motor_temp_C,
+                                          bldc_.status().motor_temp_est_C),
+                                type);
       }
       case Register::kTemperature: {
         return ScaleTemperature(bldc_.status().fet_temp_C, type);

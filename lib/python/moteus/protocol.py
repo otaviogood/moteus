@@ -37,6 +37,9 @@ class Register(enum.IntEnum):
     D_CURRENT = 0x005
     ABS_POSITION = 0x006
     POWER = 0x007
+    # Fork: what the motor derate/fault act on (thermistor plus the
+    # motor thermal estimate's lead; fw/motor_thermal_model.h).
+    PROTECT_MOTOR_TEMPERATURE = 0x008
     MOTOR_TEMPERATURE = 0x00a
     TRAJECTORY_COMPLETE = 0x00b
     REZERO_STATE = 0x00c
@@ -299,7 +302,8 @@ def scale_register(register, resolution, value):
         return int(value)
     elif register == Register.VOLTAGE:
         return _scale_mapped(value, resolution, 0.5, 0.1, 0.001)
-    elif register == Register.MOTOR_TEMPERATURE:
+    elif (register == Register.MOTOR_TEMPERATURE or
+          register == Register.PROTECT_MOTOR_TEMPERATURE):
         return _scale_mapped(value, resolution, 1.0, 0.1, 0.001)
     elif register == Register.TEMPERATURE:
         return _scale_mapped(value, resolution, 1.0, 0.1, 0.001)

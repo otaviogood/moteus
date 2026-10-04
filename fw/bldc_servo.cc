@@ -18,6 +18,7 @@
 #include <atomic>
 #include <cmath>
 #include <functional>
+#include <limits>
 
 #include "mbed.h"
 
@@ -30,6 +31,7 @@
 #include "fw/bldc_servo_position.h"
 #include "fw/foc.h"
 #include "fw/moteus_hw.h"
+#include "fw/motor_thermal_model.h"
 #include "fw/scope_markers.h"
 #include "fw/stm32_dma.h"
 #include "fw/stm32g4_adc.h"
@@ -184,6 +186,8 @@ class BldcServo::Impl : public BldcServoControl<BldcServo::Impl> {
                                 std::bind(&Impl::UpdateConfig, this));
     persistent_config->Register("servopos", &position_config_,
                                 std::bind(&Impl::UpdateConfig, this));
+    persistent_config->Register("motor_thermal", &thermal_config_,
+                                std::bind(&Impl::UpdateConfig, this));
     telemetry_manager->Register("servo_stats", &status_);
     telemetry_manager->Register("servo_cmd", &telemetry_data_);
     telemetry_manager->Register("servo_control", &control_);
@@ -295,8 +299,9 @@ class BldcServo::Impl : public BldcServoControl<BldcServo::Impl> {
 
     derate_temperature_ =
         config_.fault_temperature - config_.temperature_margin;
-    motor_derate_temperature_ =
+    motor_derate_base_C_ =
         config_.motor_fault_temperature - config_.motor_temperature_margin;
+    ApplyMotorThermalOffset();
 
     velocity_filter_ = ExponentialFilter(rate_config_.pwm_rate_hz, 100.0f);
     temperature_filter_ = ExponentialFilter(rate_config_.pwm_rate_hz, 100.0f);
@@ -334,6 +339,8 @@ class BldcServo::Impl : public BldcServoControl<BldcServo::Impl> {
 
     UpdateDerivedMotorConstants();
     UpdateFieldWeakeningIdChar();
+
+    thermal_model_.Configure(motor_.resistance_ohm, kMotorThermalPeriodS);
   }
 
   void PollMillisecond() {
@@ -347,6 +354,7 @@ class BldcServo::Impl : public BldcServoControl<BldcServo::Impl> {
     volatile auto* mode_volatile = &status_.mode;
     volatile auto* fault_volatile = &status_.fault;
     Mode mode = *mode_volatile;
+    UpdateMotorThermal(mode);
     if (mode == kEnabling) {
       const auto enable_result = motor_driver_->StartEnable(true);
       switch (enable_result) {
@@ -391,6 +399,40 @@ class BldcServo::Impl : public BldcServoControl<BldcServo::Impl> {
       main_motor_position_epoch_ = motor_position_->status().epoch;
       UpdateConfig();
     }
+  }
+
+  // Fork: the motor thermal estimate (fw/motor_thermal_model.h).  Runs
+  // here, once per millisecond on the main loop; the ISR sees it only
+  // through motor_derate_temperature_ and motor_fault_threshold_.
+  void UpdateMotorThermal(Mode mode) {
+    if (thermal_config_.mode == MotorThermalConfig::kOff) {
+      // Re-enabling starts from the FET reading, with no stale rise.
+      thermal_model_.Reset();
+      motor_thermal_offset_C_ = 0.0f;
+      status_.motor_temp_est_C = std::numeric_limits<float>::quiet_NaN();
+    } else {
+      // Current flows only while the bridge is driven; stopped boards
+      // read a few hundred mA of sensor offset.  The undriven modes
+      // (stopped, fault, enabling, calibrating) are the lowest values.
+      static_assert(kStopped == 0 && kFault == 1 && kEnabling == 2 &&
+                    kCalibrating == 3 && kCalibrationComplete == 4);
+      const bool driven = mode > kCalibrationComplete;
+      const float d_A = status_.d_A;
+      const float q_A = status_.q_A;
+      const float i_squared_A2 = driven ? (d_A * d_A + q_A * q_A) : 0.0f;
+      const float estimate_C =
+          thermal_model_.Update(i_squared_A2, status_.filt_fet_temp_C);
+      status_.motor_temp_est_C = estimate_C;
+      motor_thermal_offset_C_ =
+          MotorThermalOffset(estimate_C, status_.filt_motor_temp_C);
+    }
+    ApplyMotorThermalOffset();
+  }
+
+  void ApplyMotorThermalOffset() {
+    motor_derate_temperature_ = motor_derate_base_C_ - motor_thermal_offset_C_;
+    motor_fault_threshold_ =
+        config_.motor_fault_temperature - motor_thermal_offset_C_;
   }
 
   void SetOutputPositionNearest(float position) {
@@ -1344,6 +1386,13 @@ class BldcServo::Impl : public BldcServoControl<BldcServo::Impl> {
   const MotorPosition::Status& position_ = motor_position_->status();
   Config config_;
   PositionConfig position_config_;
+
+  // Fork: motor thermal estimate.  Main loop only.
+  static constexpr float kMotorThermalPeriodS = 0.001f;
+  MotorThermalConfig thermal_config_;
+  MotorThermalModel thermal_model_;
+  float motor_derate_base_C_ = 0.0f;
+  float motor_thermal_offset_C_ = 0.0f;
 
   // Counterpart to isr_motor_position_epoch_ (inherited from
   // BldcServoControl), only accessed from the main loop.

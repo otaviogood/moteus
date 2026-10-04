@@ -1192,6 +1192,69 @@ BOOST_AUTO_TEST_CASE(BldcServoControlDoControl) {
   BOOST_CHECK(ctx.status_.fault == errc::kMotorDriverFault);
 }
 
+BOOST_AUTO_TEST_CASE(BldcServoControlMotorThermalThresholds) {
+  // The motor thermal estimate (fw/motor_thermal_model.h) reaches the
+  // ISR only by lowering motor_derate_temperature_ and
+  // motor_fault_threshold_.
+  Context ctx;
+  ctx.status_.filt_bus_V = 24.0f;
+  ctx.status_.filt_1ms_bus_V = 24.0f;
+  ctx.status_.filt_fet_temp_C = 25.0f;
+  ctx.status_.bus_V = 24.0f;
+  ctx.status_.max_power_W = 500.0f;
+  ctx.position_.epoch = 0;
+  ctx.isr_motor_position_epoch_ = 0;
+  ctx.position_.theta_valid = true;
+  ctx.motor_.poles = 14;
+  ctx.motor_.resistance_ohm = 0.1f;
+  ctx.config_.max_current_A = 14.0f;
+  ctx.config_.derate_current_A = -3.0f;
+  ctx.config_.max_velocity = 100.0f;
+  ctx.config_.max_velocity_derate = 20.0f;
+  ctx.config_.motor_fault_temperature = 75.0f;
+  ctx.config_.motor_temperature_margin = 20.0f;
+  ctx.motor_position_config_val.output.sign = 1;
+
+  SinCos sc;
+  sc.s = 0.0f;
+  sc.c = 1.0f;
+  BldcServoCommandData data;
+  data.mode = BldcServoMode::kCurrent;
+
+  // No offset: thermistor 60 C is a quarter into the 55-75 C range.
+  ctx.motor_derate_temperature_ = 55.0f;
+  ctx.motor_fault_threshold_ = 75.0f;
+  ctx.status_.filt_motor_temp_C = 60.0f;
+  ctx.status_.mode = BldcServoMode::kCurrent;
+  ctx.ISR_DoControl(sc, &data);
+  BOOST_TEST(ctx.status_.mode == BldcServoMode::kCurrent);
+  BOOST_TEST(ctx.status_.effective_max_current_A == 14.0f - 0.25f * 17.0f,
+             boost::test_tools::tolerance(1e-4f));
+
+  // The estimate leads the thermistor by 10 C: three quarters in.
+  ctx.motor_derate_temperature_ = 45.0f;
+  ctx.motor_fault_threshold_ = 65.0f;
+  ctx.ISR_DoControl(sc, &data);
+  BOOST_TEST(ctx.status_.mode == BldcServoMode::kCurrent);
+  BOOST_TEST(ctx.status_.effective_max_current_A == 14.0f - 0.75f * 17.0f,
+             boost::test_tools::tolerance(1e-4f));
+
+  // The estimate passes the fault temperature with the thermistor at 66 C.
+  ctx.status_.filt_motor_temp_C = 66.0f;
+  ctx.ISR_DoControl(sc, &data);
+  BOOST_CHECK(ctx.status_.mode == BldcServoMode::kFault);
+  BOOST_CHECK(ctx.status_.fault == errc::kOverTemperature);
+
+  // A disabled motor fault (NaN) never trips.
+  ctx.config_.motor_fault_temperature =
+      std::numeric_limits<float>::quiet_NaN();
+  ctx.motor_fault_threshold_ = std::numeric_limits<float>::quiet_NaN();
+  ctx.status_.filt_motor_temp_C = 200.0f;
+  ctx.status_.mode = BldcServoMode::kCurrent;
+  ctx.ISR_DoControl(sc, &data);
+  BOOST_TEST(ctx.status_.mode == BldcServoMode::kCurrent);
+}
+
 BOOST_AUTO_TEST_CASE(BldcServoControlDynamicInductance) {
   Context ctx;
   ctx.status_.filt_bus_V = 24.0f;

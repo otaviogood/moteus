@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <limits>
 #include <utility>
 
 #include "mjlib/base/assert.h"
@@ -209,6 +210,9 @@ class BldcServoControl {
   float flux_brake_min_voltage_ = 0.0f;
   float derate_temperature_ = 0.0f;
   float motor_derate_temperature_ = 0.0f;
+  // servo.motor_fault_temperature, lowered by the motor thermal
+  // estimate's lead (fork; fw/motor_thermal_model.h).  NaN = disabled.
+  float motor_fault_threshold_ = std::numeric_limits<float>::quiet_NaN();
 
   // ISR epoch counter — set by the Impl (or tests) and compared
   // against position_.epoch inside the control loop to detect new
@@ -1706,8 +1710,8 @@ class BldcServoControl {
         self().status_.mode = kFault;
         self().status_.fault = errc::kOverTemperature;
       }
-      if (std::isfinite(self().config_.motor_fault_temperature) &&
-          self().status_.filt_motor_temp_C > self().config_.motor_fault_temperature) {
+      // NaN (motor_fault_temperature disabled) never compares greater.
+      if (self().status_.filt_motor_temp_C > motor_fault_threshold_) {
         self().status_.mode = kFault;
         self().status_.fault = errc::kOverTemperature;
       }

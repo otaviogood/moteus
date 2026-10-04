@@ -27,6 +27,7 @@ git status --short                # plus new files
 | Registers | 0x065–0x067 gyro rate and 0x06d–0x06f quaternion (both fork-only) |
 | CAN protocol | A fixed-layout "telemetry block" request (`0x60 0x02`) with 11-bit replies; "command update" frames (`0x64`) that change only some registers of the current command; hardware receive timestamps |
 | Upstream bug fix | Encoder PLL gains are now computed on boards with no motor configured |
+| Motor protection | A per-board winding temperature estimate for motors whose thermistor is slow, misplaced or dead (`motor_thermal` config group, register 0x008) |
 | Latency / CPU | Non-blocking DRV8323 status poll on r4.x, IMU interrupt path in CCM, interrupt profiler, logic-analyzer markers |
 | Build safety | The firmware image can no longer overlap the persistent config pages |
 | Client libraries | Python and C++ register definitions and examples for the IMU registers |
@@ -140,10 +141,11 @@ broadcast address turns it off until the next power cycle.
 
 | Register | Meaning | Types |
 |---|---|---|
+| 0x008 | Motor protection temperature: what the motor derate and fault act on (section 9) | int8 1, int16 0.1, int32 0.001, float 1 |
 | 0x065–0x067 | Aux2 fusion gyro rate: bias-corrected, newest 960 Hz sample, rad/s, in the quaternion's body frame. NaN until converged or when stale | int8 0.1, int16 0.001, int32 1e-6, float 1 |
 | 0x06d–0x06f | Aux2 quaternion, "smallest three" 48-bit format: three 15-bit components, the index of the omitted one, and bit 47 as a freshness toggle. All-zero low 47 bits is the "no data" sentinel | int16 raw words |
 
-`docs/protocol/registers.md` documents both.  Read each triple in one
+`docs/protocol/registers.md` documents all three.  Read each triple in one
 subframe (`0x17 0x65`, `0x17 0x6d`) so all three words come from one sample.
 
 **Telemetry block** (`fw/telemetry_block.h`).
@@ -297,7 +299,100 @@ Measurements and reasoning: `docs/latency.md`.
 - `docs/latency.md`: where the robot's latency goes, what changed, and
   what's left.
 - Edits to `docs/protocol/registers.md`, `can.md`, `diagnostic.md` and
-  `docs/reference/configuration.md` / `encoders.md` for the items above.
+  `docs/reference/configuration.md` / `encoders.md` for the items above
+  (`motor_thermal.*` and register 0x008 included).
+
+## 9. Motor winding temperature estimate
+
+`fw/motor_thermal_model.h`, config `motor_thermal.mode`, register 0x008,
+telemetry `servo_stats.motor_temp_est_C`.
+
+- **Why.** The humanoid3 actuators' thermistors vary a lot, and some are
+  intermittent.  In a 10 A, 5 s pulse the copper rose 11-17 C (measured
+  from its resistance); the right chest shoulder's thermistor moved
+  1.5 C, and the right knee's 1.7 C one day and 15 C (normal) the next
+  (2026-10-02/03; humanoid3 `orin/calib/STATUS.md`, thermal row).
+- **Model.** Two nodes, as rises above the board's FET temperature: the
+  winding gains `1.5 R (1 + a (T - 25)) (Id^2 + Iq^2)` and passes heat to
+  a slow node (the motor body), which loses it to the FET reading; the
+  estimate is the FET reading plus the winding's rise.  Because the
+  states are rises, the estimate equals the FET reading from its first
+  reading, at power-up and on a mode change.  The current counts only while the bridge is
+  driven (stopped boards read a few hundred mA of sensor offset).
+- **Modes.** Per board: 0 off (stock); 1 the hotter of the motor
+  thermistor and the estimate.  A faulty thermistor reads low, so the
+  estimate covers it; with `servo.enable_motor_temperature 0` (a dead
+  thermistor, or one reading high) the estimate alone protects.
+  `docs/reference/configuration.md`.  Register 0x008 is computed on read,
+  `fmax(filt_motor_temp_C, motor_temp_est_C)` (the thermistor alone
+  while the estimate is NaN).  (An earlier build had
+  the rise ride on the thermistor and a separate FET-only mode; both are
+  covered by this one: the thermistor-based rise counted the heating
+  twice whenever the thermistor worked.)
+- **The FET as reference.** The FET thermistor is clean on all 24 robot
+  boards (noise 0.05-0.13 C sd, never more than 0.8 C off its local
+  average in 30 runs, including 10 A pulses; none of the leg crosstalk the
+  motor thermistors pick up).  A shared one-node rise over it tracked the
+  working motor thermistors within 0.6-1.8 C rms in the 10 A pulses, but
+  in 10 min at 4 A the two bicep twists' boards stayed far cooler than
+  their motors and it read 7-9 C low; the slow node covers that.
+- **Parameters** (compiled in, `MotorThermalParams`: 13.4 J/C, 1.08 C/W,
+  77 J/C, 0.57 C/W, resistance scale 1.1): fitted to 29 robot runs with
+  the FET as reference and under-prediction weighted 10x.  At most 1.3 C below a working
+  thermistor in any run; typically 2-5 C above it, up to 15 C above at
+  the end of 10 min holds on boards well coupled to their motor (they
+  derate early there).  Per-board values would recover that headroom
+  (they would need config fields again).  On bench
+  board 2 an earlier one-node default overstated a 10 A pulse's rise by
+  ~50 % (its resistance reads 4 % below calibration); with fitted values
+  the slope matched the copper's within ~7 %.
+- **Timing.** It runs in `BldcServo::PollMillisecond` on the main loop.
+  The control interrupt sees it only through two thresholds the poll
+  lowers by the estimate's lead: `motor_derate_temperature_` (already a
+  member) and the new `motor_fault_threshold_`, which replaced the config
+  value in the over-temperature check (NaN when the fault is disabled, so
+  the `isfinite` test went away).  `ISR_DoControl` is 64 bytes smaller;
+  `GlobalPendSv` and `GlobalInterrupt` are unchanged in size.  Bench
+  board 2 under the robot-pattern load (`scope_can_capture.py`, phases
+  1-5): interrupt peak 4015-4035 cycles before, 3999-4029 with the
+  estimate off, 4009-4027 with it on; main-loop idle rate 751-754 per
+  10 ms either way.
+- **Bench check of the final build** (2026-10-03, board 2): interrupt
+  peak 4005-4031 cycles with the estimate off or on (phases 1-5; a rare
+  4123-4129 in the enable cycles shows up in either mode), main-loop idle
+  rate 744-749 per 10 ms either way.  A 10 A, 5 s pulse in mode 1:
+  protection peaked at 50.7 C against a working thermistor's 42.5 C and
+  the copper's 38.4 C.  Derate on the estimate, with
+  `servo.motor_fault_temperature` lowered to 45 C and margin 10 C at
+  runtime and 10 A commanded for 15 s: the current followed the limit
+  computed from the estimate (14 - 17 (T - 35) / 10 A) to within 0.1 A
+  and settled at 3.3 A with the estimate at 41.3 C and the thermistor at
+  36.2 C, with no fault.  The thermistor alone would not have derated
+  until 1.5 s later and much less.
+- **Config safety.** A new group name, so no existing group's schema
+  changes and an older board's stored config loads unchanged (the new
+  group starts at its defaults).  Bench board 2 flashed three times with
+  `moteus_tool --flash`: calibration bit-identical each time.  Note:
+  `--flash` replays the board's RAM config, so a runtime `conf set` made
+  before flashing gets saved; reset the board first.
+- **Tests.** `fw/test/motor_thermal_model_test.cc` (step response, the
+  two-node steady state, the copper tempco, power-up, invalid inputs, the
+  right-knee pulse, the modes) and `BldcServoControlMotorThermalThresholds` in
+  `fw/test/bldc_servo_control_test.cc` (derate and fault through the
+  lowered thresholds).
+- **Flash space.** The feature costs ~2.2 kB; the image ends 2464 bytes
+  below the config pages (4616 without it).  Most of the cost is the
+  `motor_thermal` config group itself (~1.6 kB of handler and schema
+  code); each config field adds ~400 bytes, which is why the model's
+  parameters are compiled in and `mode` is a plain integer (an enum's
+  name table costs ~160 bytes more).  Putting `mode` in the `servo` group
+  instead would save ~840 bytes more but change that group's schema.
+- **Robot.** 2026-10-03: every humanoid3 board (24 motor, 24 sensor) runs
+  this build; calibration bit-identical on every board, every config
+  otherwise unchanged.  `motor_thermal.mode 1` only on the two motors
+  with broken thermistors (right knee, right chest shoulder), 0 on the
+  rest (humanoid3 `orin/calib/STATUS.md`).  The humanoid3 flash tool lists
+  `motor_thermal.mode` as an expected new key.
 
 ## Files in the repository root that are not source
 

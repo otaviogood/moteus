@@ -107,6 +107,9 @@ enum Register : uint16_t {
   kDCurrent = 0x005,
   kAbsPosition = 0x006,
   kPower = 0x007,
+  // Fork: what the motor derate/fault act on (thermistor plus the motor
+  // thermal estimate's lead; fw/motor_thermal_model.h).
+  kProtectMotorTemperature = 0x008,
 
   kMotorTemperature = 0x00a,
   kTrajectoryComplete = 0x00b,
@@ -650,6 +653,7 @@ struct Query {
       // { R::kDCurrent,  1,  MP::kCurrent, },
       { R::kAbsPosition, 1, MP::kPosition, },
       { R::kPower,       1, MP::kPower, },
+      { R::kProtectMotorTemperature, 1, MP::kTemperature, },
       { R::kMotorTemperature, 1, MP::kTemperature, },
       { R::kTrajectoryComplete, 2, MP::kInt, },
       // { R::kHomeState,  1, MP::kInt, },

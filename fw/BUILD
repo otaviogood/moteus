@@ -51,6 +51,7 @@ cc_library(
         "broadcast_reply_filter.h",
         "command_update.h",
         "telemetry_block.h",
+        "motor_thermal_model.h",
     ],
     srcs = [
         "foc.cc",
@@ -239,6 +240,7 @@ cc_test(
         "test/broadcast_reply_filter_test.cc",
         "test/command_update_test.cc",
         "test/telemetry_block_test.cc",
+        "test/motor_thermal_model_test.cc",
         "test/test_main.cc",
     ],
     data = [
