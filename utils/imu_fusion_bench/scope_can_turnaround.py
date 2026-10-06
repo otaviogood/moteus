@@ -38,8 +38,31 @@ Reported, from the ack end:
 With --dbg1, the cpu time (minus control-interrupt time) of pickup ..
 rest is printed as well.
 
+Command frames: frames with the board's 11-bit ID sent TICK_COMMAND_S
+after a telemetry request, as the robot and scope_can_capture.py phase 6
+send them (needs --dbg1 and --dbg2).  DBG2 rises when the frame
+reaches the main loop, is notched low by the frame-start fusion work, and
+falls when Poll() hands the command to the servo (BldcServo::Command swaps
+the command buffer); the next control interrupt uses it, so the first
+DBG1 rise after that fall is "in use".  Reported, per frame:
+
+  wire        start of frame -> end of the ack slot (the frame is in)
+  pickup      ack end -> DBG2 rises (StartFrame)
+  handoff     DBG2 rises -> its last fall before the board's next frame
+  isr wait    handoff -> the next DBG1 rise (the cycle using the command)
+  in use      ack end -> that DBG1 rise
+  sof->use    start of frame -> that DBG1 rise
+
+An interrupt that ends within ISR_AMBIGUOUS_S before the handoff may have
+preempted the hand-off right after the buffer swap (and so already used
+the command); those frames are counted, and their "in use" may be one
+control cycle late.
+
 Usage: python3 scope_can_turnaround.py capture.csv --id 2 --tx 0 --rx 1
            [--dbg1 2 --dbg2 3]
+
+scope_can_capture.py --phases 6 makes a capture of the robot's command
+updates alone.
 
 Without --dbg2 only the turnaround (and busy) is reported; without --dbg1
 cpu is left out.
@@ -54,6 +77,10 @@ NOMINAL_BIT_S = 1e-6        # 1 Mbit/s arbitration phase
 IDLE_BITS = 11              # recessive bits before a start of frame
 DBG2_GAP_S = 60e-6          # DBG2 notches shorter than this join one pulse
 ACK_MAX_S = 3e-6            # a TX low pulse this short is an ack
+ISR_AMBIGUOUS_S = 3e-6
+COMMAND_SPAN_S = 2e-3       # a command's hand-off is looked for this long
+TICK_COMMAND_S = (3e-3, 15e-3)  # a tick's command, after its request (the
+                                # fdcanusb delivers it ~7.6 ms after)
 
 
 def load(path, columns):
@@ -118,6 +145,79 @@ def decode_id(t, rx, sof):
     for b in bits[:11]:
         base = (base << 1) | b
     return base, bits[12] == 1       # bit 12 is IDE (bit 11 RRS / SRR)
+
+
+def commands(frames, dev_id, ack_end_after, d1_rises, d1_falls, d2_rises, d2_falls,
+             markers):
+    """Command frame -> in use, for every command frame to the board (see
+    the module docstring)."""
+    sofs = np.array([s for s, _i, _ext in frames] + [np.inf])
+    # frames the board itself processes (its own commands and the
+    # broadcast requests); the hardware filter drops the rest unseen
+    mine = [(k, s) for k, (s, i, ext) in enumerate(frames)
+            if ext is False and i in (dev_id, 0x07F)]
+    req = np.array([s for _k, s in mine if frames[_k][1] == 0x07F])
+
+    def tick_command(sof):
+        k = np.searchsorted(req, sof) - 1
+        return k >= 0 and TICK_COMMAND_S[0] <= sof - req[k] <= TICK_COMMAND_S[1]
+
+    to_board = [(k, s) for k, s in mine if frames[k][1] == dev_id]
+    cmds = [(k, s) for k, s in to_board if tick_command(s)]
+    print(f'{len(to_board)} frames to 11-bit 0x{dev_id:03x}, {len(cmds)} of them tick '
+          f'commands ({TICK_COMMAND_S[0] * 1e3:.0f}-{TICK_COMMAND_S[1] * 1e3:.0f} ms '
+          'after a request)')
+    if not cmds or not markers:
+        if cmds:
+            print('  (command frame -> in use needs --dbg1 and --dbg2)')
+        return
+    names = ('wire', 'pickup', 'handoff', 'isr wait', 'in use', 'sof->use')
+    rows = []
+    ambiguous = skipped = 0
+    for (k, sof), nxt in zip(mine, mine[1:] + [(len(frames), np.inf)]):
+        if frames[k][1] != dev_id or not tick_command(sof):
+            continue
+        ack = ack_end_after(sof, sofs[k + 1])
+        if ack is None:
+            skipped += 1
+            continue
+        # the board's next frame cannot reach its main loop before that
+        # frame's own ack
+        limit = ack + COMMAND_SPAN_S
+        if np.isfinite(nxt[1]):
+            limit = min(limit, ack_end_after(nxt[1], sofs[nxt[0] + 1]) or nxt[1])
+        r0 = d2_rises[(d2_rises > ack) & (d2_rises < limit)]
+        if not len(r0):
+            skipped += 1
+            continue
+        r0 = r0[0]
+        f = d2_falls[(d2_falls > r0) & (d2_falls < limit)]
+        if not len(f):
+            skipped += 1
+            continue
+        handoff = f[-1]
+        use = d1_rises[d1_rises > handoff]
+        if not len(use):
+            skipped += 1
+            continue
+        use = use[0]
+        before = d1_falls[d1_falls <= handoff]
+        if len(before) and handoff - before[-1] < ISR_AMBIGUOUS_S:
+            ambiguous += 1
+        rows.append([ack - sof, r0 - ack, handoff - r0, use - handoff,
+                     use - ack, use - sof])
+    if not rows:
+        print('  no command frame with its DBG2 hand-off: check the channel '
+              'numbers and `d mark can`')
+        return
+    a = np.array(rows) * 1e6
+    print(f'  {len(rows)} with a hand-off ({skipped} skipped, {ambiguous} with an '
+          f'interrupt ending < {ISR_AMBIGUOUS_S * 1e6:.0f} us before the hand-off)')
+    print(f'{"wall us":>14} {"mean":>8} {"median":>8} {"p90":>8} {"p99":>8} {"max":>8}')
+    for j, name in enumerate(names):
+        col = a[:, j]
+        print(f'{name:>14} {col.mean():8.1f} {np.median(col):8.1f} '
+              f'{np.percentile(col, 90):8.1f} {np.percentile(col, 99):8.1f} {col.max():8.1f}')
 
 
 def main():
@@ -201,6 +301,18 @@ def main():
         busy.append(bool(np.any((sofs > ack_end) & (sofs < reply))))
         before = rx_rises[rx_rises < reply]
         idle_ok.append(len(before) and reply - before[-1] >= 11 * NOMINAL_BIT_S)
+
+    def ack_end_after(sof, before):
+        """End of the first ack-length TX low pulse after sof (and before
+        ``before``), or None."""
+        for f in tx_falls[(tx_falls > sof) & (tx_falls < before)]:
+            r = tx_rises[tx_rises > f]
+            if len(r) and r[0] - f <= ACK_MAX_S:
+                return r[0]
+        return None
+
+    commands(frames, args.id, ack_end_after, d1_rises, d1_falls, d2_rises, d2_falls,
+             'dbg1' in ch and 'dbg2' in ch)
 
     if not wall:
         sys.exit('no request/reply pairs found: check the channel numbers '
