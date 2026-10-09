@@ -252,6 +252,9 @@ cc_test(
         "@fmt",
         "@com_github_mjbots_mjlib//mjlib/micro:test_fixtures",
     ],
+    # The IMU transfer-delay probe is a bench build option (fw/imu_fusion.h);
+    # its test needs it compiled in.
+    copts = ["-DMOTEUS_TS_PROBE"],
     size = "small",
 )
 

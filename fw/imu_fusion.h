@@ -56,13 +56,17 @@ constexpr float kFusionGyroScale = 70.0e-3f * 3.14159265f / 180.0f;
 constexpr float kFusionAccelScale = 4.0f / 32768.0f;
 constexpr float kFusionNominalTicks =
     1.0e6f / kFusionGyroOdrHz / kFusionTickUs;  // 260.4167
+// The chip's timestamp counter (TIMESTAMP0-3, FIFO tag 0x04) and its ODR
+// run from one oscillator: 46080 / 960 = 48 counter LSB per gyro sample,
+// whatever INTERNAL_FREQ_FINE says (DS Table 145).
+constexpr int32_t kFusionChipTicksPerSample = 48;
 
 struct FusionWord {
   uint16_t t = 0;       // TIM3 ticks at I2C completion
   uint16_t seq = 0;     // gyro sequence number (assigned before drop decision)
   int16_t v[3] = {};    // raw sensor words
   uint8_t tag = 0;      // FusionTag
-  uint8_t flags = 0;    // reserved
+  uint8_t flags = 0;    // TAG_CNT: the chip's 2-bit time-slot counter
 };
 static_assert(sizeof(FusionWord) == 12);
 
@@ -143,6 +147,12 @@ struct FusionControl {
   std::atomic<uint16_t> overrun_count{0};  // FIFO_OVR_LATCHED seen
   std::atomic<int16_t> freq_fine{0};       // INTERNAL_FREQ_FINE, signed
   std::atomic<uint8_t> init_state{0};      // driver state, for telemetry
+  // Transfer-delay probe: the chip's live timestamp counter
+  // (TIMESTAMP0-3) read right after a FIFO timestamp word, and the TIM3
+  // ticks when that read completed.  probe_count changes last.
+  std::atomic<uint32_t> probe_chip{0};
+  std::atomic<uint16_t> probe_t{0};
+  std::atomic<uint16_t> probe_count{0};
 
   void Reset() {
     resync_count.store(0);
@@ -150,6 +160,9 @@ struct FusionControl {
     overrun_count.store(0);
     freq_fine.store(0);
     init_state.store(0);
+    probe_chip.store(0);
+    probe_t.store(0);
+    probe_count.store(0);
   }
 };
 
@@ -259,9 +272,25 @@ class ImuFusion {
     uint16_t extrapolate_max_ticks = 2000;  // 8 ms
     uint16_t gap_max_words = 96;     // dead-reckon up to this, else re-init
     uint8_t sentinel_hold_replies = 3;
-    uint16_t latency_comp_ticks = 0; // added to the request stamp
+    // Orientation compensation: the reply is evaluated this much after
+    // the request stamp (gyro extrapolation), cancelling the chip's
+    // filter delay, the transfer and the fusion time base.  MEASURED
+    // 2026-10-07 on the robot (hand-rocked joint vs its encoder,
+    // orin/calib/STATUS.md): with CTRL6 at the 310 Hz setting the
+    // orientation is ~2.15 ms behind the request (3.35 at 149 Hz); 2.0 ms
+    // is taken out here, the ~0.15 ms left is modelled by the simulators
+    // (kept positive: they interpolate history, not extrapolate).  A
+    // prediction with the newest, itself ~2 ms old, gyro rate: exact for
+    // smooth motion, a gain error ~L*D*w^2 at high frequency.  Console
+    // `aux2 fusion latency <us>` overrides it (not saved).
+    uint16_t latency_comp_ticks = 500;  // 2000 us
     uint16_t tracker_window_first = 128;
     uint16_t tracker_window = 1024;
+    // No gyro word for this long (main-loop milliseconds): replies are
+    // sentinels.  The 16-bit tick stamps wrap every 262 ms, so the
+    // tick-based extrapolation limit alone would accept a stale history
+    // again once a stopped acquisition has lasted a whole wrap.
+    uint16_t stale_ms = 50;
     // Stationary gyro-bias learning, all three axes (the accelerometer
     // innovation cannot see the bias about the vertical).  While every
     // axis reads within stat_omega_max of the current bias, |a| is within
@@ -269,24 +298,41 @@ class ImuFusion {
     // than stat_dir_deg since the window began, for stat_qualify_words
     // samples, the residual rate is the bias error and is blended in
     // with per-sample gain stat_gain (time constant ~10 s at 960 Hz).
+    // A 6-axis IMU cannot tell a steady yaw from a bias, so a corrected
+    // rate above stat_omega_max counts as motion -- which also means a
+    // bias error above it can never be unlearned here: the learner tracks
+    // any rotation slower than its time constant, and when that rotation
+    // stops the corrected rate jumps by the absorbed amount (8 of 48
+    // robot boards sat at a false 0.6-1.2 dps, 2026-10-07).  The way out
+    // is Relearn(), requested by the host when the robot is known to be
+    // still (console `aux2 fusion relearn`): for its wall-time deadline
+    // the gate is steadiness only (each axis within stat_omega_max of its
+    // own stat_lp_alpha average), at the fast gain.
     float stat_omega_max = 0.0174533f;   // 1 dps
+    float stat_lp_alpha = 1.0f / 240.0f; // 0.25 s at 960 Hz
     uint8_t stat_over_samples = 8;       // consecutive over-threshold samples that reset the window
     float stat_acc_tol = 0.02f;
     float stat_dir_cos = 0.99999391f;    // cos(0.2 deg)
     uint16_t stat_qualify_words = 960;   // 1 s
     float stat_gain = 1.0e-4f;
-    // Startup capture: for the first stat_fast_words of qualified
-    // stationary time after a cold start the bias is taken in with a fast
-    // gain (~0.1 s), so a board that boots at rest (the crane) does not
-    // spend ~45 s with a 1.7 deg tilt error while the slow learners
-    // discover a 0.5 dps bias.
+    // The fast gain (~0.1 s) runs only during a host-requested Relearn():
+    // a cold-start fast phase used to take in whatever the board saw in
+    // its first two seconds, and the robot is often moving then (the
+    // joint power switch is on the robot; a hanging robot twists after
+    // it is touched), which is how 7 of 48 boards came to carry a false
+    // 0.6-1.2 dps for hours (2026-10-07).  At boot the bias starts from
+    // the persisted gyro_bias0 (imu_cal.gyro_bias, saved by the host) and
+    // the slow learner refines it; the runner's startup relearn takes
+    // care of the rest before the policy runs.
     float stat_gain_fast = 1.0e-2f;
-    uint16_t stat_fast_words = 1920;     // 2 s
     // Accelerometer calibration, applied to the raw reading before use:
     // a = (raw - accel_bias) / accel_scale, in g.  Copied from the
     // persistent `imu_cal` config group by the aux port (fw/imu_cal.h).
     float accel_bias[3] = {0.0f, 0.0f, 0.0f};
     float accel_scale[3] = {1.0f, 1.0f, 1.0f};
+    // The gyro bias to start from at power-up (imu_cal.gyro_bias, rad/s),
+    // seeded once at the first initialization.
+    float gyro_bias0[3] = {0.0f, 0.0f, 0.0f};
   };
 
   enum ReinitReason : uint8_t {
@@ -298,6 +344,20 @@ class ImuFusion {
 
   static constexpr size_t kHistorySize = 64;
   using History = std::array<FusionHistoryEntry, kHistorySize>;
+
+  // Transfer-delay probe, bench builds only (flash is tight):
+  //   tools/bazel build --config=target //:target --copt=-DMOTEUS_TS_PROBE
+  // The probe's 4-byte read of TIMESTAMP0-3 at 400 kHz: the chip's value
+  // is taken as latched at the first data byte, 4 x 9 bits = 90 us = 22
+  // ticks before the transfer ends.  (The ISR sees both this completion
+  // and a word's arrival up to one control cycle late, which cancels.)
+  // Systematic uncertainty of the delay below: about +-50 us.
+  static constexpr uint16_t kProbeLatchTicks = 22;
+  // The measured gyro word is this many slots after the timestamp slot:
+  // the slot right after it is itself delayed by the probe's own read
+  // (bench 2026-10-06: its transfer floor read 519 us while the fusion
+  // clock sat 398 us behind the chip), two slots on the bus is quiet again.
+  static constexpr uint16_t kProbeSlotOffset = 2;
 
   ImuFusion() {}
 
@@ -312,11 +372,38 @@ class ImuFusion {
 
   Params* params() { return &params_; }
 
+  /// Host-requested gyro-bias relearn (console `aux2 fusion relearn <s>`):
+  /// the robot is known to be still, so a steady corrected rate of any
+  /// size is bias error, taken in at the fast gain for learn_ms of
+  /// elapsed time after the stationary window has qualified again (one
+  /// second); the accelerometer gate is not consulted.  The assurance of
+  /// stillness does not outlive the request: the deadline is wall time
+  /// (PollMillisecond), and an acquisition outage (stale words) or a
+  /// re-initialization cancels it.
+  void Relearn(uint16_t learn_ms) {
+    const uint32_t qualify_ms = static_cast<uint32_t>(
+        params_.stat_qualify_words * 1000.0f / kFusionGyroOdrHz + 0.5f);
+    relearn_ms_ = static_cast<uint16_t>(std::min<uint32_t>(65535, learn_ms + qualify_ms));
+    stat_words_ = 0;
+    stat_lp_reset_ = true;
+  }
+
+  /// Main loop, once per millisecond: ages the newest gyro word (see
+  /// Params::stale_ms) and runs the relearn deadline.
+  void PollMillisecond() {
+    if (ms_since_gyro_ < 65535) { ms_since_gyro_++; }
+    if (relearn_ms_ > 0) {
+      relearn_ms_--;
+      if (ms_since_gyro_ > params_.stale_ms) { relearn_ms_ = 0; }
+    }
+  }
+
   FUSION_MAINLOOP void Reset() {
     initialized_ = false;
     converged_ = false;
     q_[0] = 1.0f; q_[1] = q_[2] = q_[3] = 0.0f;
     for (auto& v : bias_) { v = 0.0f; }
+    bias_seeded_ = false;
     for (auto& v : omega_c_) { v = 0.0f; }
     for (auto& v : omega_prev_) { v = 0.0f; }
     for (auto& v : corr_) { v = 0.0f; }
@@ -350,12 +437,29 @@ class ImuFusion {
     counters_ = {};
     stat_words_ = 0;
     stat_over_ = 0;
+    relearn_ms_ = 0;
+    for (auto& v : omega_lp_) { v = 0.0f; }
+    stat_lp_reset_ = false;
     stat_active_ = false;
     stat_accel_ok_ = false;
     stat_have_ref_ = false;
     stationary_words_ = 0;
     for (auto& v : accel_raw_lp_) { v = 0.0f; }
     last_request_age_ticks_ = 0;
+    ms_since_gyro_ = 0;
+#ifdef MOTEUS_TS_PROBE
+    have_last_gyro_ = false;
+    ts_wait_gyro_ = false;
+    next_armed_ = false;
+    pair_valid_ = false;
+    probe_valid_ = false;
+    seen_probe_ = control_ ? control_->probe_count.load() : 0;
+    ts_pairs_ = 0;
+    ts_rejects_ = 0;
+    ts_delay_min_us_ = 0;
+    ts_delay_mean_us_ = 0.0f;
+    ts_model_mean_us_ = 0.0f;
+#endif
     if (status_) { *status_ = {}; }
   }
 
@@ -432,7 +536,8 @@ class ImuFusion {
   /// quaternion's extrapolation limit.  No side effects: the freshness
   /// toggle and the sentinel hold advance on quaternion replies only.
   FUSION_MAINLOOP float RateAt(uint16_t stamp_ticks, int axis) const {
-    if (!initialized_ || !converged_ || hist_count_ == 0) {
+    if (!initialized_ || !converged_ || hist_count_ == 0 ||
+        ms_since_gyro_ > params_.stale_ms) {
       return std::numeric_limits<float>::quiet_NaN();
     }
     const auto& newest = (*history_)[Index(hist_count_ - 1)];
@@ -479,7 +584,7 @@ class ImuFusion {
   /// Evaluate the orientation at t_req (ticks) from the history.
   /// Returns false when the request is outside the covered window.
   FUSION_MAINLOOP bool EvaluateAt(uint16_t t_req, float* q_out) const {
-    if (hist_count_ == 0) { return false; }
+    if (hist_count_ == 0 || ms_since_gyro_ > params_.stale_ms) { return false; }
     const auto& newest = (*history_)[Index(hist_count_ - 1)];
     const int16_t d = static_cast<int16_t>(t_req - newest.t);
     if (d > static_cast<int16_t>(params_.extrapolate_max_ticks)) {
@@ -577,19 +682,45 @@ class ImuFusion {
       seen_overrun_ = overrun;
       ReInit(kReinitOverrun);
     }
+#ifdef MOTEUS_TS_PROBE
+    uint16_t probe = control_->probe_count.load();
+    if (probe != seen_probe_) {
+      // A consistent snapshot: the ISR stores chip and t, then bumps
+      // count; re-read while count moves under us.
+      uint32_t chip = 0;
+      uint16_t t = 0;
+      for (int i = 0; i < 3; i++) {
+        chip = control_->probe_chip.load();
+        t = control_->probe_t.load();
+        const uint16_t again = control_->probe_count.load();
+        if (again == probe) { break; }
+        probe = again;
+      }
+      seen_probe_ = probe;
+      probe_chip_ = chip;
+      probe_t_ = t;
+      probe_valid_ = true;
+      EvaluateProbe();
+    }
+#endif
   }
 
   FUSION_MAINLOOP void Process(const FusionWord& w) {
     switch (w.tag) {
       case kFusionTagGyro: { ProcessGyro(w); break; }
       case kFusionTagAccel: { ProcessAccel(w); break; }
-      case kFusionTagTimestamp: { counters_.ts_words++; break; }
+      case kFusionTagTimestamp: {
+        counters_.ts_words++;
+        ProcessTimestamp(w);
+        break;
+      }
       default: { counters_.other_words++; break; }
     }
   }
 
   FUSION_MAINLOOP void ProcessGyro(const FusionWord& w) {
     counters_.gyro_words++;
+    ms_since_gyro_ = 0;
 
     if (!have_seq_) {
       have_seq_ = true;
@@ -636,6 +767,10 @@ class ImuFusion {
       }
       if (win_count_ >= win_len_) { FitTrackerWindow(); }
     }
+    // This word's sample time on the fusion's clock (the history stamp).
+    const uint16_t model_t16 = static_cast<uint16_t>(
+        static_cast<uint32_t>(model_t_ + 0.5f) & 0xffff);
+    ProbeGyro(w, model_t16);
 
     float omega[3];
     for (int i = 0; i < 3; i++) {
@@ -659,7 +794,7 @@ class ImuFusion {
       }
 
       auto& e = (*history_)[hist_head_];
-      e.t = static_cast<uint16_t>(static_cast<uint32_t>(model_t_ + 0.5f) & 0xffff);
+      e.t = model_t16;
       std::memcpy(e.q, q_, sizeof(q_));
       hist_head_ = static_cast<uint16_t>((hist_head_ + 1) % kHistorySize);
       if (hist_count_ < kHistorySize) { hist_count_++; }
@@ -673,13 +808,35 @@ class ImuFusion {
     // Stationary bias learning (all axes).  omega is already bias
     // corrected, so at rest it is the remaining bias error.
     if (initialized_) {
-      const float wmax = std::max(std::abs(omega[0]),
-                                  std::max(std::abs(omega[1]), std::abs(omega[2])));
+      if (stat_lp_reset_) {
+        // A relearn's steadiness reference starts from its first sample:
+        // the running average still remembers a rotation that stopped
+        // within the last second or so, and until that had decayed every
+        // sample would count as unsteady, eating into (or outlasting)
+        // the deadline.
+        stat_lp_reset_ = false;
+        std::memcpy(omega_lp_, omega, sizeof(omega_lp_));
+      }
+      float dev = 0.0f;
+      float wmax = 0.0f;
+      for (int i = 0; i < 3; i++) {
+        omega_lp_[i] += params_.stat_lp_alpha * (omega[i] - omega_lp_[i]);
+        dev = std::max(dev, std::abs(omega[i] - omega_lp_[i]));
+        wmax = std::max(wmax, std::abs(omega[i]));
+      }
       // A brief bump (table vibration) neither resets the window nor
-      // feeds the learner; sustained motion resets it.
-      const bool over = wmax > params_.stat_omega_max;
+      // feeds the learner; sustained motion resets it.  Motion is a rate
+      // above stat_omega_max, or, during a host-requested relearn (the
+      // robot is known still), an unsteady rate of any size.
+      const bool relearn = relearn_ms_ > 0;
+      const bool over = relearn ? (dev > params_.stat_omega_max)
+                                : (wmax > params_.stat_omega_max);
       stat_over_ = over ? static_cast<uint8_t>(std::min(255, stat_over_ + 1)) : 0;
-      if (stat_over_ >= params_.stat_over_samples || !stat_accel_ok_) {
+      // The host vouching for stillness also stands in for the
+      // accelerometer gate: a board whose |a| calibration is off by more
+      // than stat_acc_tol never passes it (robot board can3/34 read
+      // 0.975 g, 2026-10-07) and could never learn otherwise.
+      if (stat_over_ >= params_.stat_over_samples || (!relearn && !stat_accel_ok_)) {
         stat_words_ = 0;
         stat_active_ = false;
       } else if (!over) {
@@ -687,8 +844,7 @@ class ImuFusion {
         if (stat_words_ >= params_.stat_qualify_words) {
           stat_active_ = true;
           stationary_words_++;
-          const float gain = stationary_words_ <= params_.stat_fast_words ?
-              params_.stat_gain_fast : params_.stat_gain;
+          const float gain = relearn ? params_.stat_gain_fast : params_.stat_gain;
           for (int i = 0; i < 3; i++) {
             bias_[i] += gain * omega[i];
             if (bias_[i] > params_.bias_max) { bias_[i] = params_.bias_max; }
@@ -698,6 +854,123 @@ class ImuFusion {
       }
     }
   }
+
+#ifdef MOTEUS_TS_PROBE
+  // Transfer-delay probe.  Every 32nd slot carries the chip's timestamp
+  // counter at that slot's data-ready (FIFO tag 0x04, chip clock); the
+  // driver then reads the live counter (FusionControl::probe_*), which
+  // ties the chip clock to TIM3 at one instant.  The word's slot counter
+  // (TAG_CNT) picks out the gyro word of the same slot whatever order the
+  // chip writes them in (bench 2026-10-06: the timestamp word comes
+  // first), and the measured word is the gyro word kProbeSlotOffset slots
+  // later (chip time + 48 per slot, DS Table 145): a slot with nothing
+  // but a gyro word, the kind the arrival-floor tracker's floor comes
+  // from, far enough from the probe's own read.  Two results per
+  // word: its arrival stamp minus its FIFO write (the transfer,
+  // ts_delay_*) and its history stamp minus its FIFO write (the fusion
+  // clock's offset from the chip's data-ready, ts_model_*).
+  FUSION_MAINLOOP void ProbeGyro(const FusionWord& w, uint16_t model_t16) {
+    bool armed_now = false;
+    if (ts_wait_gyro_) {
+      // The slot's timestamp word came first; this is its gyro word if
+      // the slot counters agree.
+      ts_wait_gyro_ = false;
+      if (w.flags == ts_wait_cnt_) {
+        ArmNext(ts_wait_value_, w.seq);
+        armed_now = true;
+      }
+    }
+    if (next_armed_ && !armed_now) {
+      // The gyro word kProbeSlotOffset slots after the timestamp slot.
+      const uint16_t ahead = static_cast<uint16_t>(w.seq - next_seq_);
+      if (ahead >= kProbeSlotOffset) {
+        next_armed_ = false;
+      }
+      if (ahead == kProbeSlotOffset) {
+        pair_chip_ = next_chip_;
+        pair_t_ = w.t;
+        pair_model_t_ = model_t16;
+        pair_valid_ = true;
+        EvaluateProbe();
+      }
+    }
+    last_gyro_t_ = w.t;
+    last_gyro_seq_ = w.seq;
+    last_gyro_cnt_ = w.flags;
+    have_last_gyro_ = true;
+  }
+
+  FUSION_MAINLOOP void ProcessTimestamp(const FusionWord& w) {
+    const uint32_t value =
+        static_cast<uint32_t>(static_cast<uint16_t>(w.v[0])) |
+        (static_cast<uint32_t>(static_cast<uint16_t>(w.v[1])) << 16);
+    if (have_last_gyro_ && last_gyro_cnt_ == w.flags) {
+      ArmNext(value, last_gyro_seq_);
+    } else {
+      ts_wait_gyro_ = true;
+      ts_wait_cnt_ = w.flags;
+      ts_wait_value_ = value;
+    }
+  }
+
+  FUSION_MAINLOOP void ArmNext(uint32_t chip, uint16_t gyro_seq) {
+    next_chip_ = chip + kProbeSlotOffset * kFusionChipTicksPerSample;
+    next_seq_ = gyro_seq;
+    next_armed_ = true;
+  }
+
+  FUSION_MAINLOOP void EvaluateProbe() {
+    if (!pair_valid_ || !probe_valid_) { return; }
+    // The live read follows the timestamp slot's burst, so its latch is
+    // ~1 ms after that slot's data-ready and the measured slot (+2 x 48)
+    // is written within ~2 ms of it either way.  A byte of the live
+    // counter rolling over during its 4-byte read reads 256 LSB high
+    // (dchip 5.6 ms too low): outside this window, rejected.
+    const int32_t dchip = static_cast<int32_t>(pair_chip_ - probe_chip_);
+    if (dchip > 3 * kFusionChipTicksPerSample ||
+        dchip < -2 * kFusionChipTicksPerSample) {
+      // Records from different cycles: only the older one is spent.  A
+      // main-loop stall queues the words of one or more cycles behind
+      // the latest live read, and if that read were spent on the first
+      // stale pair, every later pair would meet a read one cycle ahead
+      // of it, for good.
+      if (dchip < 0) { pair_valid_ = false; } else { probe_valid_ = false; }
+      ts_rejects_++;
+      return;
+    }
+    pair_valid_ = false;
+    probe_valid_ = false;
+    const float ticks_per_lsb =
+        (T_ticks_ + dT_) / static_cast<float>(kFusionChipTicksPerSample);
+    // FIFO write of the measured sample, in TIM3 ticks relative to the
+    // probe's latch.
+    const float write_ticks = static_cast<float>(dchip) * ticks_per_lsb;
+    const uint16_t latch = static_cast<uint16_t>(probe_t_ - kProbeLatchTicks);
+    const int32_t us = static_cast<int32_t>(std::lround(
+        (static_cast<float>(static_cast<int16_t>(pair_t_ - latch)) - write_ticks) *
+        kFusionTickUs));
+    const int32_t model_us = static_cast<int32_t>(std::lround(
+        (static_cast<float>(static_cast<int16_t>(pair_model_t_ - latch)) - write_ticks) *
+        kFusionTickUs));
+    if (us < -1000 || us > 8000) {   // not a transfer time at all
+      ts_rejects_++;
+      return;
+    }
+    if (ts_pairs_ == 0) {
+      ts_delay_min_us_ = us;
+      ts_delay_mean_us_ = static_cast<float>(us);
+      ts_model_mean_us_ = static_cast<float>(model_us);
+    } else {
+      if (us < ts_delay_min_us_) { ts_delay_min_us_ = us; }
+      ts_delay_mean_us_ += (static_cast<float>(us) - ts_delay_mean_us_) / 16.0f;
+      ts_model_mean_us_ += (static_cast<float>(model_us) - ts_model_mean_us_) / 16.0f;
+    }
+    ts_pairs_++;
+  }
+#else
+  void ProbeGyro(const FusionWord&, uint16_t) {}
+  void ProcessTimestamp(const FusionWord&) {}
+#endif
 
   FUSION_MAINLOOP void DeadReckon(uint16_t lost) {
     if (!initialized_) { return; }
@@ -764,7 +1037,7 @@ class ImuFusion {
         std::memcpy(stat_ref_, a_n, sizeof(stat_ref_));
         stat_have_ref_ = true;
       }
-      if (!ok) {
+      if (!ok && relearn_ms_ == 0) {   // a host-requested relearn vouches for stillness
         stat_words_ = 0;
         stat_active_ = false;
       }
@@ -815,6 +1088,13 @@ class ImuFusion {
   }
 
   FUSION_MAINLOOP void InitFromAccel(const float* a_n) {
+    if (!bias_seeded_) {
+      // Cold start: begin from the bias the host saved (imu_cal.gyro_bias)
+      // rather than zero.  Once only -- a re-initialization keeps what has
+      // been learned since, which is better than the saved value.
+      for (int i = 0; i < 3; i++) { bias_[i] = params_.gyro_bias0[i]; }
+      bias_seeded_ = true;
+    }
     // Tilt quaternion: R(q_tilt) a_n = z.
     float q_tilt[4] = {1.0f, 0.0f, 0.0f, 0.0f};
     const float c = a_n[2];  // a_n . z
@@ -870,6 +1150,7 @@ class ImuFusion {
     have_seq_ = false;
     sentinel_hold_ = params_.sentinel_hold_replies;
     last_reinit_reason_ = reason;
+    relearn_ms_ = 0;   // the host's assurance of stillness does not outlive a restart
   }
 
   FUSION_MAINLOOP void UpdateStatus() {
@@ -903,6 +1184,13 @@ class ImuFusion {
     s.arrival_unknown = counters_.arrival_unknown;
     s.phase_unc_us = static_cast<uint32_t>(
         std::abs(last_floor_) * 4 + (windows_done_ == 0 ? 500 : 0));
+#ifdef MOTEUS_TS_PROBE
+    s.ts_delay_min_us = ts_delay_min_us_;
+    s.ts_delay_mean_us = ts_delay_mean_us_;
+    s.ts_model_mean_us = ts_model_mean_us_;
+    s.ts_pairs = ts_pairs_;
+    s.ts_rejects = ts_rejects_;
+#endif
   }
 
   FUSION_MAINLOOP void UpdateReplyStatus() {
@@ -925,6 +1213,7 @@ class ImuFusion {
   bool converged_ = false;
   float q_[4] = {1.0f, 0.0f, 0.0f, 0.0f};
   float bias_[3] = {};
+  bool bias_seeded_ = false;
   float omega_c_[3] = {};
   float omega_prev_[3] = {};
   float corr_[3] = {};
@@ -950,6 +1239,7 @@ class ImuFusion {
   uint16_t win_len_ = 128;
   uint16_t windows_done_ = 0;
   int32_t last_floor_ = 0;
+  uint16_t ms_since_gyro_ = 0;
 
   // History ring.
   uint16_t hist_head_ = 0;
@@ -968,10 +1258,39 @@ class ImuFusion {
   uint16_t seen_resync_ = 0;
   uint16_t seen_running_ = 0;
   uint16_t seen_overrun_ = 0;
+#ifdef MOTEUS_TS_PROBE
+  // Transfer-delay probe state (EvaluateProbe).
+  uint16_t seen_probe_ = 0;
+  bool have_last_gyro_ = false;
+  uint16_t last_gyro_t_ = 0;
+  uint16_t last_gyro_seq_ = 0;
+  uint8_t last_gyro_cnt_ = 0;
+  bool ts_wait_gyro_ = false;
+  uint8_t ts_wait_cnt_ = 0;
+  uint32_t ts_wait_value_ = 0;
+  bool next_armed_ = false;
+  uint32_t next_chip_ = 0;
+  uint16_t next_seq_ = 0;
+  bool pair_valid_ = false;
+  uint32_t pair_chip_ = 0;
+  uint16_t pair_t_ = 0;
+  uint16_t pair_model_t_ = 0;
+  bool probe_valid_ = false;
+  uint32_t probe_chip_ = 0;
+  uint16_t probe_t_ = 0;
+  uint32_t ts_pairs_ = 0;
+  uint16_t ts_rejects_ = 0;
+  int32_t ts_delay_min_us_ = 0;
+  float ts_delay_mean_us_ = 0.0f;
+  float ts_model_mean_us_ = 0.0f;
+#endif
 
   float accel_raw_lp_[3] = {};
 
   // Stationary bias learning state.
+  float omega_lp_[3] = {};
+  bool stat_lp_reset_ = false;
+  uint16_t relearn_ms_ = 0;
   uint16_t stat_words_ = 0;
   uint8_t stat_over_ = 0;
   bool stat_active_ = false;

@@ -65,6 +65,10 @@ struct Sim {
   Sim() : storage(new FusionStorage()) {
     fusion.Attach(&storage->mailbox, &storage->control, &storage->history,
                   &status);
+    // These tests check the reply against the truth at the request
+    // itself; the production default compensates the sensor chain
+    // (FusionLatencyCompensation covers that).
+    fusion.params()->latency_comp_ticks = 0;
     q_true[0] = 1.0f; q_true[1] = q_true[2] = q_true[3] = 0.0f;
   }
 
@@ -81,6 +85,9 @@ struct Sim {
   double t_sample = 0.0;                    // true time of the last sample
   double dmin = 0.0;                        // constant transfer delay, ticks
   double jitter = 0.0;                      // uniform extra delay, ticks
+  uint32_t chip_epoch = 0x12345678;         // chip timestamp counter at sample 0
+  bool ts_first = false;                    // timestamp word before the slot's gyro word (the real chip)
+  double ms_acc = 0.0;                      // the main loop's millisecond poll, driven by Step()
   uint16_t seq = 0;
   int k = 0;
   bool drain_each = true;
@@ -138,6 +145,8 @@ struct Sim {
     g.t = Arrival();
     g.seq = seq;
     g.tag = kFusionTagGyro;
+    g.flags = static_cast<uint8_t>(k & 3);   // TAG_CNT
+    if (k % 32 == 0 && ts_first) { PushTimestamp(g); }
     if (!drop) { storage->mailbox.Push(g); }
 
     if (k % 8 == 0) {
@@ -153,19 +162,56 @@ struct Sim {
       }
       storage->mailbox.Push(a);
     }
-    if (k % 32 == 0) {
-      FusionWord ts;
-      ts.t = g.t;
-      ts.seq = seq;
-      ts.tag = kFusionTagTimestamp;
-      storage->mailbox.Push(ts);
-    }
+    if (k % 32 == 0 && !ts_first) { PushTimestamp(g); }
     if (drain_each) { fusion.Drain(16); }
+    ms_acc += 1000.0 / kFusionGyroOdrHz;
+    while (ms_acc >= 1.0) {
+      fusion.PollMillisecond();
+      ms_acc -= 1.0;
+    }
+  }
+
+  // Acquisition stops for `seconds`: time passes with no words at all,
+  // then the driver's restart re-initializes the fusion (resync_count).
+  void Outage(double seconds) {
+    for (int ms = 0; ms < static_cast<int>(seconds * 1000); ms++) { fusion.PollMillisecond(); }
+    t_sample += seconds * kFusionGyroOdrHz * T_true;
+    storage->control.resync_count.fetch_add(1);
+    fusion.Drain(16);
+  }
+
+  // The chip's timestamp counter at this slot's data-ready, 48 LSB per
+  // sample (DS Table 145).  The real chip writes it before the slot's
+  // gyro word (bench 2026-10-06): ts_first.
+  void PushTimestamp(const FusionWord& g) {
+    FusionWord ts;
+    ts.t = g.t;
+    ts.seq = seq;
+    ts.tag = kFusionTagTimestamp;
+    ts.flags = g.flags;
+    const uint32_t chip = chip_epoch + static_cast<uint32_t>(k) * kFusionChipTicksPerSample;
+    ts.v[0] = static_cast<int16_t>(chip & 0xffff);
+    ts.v[1] = static_cast<int16_t>(chip >> 16);
+    storage->mailbox.Push(ts);
   }
 
   void Run(double seconds) {
     const int n = static_cast<int>(seconds * kFusionGyroOdrHz);
     for (int i = 0; i < n; i++) { Step(); }
+  }
+
+  // The driver's live read of TIMESTAMP0-3 (the transfer-delay probe):
+  // the counter latched at true time t_latch (ticks from sample 0), the
+  // read seen complete kProbeLatchTicks later.  chip_error: a corrupted
+  // read (a byte rolling over mid-transfer reads 256 LSB high).
+  void Probe(double t_latch, int32_t chip_error = 0) {
+    const double lsb = t_latch * kFusionChipTicksPerSample / T_true;
+    storage->control.probe_chip.store(
+        chip_epoch + static_cast<uint32_t>(std::llround(lsb) + chip_error));
+    storage->control.probe_t.store(static_cast<uint16_t>(
+        static_cast<uint64_t>(std::llround(t_latch + ImuFusion::kProbeLatchTicks)) & 0xffff));
+    storage->control.probe_count.fetch_add(1);
+    fusion.Drain(FusionMailbox::kSize);   // like BeginFrame: everything queued
   }
 
   // Truth at an arbitrary true time (constant omega propagation from
@@ -475,8 +521,9 @@ BOOST_AUTO_TEST_CASE(FusionGyroRate) {
   sim.fusion.BeginFrame(0);
   BOOST_TEST(std::isnan(sim.fusion.RateAt(Stamp(sim.t_sample), 0)));
 
-  // At rest the stationary learner takes the bias out of the rate.
-  sim.Run(5.0);
+  // At rest the stationary learner takes the bias out of the rate
+  // (slowly: tau 10 s, no startup capture).
+  sim.Run(60.0);
   for (int i = 0; i < 3; i++) { sim.Request(sim.t_sample); }
   for (int axis = 0; axis < 3; axis++) {
     BOOST_TEST(std::abs(sim.fusion.RateAt(Stamp(sim.t_sample), axis)) < 0.002f);
@@ -567,25 +614,29 @@ BOOST_AUTO_TEST_CASE(FusionStationaryBiasLearnsVerticalAxis) {
   const float yaw_early = fm::Yaw(sim.fusion.q());
   sim.Run(0.5);
   BOOST_TEST(std::abs(fm::Yaw(sim.fusion.q()) - yaw_early) > 0.05f * M_PI / 180.0f);
-  // Startup capture: within 4 s at rest both biases are in, and the
-  // tilt transient the x bias caused is decaying (kp = 0.3: ~3 s).
+  // A cold start learns slowly on purpose (no startup capture since
+  // 2026-10-07: the robot may well be moving in its first seconds): at
+  // 4 s the vertical bias is only part way in.
   sim.Run(3.2);
-  BOOST_TEST(std::abs(sim.fusion.bias()[2] - sim.gyro_bias[2]) < 0.2f * sim.gyro_bias[2]);
-  BOOST_TEST(std::abs(sim.fusion.bias()[0] - sim.gyro_bias[0]) < 0.2f * sim.gyro_bias[0]);
-  // Heading is unobservable and holds whatever it acquired before the
-  // capture (~0.3 deg here), so judge tilt only.
+  BOOST_TEST(std::abs(sim.fusion.bias()[2] - sim.gyro_bias[2]) > 0.5f * sim.gyro_bias[2]);
+  BOOST_TEST(sim.fusion.stationary());
+  // The tilt-axis bias is learned by the accel innovation as well
+  // (kp/ki = 15 s) and by the stationary learner (10 s); its 1.7 deg tilt
+  // transient is mostly gone by 12 s.  Heading is unobservable and holds
+  // whatever it acquired, so judge tilt only.
+  sim.Run(8.0);
   {
     float up_est[3]; float up_true[3];
     fm::BodyUp(sim.fusion.q(), up_est); fm::BodyUp(sim.q_true, up_true);
-    BOOST_TEST(VecAngleDeg(up_est, up_true) < 0.5);
+    BOOST_TEST(VecAngleDeg(up_est, up_true) < 0.75);
   }
-  sim.Run(8.0);
+  sim.Run(32.0);
   {
     float up_est[3]; float up_true[3];
     fm::BodyUp(sim.fusion.q(), up_est); fm::BodyUp(sim.q_true, up_true);
     BOOST_TEST(VecAngleDeg(up_est, up_true) < 0.1);
   }
-  sim.Run(32.0);
+  BOOST_TEST(std::abs(sim.fusion.bias()[0] - sim.gyro_bias[0]) < 0.2f * sim.gyro_bias[0]);
   BOOST_TEST(sim.fusion.stationary());
   BOOST_TEST(std::abs(sim.fusion.bias()[2] - sim.gyro_bias[2]) < 0.2f * sim.gyro_bias[2]);
   const float yaw_a = fm::Yaw(sim.fusion.q());
@@ -641,7 +692,7 @@ BOOST_AUTO_TEST_CASE(FusionFreefallDropsCorrection) {
   // every gyro word; in free fall there is no gravity reference, so the
   // last correction must not keep rotating the estimate.
   Sim sim;
-  sim.Run(0.2);  // initialized, still on the fast startup gain
+  sim.Run(0.2);  // initialized
   // The body tilts 30 deg between two accel words: a large innovation.
   sim.SetTilt(1.0f, 0.0f, 0.0f, 30.0f * M_PI / 180.0f);
   for (int i = 0; i < 8; i++) { sim.Step(); }
@@ -689,3 +740,344 @@ BOOST_AUTO_TEST_CASE(FusionNonFiniteCalibrationDoesNotPoisonState) {
     BOOST_TEST(sim.ReplyErrorDeg(sim.t_sample) < 0.05);
   }
 }
+
+BOOST_AUTO_TEST_CASE(FusionStaleAfterTickWrap) {
+  // A stopped acquisition: replies must stay sentinels even when the
+  // 16-bit tick stamps have wrapped back to near the newest sample's
+  // (every 262.144 ms), where the tick-based extrapolation limit alone
+  // would accept the stale history again.
+  Sim sim;
+  sim.Run(3.0);
+  sim.omega[1] = 1.0f;
+  sim.Run(0.05);
+  for (int i = 0; i < 4; i++) { sim.Request(sim.t_sample); }
+
+  int polled_ms = 0;
+  auto pause_to = [&](double ms) {
+    for (; polled_ms < static_cast<int>(ms); polled_ms++) {
+      sim.fusion.PollMillisecond();
+    }
+  };
+  pause_to(5.0);
+  BOOST_TEST(!Quat48IsSentinel(sim.Request(sim.t_sample + 5.0 * 250.0)));
+  for (const double pause_ms : {262.144, 524.288}) {
+    pause_to(pause_ms);
+    BOOST_TEST(Quat48IsSentinel(sim.Request(sim.t_sample + pause_ms * 250.0)));
+    BOOST_TEST(std::isnan(sim.fusion.RateAt(
+        static_cast<uint16_t>(static_cast<uint64_t>(
+            std::llround(sim.t_sample + pause_ms * 250.0)) & 0xffff), 1)));
+  }
+
+  // Acquisition resumes: valid again.
+  sim.Run(0.05);
+  for (int i = 0; i < 4; i++) { sim.Request(sim.t_sample); }
+  BOOST_TEST(sim.ReplyErrorDeg(sim.t_sample) < 0.05);
+}
+
+BOOST_AUTO_TEST_CASE(FusionSteadyYawIsNotLearnedAsBias) {
+  // A 6-axis IMU cannot tell a steady yaw from a bias: a robot turning at
+  // a constant 2 dps for a minute must keep reading 2 dps (the magnitude
+  // gate), not learn it away (review 2026-10-07: a steadiness gate did).
+  Sim sim;
+  sim.gyro_bias[2] = 0.005f;
+  sim.Run(60.0);                                  // the slow learner has it
+  // (the heading drifted ~3 deg meanwhile -- bias x tau, the price of
+  // learning from zero; the robot boots from the persisted bias instead)
+  float truth0[4];
+  sim.TruthAt(sim.t_sample, truth0);
+  const float yaw0 = fm::Yaw(sim.fusion.q()) - fm::Yaw(truth0);
+  sim.omega[2] = 2.0f * static_cast<float>(M_PI) / 180.0f;
+  sim.Run(60.0);
+  BOOST_TEST(std::abs(sim.fusion.bias()[2] - 0.005f) < 0.001f);
+  BOOST_TEST(std::abs(sim.fusion.omega()[2] - sim.omega[2]) < 0.001f);
+  BOOST_TEST(!sim.fusion.stationary());
+  float truth[4];
+  sim.TruthAt(sim.t_sample, truth);
+  const float yaw1 = fm::Yaw(sim.fusion.q()) - fm::Yaw(truth);
+  BOOST_TEST(std::abs(std::remainder(yaw1 - yaw0, 2.0f * static_cast<float>(M_PI))) < 1.0f * M_PI / 180.0f);
+}
+
+BOOST_AUTO_TEST_CASE(FusionRelearnClearsAnAbsorbedRotation) {
+  // A hanging robot's rope twist ramps the yaw rate slowly enough for the
+  // learner to track it as bias; when a hand stops it the corrected rate
+  // jumps past the gate and the learner is locked out for good (8 of 48
+  // robot boards, 2026-10-07).  Only a host-requested relearn, issued
+  // when the robot is known still, clears it.
+  Sim sim;
+  sim.gyro_bias[2] = 0.005f;
+  sim.Run(5.0);
+  const int n = 60 * 960;
+  for (int k = 0; k < n; k++) {
+    sim.omega[2] = 2.0f * static_cast<float>(M_PI) / 180.0f * static_cast<float>(k) / n;
+    sim.Step();
+  }
+  sim.Run(10.0);
+  BOOST_TEST(std::abs(sim.fusion.bias()[2] - 0.005f) > 0.02f);   // the twist was absorbed
+  sim.omega[2] = 0.0f;
+  sim.Run(60.0);
+  BOOST_TEST(std::abs(sim.fusion.bias()[2] - 0.005f) > 0.02f);   // and stays: locked out
+  BOOST_TEST(!sim.fusion.stationary());
+  sim.fusion.Relearn(3000);
+  sim.Run(5.0);
+  BOOST_TEST(std::abs(sim.fusion.bias()[2] - 0.005f) < 0.001f);
+  BOOST_TEST(std::abs(sim.fusion.omega()[2]) < 0.001f);
+  BOOST_TEST(sim.fusion.stationary());
+}
+
+BOOST_AUTO_TEST_CASE(FusionRelearnWorksPastTheLearnableRange) {
+  // Opposite signs: a true -5 mrad/s bias and a learned +50 (the clamp)
+  // leave a -55 mrad/s residual, beyond bias_max; the relearn gate is
+  // steadiness only, so it still recovers (review 2026-10-07).
+  Sim sim;
+  sim.gyro_bias[2] = -0.005f;
+  sim.Run(5.0);
+  const int n = 60 * 960;
+  for (int k = 0; k < n; k++) {
+    sim.omega[2] = 5.0f * static_cast<float>(M_PI) / 180.0f * static_cast<float>(k) / n;
+    sim.Step();
+  }
+  sim.omega[2] = 0.0f;
+  sim.Run(60.0);
+  BOOST_TEST(sim.fusion.bias()[2] > 0.02f);                      // locked out, wrong sign
+  sim.fusion.Relearn(3000);
+  sim.Run(5.0);
+  BOOST_TEST(std::abs(sim.fusion.bias()[2] + 0.005f) < 0.001f);
+  BOOST_TEST(std::abs(sim.fusion.omega()[2]) < 0.001f);
+  BOOST_TEST(sim.fusion.stationary());
+}
+
+BOOST_AUTO_TEST_CASE(FusionRelearnIgnoresAMiscalibratedAccelerometer) {
+  // A board whose accelerometer reads 2.5% off g never passes the
+  // stationary gate (robot board can3/34, 2026-10-07): with the host
+  // vouching for stillness the relearn still runs.
+  Sim sim;
+  sim.gyro_bias[2] = 0.008f;
+  sim.accel_bias[2] = -0.025f;                   // along gravity: |a| = 0.975 g
+  sim.Run(3.0);
+  for (int i = 0; i < 3; i++) { sim.fusion.params()->accel_bias[i] = 0.0f; }
+  sim.Run(30.0);
+  BOOST_TEST(!sim.fusion.stationary());          // gated out
+  sim.fusion.Relearn(3000);
+  sim.Run(5.0);
+  BOOST_TEST(std::abs(sim.fusion.bias()[2] - 0.008f) < 0.001f);
+  BOOST_TEST(std::abs(sim.fusion.omega()[2]) < 0.001f);
+}
+
+BOOST_AUTO_TEST_CASE(FusionRelearnDoesNotOutliveAnOutage) {
+  // The host's assurance of stillness is for the request's wall time: a
+  // relearn in progress when acquisition stops is cancelled (stale words,
+  // and the restart's re-initialization), so a turn that begins after the
+  // restart is not learned away (review 2026-10-07).
+  Sim sim;
+  sim.gyro_bias[2] = 0.005f;
+  sim.Run(60.0);
+  sim.fusion.Relearn(3000);
+  sim.Run(0.5);                                   // qualifying, nothing learnt yet
+  sim.Outage(5.0);
+  sim.omega[2] = 2.0f * static_cast<float>(M_PI) / 180.0f;
+  sim.Run(20.0);                                  // re-init, converge, turn
+  BOOST_TEST(std::abs(sim.fusion.bias()[2] - 0.005f) < 0.001f);
+  BOOST_TEST(std::abs(sim.fusion.omega()[2] - sim.omega[2]) < 0.001f);
+}
+
+BOOST_AUTO_TEST_CASE(FusionBootWhileTwistingIsNotAbsorbed) {
+  // The joint power switch is on the robot: the boards boot while the
+  // hanging body is still twisting from the touch.  Qualified at rest for
+  // a moment, then a yaw rate that ramps to 1.5 dps over 1.5 s, holds,
+  // and ramps back.  The old startup capture (0.1 s) tracked that ramp as
+  // bias and left the stopped robot reading -1.5 dps for good; the slow
+  // learner barely moves and the gate shuts it off.  The board starts
+  // from its persisted bias, as on the robot.
+  Sim sim;
+  sim.gyro_bias[2] = 0.005f;
+  sim.fusion.params()->gyro_bias0[2] = 0.005f;
+  sim.Run(1.5);
+  const float peak = 1.5f * static_cast<float>(M_PI) / 180.0f;
+  const int ramp = static_cast<int>(1.5 * 960);
+  for (int k = 0; k < ramp; k++) {
+    sim.omega[2] = peak * static_cast<float>(k) / ramp;
+    sim.Step();
+  }
+  sim.omega[2] = peak;
+  sim.Run(1.0);
+  for (int k = ramp; k > 0; k--) {
+    sim.omega[2] = peak * static_cast<float>(k) / ramp;
+    sim.Step();
+  }
+  sim.omega[2] = 0.0f;
+  BOOST_TEST(std::abs(sim.fusion.bias()[2] - 0.005f) < 0.002f);   // < 0.12 dps taken in
+  sim.Run(30.0);
+  BOOST_TEST(std::abs(sim.fusion.bias()[2] - 0.005f) < 0.0005f);
+  BOOST_TEST(std::abs(sim.fusion.omega()[2]) < 0.0005f);
+  BOOST_TEST(sim.fusion.stationary());
+}
+
+BOOST_AUTO_TEST_CASE(FusionPersistedBiasSeedsTheLearner) {
+  // The host saves each board's learned bias (imu_cal.gyro_bias); a cold
+  // start begins from it, so the corrected rate and the tilt are right
+  // from the first word instead of after a 1.7 deg, 15 s transient.
+  Sim sim;
+  sim.gyro_bias[0] = 0.5f * M_PI / 180.0f;
+  sim.gyro_bias[1] = -0.4f * M_PI / 180.0f;
+  sim.gyro_bias[2] = 0.3f * M_PI / 180.0f;
+  for (int i = 0; i < 3; i++) { sim.fusion.params()->gyro_bias0[i] = sim.gyro_bias[i]; }
+  sim.SetTilt(1.0f, 0.0f, 0.0f, 10.0f * M_PI / 180.0f);
+  sim.Run(0.3);
+  for (int i = 0; i < 3; i++) {
+    BOOST_TEST(std::abs(sim.fusion.bias()[i] - sim.gyro_bias[i]) < 1.0e-6f);
+    BOOST_TEST(std::abs(sim.fusion.omega()[i]) < 0.0005f);
+  }
+  sim.Run(2.0);
+  BOOST_TEST(AngleDeg(sim.fusion.q(), sim.q_true) < 0.1);
+  // Seeded once: a restart after an outage keeps the bias learned since
+  // (here: the same value) even when the parameter has changed.
+  sim.fusion.params()->gyro_bias0[2] = 0.0f;
+  sim.Outage(2.0);
+  sim.Run(3.0);
+  BOOST_TEST(std::abs(sim.fusion.bias()[2] - sim.gyro_bias[2]) < 0.0005f);
+  // Reset() (a new attach) does seed again.
+  sim.fusion.Reset();
+  sim.Run(0.3);
+  BOOST_TEST(std::abs(sim.fusion.bias()[2]) < 1.0e-6f);
+  BOOST_TEST(std::abs(sim.fusion.bias()[0] - sim.gyro_bias[0]) < 1.0e-6f);
+}
+
+BOOST_AUTO_TEST_CASE(FusionRelearnDurationIsLearningTime) {
+  // `relearn 0.5` means half a second of learning after the one-second
+  // qualification (the first version accepted it and learnt nothing).
+  Sim sim;
+  sim.gyro_bias[2] = 0.005f;
+  sim.Run(60.0);
+  sim.gyro_bias[2] = 0.035f;                     // a 30 mrad/s step: past the gate, locked out
+  sim.Run(10.0);
+  BOOST_TEST(std::abs(sim.fusion.bias()[2] - 0.005f) < 0.001f);
+  BOOST_TEST(!sim.fusion.stationary());
+  sim.fusion.Relearn(500);
+  sim.Run(2.0);
+  BOOST_TEST(std::abs(sim.fusion.bias()[2] - 0.035f) < 0.001f);
+  BOOST_TEST(std::abs(sim.fusion.omega()[2]) < 0.001f);
+}
+
+BOOST_AUTO_TEST_CASE(FusionRelearnRightAfterMotion) {
+  // A relearn requested the moment the robot stops (a hand sets it down,
+  // then the console command) must still get its learning time: the
+  // steadiness average's memory of the rotation decays over ~1.2 s,
+  // which used to count as unsteady and outlast a short deadline.
+  Sim sim;
+  sim.gyro_bias[2] = 0.005f;
+  sim.Run(60.0);
+  sim.gyro_bias[2] = 0.035f;                     // past the gate, locked out
+  sim.Run(10.0);
+  sim.omega[2] = 2.0f;                           // a 2 rad/s turn
+  sim.Run(2.0);
+  sim.omega[2] = 0.0f;                           // stops, and at once:
+  sim.fusion.Relearn(500);
+  sim.Run(2.0);
+  BOOST_TEST(std::abs(sim.fusion.bias()[2] - 0.035f) < 0.001f);
+  BOOST_TEST(std::abs(sim.fusion.omega()[2]) < 0.001f);
+}
+
+BOOST_AUTO_TEST_CASE(FusionLatencyCompensation) {
+  // The production default evaluates the reply latency_comp_ticks after
+  // the request stamp (gyro extrapolation): for a constant rotation that
+  // is the orientation at request + comp, exactly.
+  const ImuFusion::Params defaults;
+  BOOST_TEST(defaults.latency_comp_ticks == 500);   // 2.0 ms, the 2026-10-07 setting
+  Sim sim;
+  sim.fusion.params()->latency_comp_ticks = defaults.latency_comp_ticks;
+  sim.omega[1] = 2.0f;
+  sim.Run(3.0);
+  for (int i = 0; i < 4; i++) { sim.Request(sim.t_sample); }
+  const auto words = sim.Request(sim.t_sample);
+  BOOST_TEST_REQUIRE(!Quat48IsSentinel(words));
+  float q[4];
+  DecodeQuat48(words, q);
+  float at_request[4], at_comp[4];
+  sim.TruthAt(sim.t_sample, at_request);
+  sim.TruthAt(sim.t_sample + defaults.latency_comp_ticks, at_comp);
+  BOOST_TEST(AngleDeg(q, at_comp) < 0.02);
+  // 2 rad/s x 2 ms = 0.23 deg ahead of the uncompensated truth
+  BOOST_TEST(AngleDeg(q, at_request) > 0.2);
+}
+
+#ifdef MOTEUS_TS_PROBE
+BOOST_AUTO_TEST_CASE(FusionChipTimestampProbe) {
+  // The transfer-delay probe recovers the FIFO write -> arrival delay of
+  // the gyro word after a timestamp word from that word and a live
+  // counter read (two clocks, one tie point), to the counter's 21.75 us
+  // resolution.
+  for (const bool ts_first : {false, true}) {
+  for (const double dmin : {100.0, 250.0}) {
+    Sim sim;
+    sim.ts_first = ts_first;
+    sim.dmin = dmin;
+    sim.Run(3.0);   // 2880 samples: the last one carries a timestamp word
+    sim.Step();
+    sim.Step();     // the measured word: the gyro two slots on
+    const auto& s = sim.status;
+    BOOST_TEST(s.ts_pairs == 0);   // no live read yet
+    sim.Probe(sim.t_sample + dmin + 60.0);
+    BOOST_TEST(s.ts_pairs == 1);
+    BOOST_TEST(s.ts_rejects == 0);
+    BOOST_TEST(std::abs(s.ts_delay_mean_us - dmin * kFusionTickUs) < 40.0);
+    BOOST_TEST(std::abs(s.ts_delay_mean_us - s.ts_delay_min_us) < 1.0);
+    // Constant transfer, no jitter: the arrival floor IS the arrival, so
+    // the fusion clock's offset from the chip equals the transfer.
+    BOOST_TEST(std::abs(s.ts_model_mean_us - dmin * kFusionTickUs) < 40.0);
+
+    // A probe seen before its words are processed waits for them.
+    sim.drain_each = false;
+    sim.Run(32.0 / kFusionGyroOdrHz);   // through the next timestamp word and its measured slot, undrained
+    sim.Probe(sim.t_sample + dmin + 60.0);   // Drain: probe first, then the words
+    BOOST_TEST(s.ts_pairs == 2);
+    BOOST_TEST(s.ts_rejects == 0);
+    BOOST_TEST(std::abs(s.ts_delay_mean_us - dmin * kFusionTickUs) < 40.0);
+    BOOST_TEST(std::abs(s.ts_delay_mean_us - s.ts_delay_min_us) < 40.0);
+
+    // A live read corrupted by a byte rollover (256 LSB high) is rejected,
+    // not reported as a 5.6 ms transfer.
+    sim.drain_each = true;
+    sim.Run(32.0 / kFusionGyroOdrHz);   // the next timestamp word and its measured slot
+    sim.Probe(sim.t_sample + dmin + 60.0, 256);
+    BOOST_TEST(s.ts_pairs == 2);
+    BOOST_TEST(s.ts_rejects == 1);
+    BOOST_TEST(std::abs(s.ts_delay_mean_us - s.ts_delay_min_us) < 40.0);
+  }
+  }
+}
+
+BOOST_AUTO_TEST_CASE(FusionChipTimestampProbeSurvivesAStall) {
+  // The main loop away for two probe cycles (a flash write, a long
+  // console command): the words of both cycles are queued behind the
+  // latest live read.  The first cycle's pair is stale and rejected,
+  // the read must survive it for its own pair, and the cycles after
+  // that pair as usual (the first version spent the read on the stale
+  // pair and then rejected every cycle, one read ahead, for good).
+  Sim sim;
+  sim.dmin = 100.0;
+  sim.Run(3.0);
+  sim.Step();
+  sim.Step();
+  sim.Probe(sim.t_sample + sim.dmin + 60.0);
+  const auto& s = sim.status;
+  BOOST_TEST(s.ts_pairs == 1);
+  BOOST_TEST(s.ts_rejects == 0);
+
+  sim.drain_each = false;
+  // Two more timestamp words, undrained; the last step is the second
+  // one's measured slot.
+  for (int i = 0; i < 64; i++) { sim.Step(); }
+  sim.Probe(sim.t_sample + sim.dmin + 60.0);   // the latest read, then the backlog
+  BOOST_TEST(s.ts_pairs == 2);
+  BOOST_TEST(s.ts_rejects == 1);
+
+  // The cycles after it, in the real order (the live read lands before
+  // its pair's word is drained), pair as usual.
+  for (int cycle = 0; cycle < 3; cycle++) {
+    for (int i = 0; i < 32; i++) { sim.Step(); }
+    sim.Probe(sim.t_sample + sim.dmin + 60.0);
+  }
+  BOOST_TEST(s.ts_pairs == 5);
+  BOOST_TEST(s.ts_rejects == 1);
+}
+#endif  // MOTEUS_TS_PROBE

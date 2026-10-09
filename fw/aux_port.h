@@ -396,6 +396,10 @@ class AuxPort {
     if (ic_pz_) {
       ic_pz_->PollMillisecond();
     }
+
+    if (fusion_storage_) {
+      fusion_storage_->fusion.PollMillisecond();
+    }
   }
 
   void Poll() {
@@ -676,6 +680,11 @@ class AuxPort {
   }
 
   // aux2 fusion gains <kp> <ki> | latency <us> | halt <0|1> | drop <n> | stall <ms>
+  //            | reg <hex reg> <hex value>   (one chip register write, e.g. `reg 15 34`:
+  //                                           CTRL6 gyro LPF1 310 Hz; 24 = the 149 Hz default)
+  //            | relearn [s]                 (gyro-bias relearn: s seconds of learning after the
+  //                                           1 s qualification, 0.5-60, default 3; only while
+  //                                           the robot is known to be still)
   // (accelerometer calibration is the persistent `imu_cal` config group)
   void HandleFusionCommand(
       mjlib::base::Tokenizer& tokenizer,
@@ -712,6 +721,20 @@ class AuxPort {
         return;
       }
       fusion_driver_->set_drop(std::strtol(value_str.data(), nullptr, 0));
+    } else if (sub == "reg") {
+      const auto reg_str = tokenizer.next();
+      const auto value_str = tokenizer.next();
+      if (reg_str.empty() || value_str.empty() || !fusion_driver_) {
+        WriteMessage(response, "ERR missing reg/value or no fusion\r\n");
+        return;
+      }
+      const auto reg = ParseHexByte(reg_str.data());
+      const auto value = ParseHexByte(value_str.data());
+      if (reg < 0 || value < 0) {
+        WriteMessage(response, "ERR invalid hex\r\n");
+        return;
+      }
+      fusion_driver_->set_write(static_cast<uint8_t>(reg), static_cast<uint8_t>(value));
     } else if (sub == "stall") {
       const auto value_str = tokenizer.next();
       if (value_str.empty()) {
@@ -719,6 +742,22 @@ class AuxPort {
         return;
       }
       fusion_stall_ms_ = std::strtol(value_str.data(), nullptr, 0);
+    } else if (sub == "relearn") {
+      if (!fusion_storage_) {
+        WriteMessage(response, "ERR no fusion\r\n");
+        return;
+      }
+      const auto s_str = tokenizer.next();
+      float seconds = 3.0f;
+      if (!s_str.empty()) {
+        const auto value = Strtof(s_str);
+        if (!value || !(*value >= 0.5f && *value <= 60.0f)) {
+          WriteMessage(response, "ERR seconds 0.5-60\r\n");
+          return;
+        }
+        seconds = *value;
+      }
+      fusion_storage_->fusion.Relearn(static_cast<uint16_t>(seconds * 1000.0f));
     } else {
       WriteMessage(response, "ERR unknown fusion command\r\n");
       return;
@@ -1814,6 +1853,7 @@ class AuxPort {
     for (int i = 0; i < 3; i++) {
       fusion_params_.accel_bias[i] = imu_cal_->bias(i);
       fusion_params_.accel_scale[i] = imu_cal_->scale(i);
+      fusion_params_.gyro_bias0[i] = imu_cal_->gyro_bias_rad_s(i);
     }
   }
   uint32_t fusion_stall_ms_ = 0;

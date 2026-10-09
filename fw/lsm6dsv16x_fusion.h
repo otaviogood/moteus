@@ -94,6 +94,19 @@ class Lsm6dsv16xFusionDriver {
         if (remaining_words_ > 0) {
           return Read(kRegFifoDataOutTag, 7);
         }
+        if (write_pending_) {
+          // Console `aux2 fusion reg`: one register write between bursts.
+          write_in_flight_ = true;
+          return Write(write_reg_, write_value_);
+        }
+#ifdef MOTEUS_TS_PROBE
+        if (probe_pending_) {
+          // Once the burst is drained: the live timestamp counter, for
+          // the fusion's transfer-delay probe (ImuFusion::EvaluateProbe).
+          probe_in_flight_ = true;
+          return Read(kRegTimestamp0, 4);
+        }
+#endif
         return Read(kRegFifoStatus1, 2);
       }
       case State::kRetryWait: {
@@ -116,6 +129,10 @@ class Lsm6dsv16xFusionDriver {
     if (!ok) {
       if (status_) { status_->i2c_errors++; }
       consecutive_errors_++;
+      write_in_flight_ = false;   // a failed console write is retried
+#ifdef MOTEUS_TS_PROBE
+      probe_in_flight_ = false;   // a failed probe read is simply retried
+#endif
       if (state_ == State::kRunning && remaining_words_ == 0 &&
           consecutive_errors_ < kErrorsBeforeResync) {
         // A failed FIFO status read has not consumed a sample, so it
@@ -180,6 +197,24 @@ class Lsm6dsv16xFusionDriver {
         break;
       }
       case State::kRunning: {
+        if (write_in_flight_) {
+          write_in_flight_ = false;
+          write_pending_ = false;
+          break;
+        }
+#ifdef MOTEUS_TS_PROBE
+        if (probe_in_flight_) {
+          probe_in_flight_ = false;
+          probe_pending_ = false;
+          const uint32_t chip = static_cast<uint32_t>(buf_[0]) |
+              (static_cast<uint32_t>(buf_[1]) << 8) |
+              (static_cast<uint32_t>(buf_[2]) << 16) |
+              (static_cast<uint32_t>(buf_[3]) << 24);
+          storage_->control.probe_chip.store(chip);
+          storage_->control.probe_t.store(static_cast<uint16_t>(TIM3->CNT));
+          storage_->control.probe_count.fetch_add(1);
+        } else
+#endif
         if (remaining_words_ > 0) {
           ParseWord();
           remaining_words_--;
@@ -205,6 +240,14 @@ class Lsm6dsv16xFusionDriver {
   void set_halt(bool halt) { halt_ = halt; }
   bool halt() const { return halt_; }
   void set_drop(uint16_t words) { drop_ = words; }
+  // Bench/robot experiments: write one chip register while running (e.g.
+  // CTRL6 0x15 for the gyro LPF1 bandwidth; the init sequence restores
+  // the configured value on the next re-init or power cycle).
+  void set_write(uint8_t reg, uint8_t value) {
+    write_reg_ = reg;
+    write_value_ = value;
+    write_pending_ = true;
+  }
 
  private:
   struct ConfigStep {
@@ -225,6 +268,7 @@ class Lsm6dsv16xFusionDriver {
   static constexpr uint8_t kRegCtrl8 = 0x17;
   static constexpr uint8_t kRegCtrl9 = 0x18;
   static constexpr uint8_t kRegFifoStatus1 = 0x1B;
+  static constexpr uint8_t kRegTimestamp0 = 0x40;
   static constexpr uint8_t kRegInternalFreqFine = 0x4F;
   static constexpr uint8_t kRegFunctionsEnable = 0x50;
   static constexpr uint8_t kRegFifoDataOutTag = 0x78;
@@ -243,7 +287,12 @@ class Lsm6dsv16xFusionDriver {
     {kRegCtrl3, 0x44},            // BDU, IF_INC
     {kRegCtrl1, 0x06},            // accel 120 Hz, high performance
     {kRegCtrl2, 0x09},            // gyro 960 Hz, high performance
-    {kRegCtrl6, 0x24},            // +-2000 dps, LPF1 149 Hz
+    // Gyro LPF1: the 310 Hz combined setting (011).  MEASURED 2026-10-07
+    // on the robot: the 149 Hz setting (010, 0x24) cost 1.6 ms of
+    // orientation and rate latency vs LPF1 off, 310 Hz 1.2 ms less; the
+    // noise cost is taken for the latency (ImuFusion::Params
+    // latency_comp_ticks compensates what is left of the orientation).
+    {kRegCtrl6, 0x34},            // +-2000 dps, LPF1 310 Hz
     {kRegCtrl7, 0x01},            // LPF1_G_EN
     {kRegCtrl8, 0x01},            // +-4 g, LPF2 at ODR/4
     {kRegCtrl9, 0x08},            // LPF2_XL_EN
@@ -303,6 +352,9 @@ class Lsm6dsv16xFusionDriver {
     word.v[0] = static_cast<int16_t>(buf_[1] | (buf_[2] << 8));
     word.v[1] = static_cast<int16_t>(buf_[3] | (buf_[4] << 8));
     word.v[2] = static_cast<int16_t>(buf_[5] | (buf_[6] << 8));
+#ifdef MOTEUS_TS_PROBE
+    if (word.tag == kFusionTagTimestamp) { probe_pending_ = true; }
+#endif
     if (word.tag == kFusionTagGyro) {
       // Counted before the drop decision so every loss is visible.
       gyro_seq_++;
@@ -336,6 +388,16 @@ class Lsm6dsv16xFusionDriver {
   uint16_t drop_ = 0;
   uint8_t consecutive_errors_ = 0;
   bool halt_ = false;
+  bool write_pending_ = false;
+  bool write_in_flight_ = false;
+  uint8_t write_reg_ = 0;
+  uint8_t write_value_ = 0;
+#ifdef MOTEUS_TS_PROBE
+  // Transfer-delay probe: one extra 4-byte read per timestamp word
+  // (every 32 slots, 30/s), after the burst it came in has drained.
+  bool probe_pending_ = false;
+  bool probe_in_flight_ = false;
+#endif
   uint8_t tx_ = 0;
   uint8_t buf_[8] = {};
 };

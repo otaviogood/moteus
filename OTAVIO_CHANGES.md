@@ -252,6 +252,15 @@ Measurements and reasoning: `docs/latency.md`.
   (upstream `0x0070000`), so an image that would overlap the two
   persistent-config pages fails to link instead of erasing the calibration.
   Always check the margin before flashing.
+- **Runtime trim** (`fw/moteus_assert.cc`, 2026-10-08).  Two pieces of the
+  C/C++ runtime that could only ever halt the board are replaced with direct
+  halts through `mbed_assert_internal`: newlib's `__assert_func` (its stock
+  version reported with `fiprintf`, linking a second printf engine that
+  nothing else used) and libstdc++'s `std::__throw_*` helpers (reached from
+  `std::string_view::substr` bounds checks; with `-fno-exceptions` they could
+  only terminate, yet kept `__cxa_throw`, the personality routine and the ARM
+  unwinder linked).  Frees about 17 kB of flash with no change in behaviour;
+  the `MOTEUS_TS_PROBE` bench build fits again.
 - **Build config.**
   - `fw/BUILD` adds the new headers, sources and tests, plus a dependency on
     `mjlib/multiplex:format`.

@@ -571,6 +571,19 @@ struct ImuFusionStatus {
   uint32_t sentinel_replies = 0;
   uint32_t valid_replies = 0;
   uint32_t phase_unc_us = 0;
+#ifdef MOTEUS_TS_PROBE
+  // Transfer-delay probe (fw/imu_fusion.h EvaluateProbe, bench builds),
+  // for the gyro word two slots after each timestamp word (a slot with
+  // only a gyro word, clear of the probe's own read): ts_delay = its arrival stamp - its FIFO write (min
+  // since the fusion was attached, mean a 16-pair EMA); ts_model = its
+  // history stamp - its FIFO write (the fusion clock's offset from the
+  // chip's data-ready, 16-pair EMA).
+  int32_t ts_delay_min_us = 0;
+  float ts_delay_mean_us = 0.0f;
+  float ts_model_mean_us = 0.0f;
+  uint32_t ts_pairs = 0;
+  uint16_t ts_rejects = 0;
+#endif
 
   template <typename Archive>
   void Serialize(Archive* a) {
@@ -604,6 +617,13 @@ struct ImuFusionStatus {
     a->Visit(MJ_NVP(sentinel_replies));
     a->Visit(MJ_NVP(valid_replies));
     a->Visit(MJ_NVP(phase_unc_us));
+#ifdef MOTEUS_TS_PROBE
+    a->Visit(MJ_NVP(ts_delay_min_us));
+    a->Visit(MJ_NVP(ts_delay_mean_us));
+    a->Visit(MJ_NVP(ts_model_mean_us));
+    a->Visit(MJ_NVP(ts_pairs));
+    a->Visit(MJ_NVP(ts_rejects));
+#endif
   }
 };
 

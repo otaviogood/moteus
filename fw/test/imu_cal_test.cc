@@ -14,6 +14,7 @@
 
 #include "fw/imu_cal.h"
 
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -35,14 +36,25 @@ BOOST_AUTO_TEST_CASE(ImuCalDefaultsAreIdentity) {
   }
 }
 
-BOOST_AUTO_TEST_CASE(ImuCalSerializesBothArrays) {
-  // The config keys are imu_cal.accel_bias.0..2 and
-  // imu_cal.accel_scale.0..2; the robot updater's expected-added list
-  // depends on these names.
+BOOST_AUTO_TEST_CASE(ImuCalSerializesAllArrays) {
+  // The config keys are imu_cal.accel_bias.0..2, imu_cal.accel_scale.0..2
+  // and imu_cal.gyro_bias.0..2; the robot updater's expected-added list
+  // and the host's bias save depend on these names.
   moteus::ImuCalConfig cal;
   NameCollector c;
   cal.Serialize(&c);
-  BOOST_TEST(c.names.size() == 2);
+  BOOST_TEST(c.names.size() == 3);
   BOOST_TEST(c.names[0] == "accel_bias");
   BOOST_TEST(c.names[1] == "accel_scale");
+  BOOST_TEST(c.names[2] == "gyro_bias");
+}
+
+BOOST_AUTO_TEST_CASE(ImuCalGyroBiasGuard) {
+  moteus::ImuCalConfig cal;
+  cal.gyro_bias[0] = std::numeric_limits<float>::quiet_NaN();
+  cal.gyro_bias[1] = 0.1f;        // past bias_max: not a gyro bias
+  cal.gyro_bias[2] = -0.0043f;
+  BOOST_TEST(cal.gyro_bias_rad_s(0) == 0.0f);
+  BOOST_TEST(cal.gyro_bias_rad_s(1) == 0.0f);
+  BOOST_TEST(cal.gyro_bias_rad_s(2) == -0.0043f);
 }

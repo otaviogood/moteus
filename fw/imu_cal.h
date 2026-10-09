@@ -33,6 +33,13 @@ namespace moteus {
 struct ImuCalConfig {
   std::array<float, 3> accel_bias = {0.0f, 0.0f, 0.0f};   // g
   std::array<float, 3> accel_scale = {1.0f, 1.0f, 1.0f};  // unitless
+  // The gyro bias the fusion starts from at power-up (rad/s, body axes):
+  // the last value the board learned while the robot was known to be
+  // still, saved by the host (orin/calib/imu_bias_check.py --save).  Not a
+  // calibration constant -- it drifts with temperature -- but a starting
+  // point good to a few mrad/s, so a board needs no fast learning in its
+  // first seconds (when the robot may well be moving).
+  std::array<float, 3> gyro_bias = {0.0f, 0.0f, 0.0f};    // rad/s
 
   float bias(int axis) const {
     const float value = accel_bias[axis];
@@ -43,11 +50,16 @@ struct ImuCalConfig {
     const float value = accel_scale[axis];
     return (value > 0.5f && value < 2.0f) ? value : 1.0f;
   }
+  float gyro_bias_rad_s(int axis) const {
+    const float value = gyro_bias[axis];
+    return (std::isfinite(value) && std::abs(value) <= 0.05f) ? value : 0.0f;
+  }
 
   template <typename Archive>
   void Serialize(Archive* a) {
     a->Visit(MJ_NVP(accel_bias));
     a->Visit(MJ_NVP(accel_scale));
+    a->Visit(MJ_NVP(gyro_bias));
   }
 };
 

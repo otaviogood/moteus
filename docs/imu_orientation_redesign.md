@@ -363,7 +363,7 @@ Fusion mode (`type = kLsm6dsv16xFusion`):
 | CTRL3 (0x12) | 0x44 | BDU = 1, IF_INC = 1 (§9.16) |
 | CTRL1 (0x10) | 0x06 | accel ODR 120 Hz, high-performance mode (Table 52) |
 | CTRL2 (0x11) | 0x09 | gyro ODR 960 Hz, high-performance mode (Table 55) |
-| CTRL6 (0x15) | 0x24 | FS_G = ±2000 dps (70 mdps/LSB), LPF1_G_BW = 010 → 149 Hz at 960 Hz (Table 64); 100 (100 Hz) is the alternative if gear vibration shows |
+| CTRL6 (0x15) | 0x34 | FS_G = ±2000 dps (70 mdps/LSB), LPF1_G_BW = 011 → 310 Hz combined at 960 Hz (Table 64). Was 010 → 149 Hz until 2026-10-07: measured on the robot, that setting cost 1.6 ms of latency (310 Hz: 0.4), see orin/calib/STATUS.md |
 | CTRL7 (0x16) | 0x01 | LPF1_G_EN (§9.20); LPF2 is fixed at 342 Hz for this ODR (Table 21) |
 | CTRL8 (0x17) | 0x01 | FS_XL = ±4 g (0.122 mg/LSB), HP_LPF2_XL_BW = 000 → ODR/4 = 30 Hz (Table 69) |
 | CTRL9 (0x18) | 0x08 | LPF2_XL_EN (§9.22) |
@@ -592,12 +592,21 @@ gravity direction by 11.5°, and a limb IMU 0.3 m from a joint swinging at
   filter a 0.5 dps tilt-axis bias error is a 1.7° tilt error that decays
   only as fast as the bias is learned (~45 s with the innovation learner
   alone — seen on the bench as a 0.5° tilt drift in a run started seconds
-  after a reboot). The first 2 s of qualified stationary time after a cold
-  start therefore use a fast gain (`stat_gain_fast`, ~0.1 s), which on the
-  crane removes the transient before the policy starts. Verified from a
-  cold boot on the bench: bias captured within 1 s (−0.506 dps on x at
-  t = 1 s, 0.165 dps on the vertical axis by 3 s), stationary from t = 1 s,
-  tilt within 0.045° of the first sample over the following 30 s.
+  after a reboot). Until 2026-10-07 the first 2 s of qualified stationary
+  time after a cold start used a fast gain (`stat_gain_fast`, ~0.1 s) to
+  remove that transient. That phase took in whatever the board saw in its
+  first seconds, and on the robot that is a hanging body twisting after
+  the joint power switch (which is on the robot) was flipped: a rate that
+  ramps slower than ~10 dps/s is tracked as bias, and when the robot is
+  stopped the corrected rate lands past the 1 dps gate and the learner is
+  locked out for good (7 of 48 boards carried 0.6–1.2 dps for hours). The
+  fast gain now runs only during a host-requested `relearn`, and a cold
+  start begins from the bias the host last saved in the persistent
+  `imu_cal.gyro_bias` (rad/s; `orin/calib/imu_bias_check.py --save` writes
+  the learned value of every board while the robot is known still). That
+  seed is good to a few mrad/s across days (temperature drift), and the
+  slow learner (τ ≈ 10 s) plus the runner's startup relearn take care of
+  the rest.
 
 This is the standard 6-axis trade-off: sustained acceleration is
 fundamentally indistinguishable from tilt; the SFLP has the same limit, and
@@ -1142,6 +1151,16 @@ edit still applies), but the change is **not** confined to the decoder:
 * Timestamp-word byte layout; that a 7-byte read from 0x78 returns one word
   and advances (today's code reads 0x79–0x7E only); behaviour of reading an
   empty FIFO (should never be needed, but must be harmless).
+  *Verified 2026-10-06 on the bench (`ImuFusion::EvaluateProbe`, the
+  transfer-delay probe): the timestamp word is the 32-bit counter
+  little-endian in data bytes 1–4 (consistent: every pair accepted); the
+  chip writes a slot's timestamp word before its gyro word (the accel
+  word's place is not established); FIFO write → gyro-word arrival stamp
+  0.39–~1 ms (mean 0.50) for a quiet plain slot, and the arrival-floor
+  time base lags the chip's data-ready by 0.40 ms, swinging ±0.09 ms with
+  the 1 s tracker window (`ts_model_mean_us`, measured directly; a probe
+  must not measure the slot its own read delays). Bench build option
+  `MOTEUS_TS_PROBE`.*
 * `SW_RESET` clear time. That `FUNC_CFG_ACCESS` is reachable from the other
   banks is supported by ST's documentation, not only by its driver: the
   datasheet's own page-write procedure (DS p. 145, step 7) writes
