@@ -172,10 +172,15 @@ struct BldcServoStatus {
   float filt_fet_temp_C = std::numeric_limits<float>::quiet_NaN();
   float motor_temp_C = 0.0f;
   float filt_motor_temp_C = std::numeric_limits<float>::quiet_NaN();
-  // Fork: the motor thermal estimate (fw/motor_thermal_model.h), updated
-  // every 1 ms; NaN when motor_thermal.mode is 0.  The motor derate and
-  // fault act on the hotter of it and filt_motor_temp_C (register 0x008).
+  // Fork: motor thermal protection (fw/motor_thermal_model.h), updated
+  // every 1 ms.  The motor derate and fault act on filt_motor_temp_C +
+  // motor_thermal_offset_C (register 0x008): the coupling-corrected
+  // thermistor, or the hotter of it and the FET-based estimate
+  // motor_temp_est_C while motor_thermal_fallback is set.  NaN / 0 when
+  // motor_thermal.mode is 0.
   float motor_temp_est_C = std::numeric_limits<float>::quiet_NaN();
+  float motor_thermal_offset_C = 0.0f;
+  int8_t motor_thermal_fallback = 0;
 
   float inductance_d_H = 0.0f;
 
@@ -294,6 +299,8 @@ struct BldcServoStatus {
     a->Visit(MJ_NVP(motor_temp_C));
     a->Visit(MJ_NVP(filt_motor_temp_C));
     a->Visit(MJ_NVP(motor_temp_est_C));
+    a->Visit(MJ_NVP(motor_thermal_offset_C));
+    a->Visit(MJ_NVP(motor_thermal_fallback));
 
     a->Visit(MJ_NVP(inductance_d_H));
 

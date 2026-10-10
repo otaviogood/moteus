@@ -212,25 +212,42 @@ all torque is stopped.
 
 ## `motor_thermal.mode`
 
-Fork-specific.  For motors whose thermistor cannot be trusted to follow
-the winding (poorly placed, detached, intermittent, dead), the board can
-estimate the winding temperature from the current and the board's FET
-temperature, and protect on it (the derate and fault above).  The
-estimate is updated every millisecond outside the control interrupt.
+Fork-specific.  Protection against motor thermistors that cannot be
+trusted to follow the winding (partly on the housing, slow, intermittent,
+dead).  Everything runs every millisecond outside the control interrupt.
 Register 0x008 reports the temperature protection acts on.
 
 - 0 (default): the motor thermistor alone.
-- 1: the hotter of the motor thermistor and the estimate.  A faulty
-  thermistor reads low, so the estimate covers it, and a working one
-  still counts.  For a dead thermistor, or one that reads high, also set
-  `servo.enable_motor_temperature` to 0: it then reads 0 and the
-  estimate alone protects.
+- 1: the thermistor corrected by `motor_thermal.thermistor_coupling`, with
+  a plausibility monitor that switches protection to the hotter of the
+  corrected thermistor and a FET-based estimate of the winding while the
+  thermistor is implausible: when the estimate says the winding is heating
+  (its 20 s rise > 4 °C) and the raw thermistor shows less than 30 % of
+  its share (coupling × that rise) for 3 s (this check is skipped below a
+  coupling of 0.6, where a sensor on the housing shows no fast rise at
+  all), when the thermistor falls > 4 °C in 20 s while the motor is
+  driven, or when the estimate exceeds the corrected thermistor by
+  > 25 °C.  A trip holds the fallback for 120 s and then until the
+  estimate is within 15 °C of the corrected thermistor again, so a sensor
+  that never recovers stays covered.  The monitor ignores the first 2 s
+  after a reset.  A healthy sensor is never derated by the model's own
+  error.  For a dead thermistor set `servo.enable_motor_temperature` to
+  0: the estimate then protects at once.
 
 The motor derate and fault still need `servo.motor_fault_temperature`
-set.  The model needs `motor.resistance_ohm` (a calibrated motor); with
-0 it adds no heat.  Its parameters are compiled in
-(`MotorThermalParams` in `fw/motor_thermal_model.h`), not config: each
-config field costs ~400 bytes of flash.
+set.  The models need `motor.resistance_ohm` (a calibrated motor); with 0
+they add no heat.  Their parameters are compiled in (`MotorThermalParams`
+in `fw/motor_thermal_model.h`).
+
+## `motor_thermal.thermistor_coupling`
+
+The fraction of the winding's rise over the housing that this motor's
+thermistor sees: 1 (default) for a sensor on the winding, lower for one
+partly on the housing.  Protection reads the thermistor plus
+(1 − coupling) times the modelled winding-over-housing rise (11.9 J/°C,
+1.26 °C/W, driven by the copper loss), which is right while cooling too.
+Measured per motor against the winding's copper resistance over a
+sustained run.  Clamped to [0, 1].
 
 ## `servo.fault_position_error`
 

@@ -341,6 +341,12 @@ class BldcServo::Impl : public BldcServoControl<BldcServo::Impl> {
     UpdateFieldWeakeningIdChar();
 
     thermal_model_.Configure(motor_.resistance_ohm, kMotorThermalPeriodS);
+    winding_rise_.Configure(kMotorThermalPeriodS);
+    thermistor_monitor_.Configure(kMotorThermalPeriodS);
+    // The heat for the thermistor correction: the same copper loss.
+    thermal_heat_W_per_A2_ = motor_.resistance_ohm > 0.0f ?
+        1.5f * motor_.resistance_ohm * MotorThermalParams().resistance_scale : 0.0f;
+    thermal_coupling_ = std::min(1.0f, std::max(0.0f, thermal_config_.thermistor_coupling));
   }
 
   void PollMillisecond() {
@@ -401,15 +407,19 @@ class BldcServo::Impl : public BldcServoControl<BldcServo::Impl> {
     }
   }
 
-  // Fork: the motor thermal estimate (fw/motor_thermal_model.h).  Runs
+  // Fork: motor thermal protection (fw/motor_thermal_model.h).  Runs
   // here, once per millisecond on the main loop; the ISR sees it only
   // through motor_derate_temperature_ and motor_fault_threshold_.
   void UpdateMotorThermal(Mode mode) {
     if (thermal_config_.mode == MotorThermalConfig::kOff) {
       // Re-enabling starts from the FET reading, with no stale rise.
       thermal_model_.Reset();
+      winding_rise_.Reset();
+      thermistor_monitor_.Reset();
       motor_thermal_offset_C_ = 0.0f;
       status_.motor_temp_est_C = std::numeric_limits<float>::quiet_NaN();
+      status_.motor_thermal_offset_C = 0.0f;
+      status_.motor_thermal_fallback = 0;
     } else {
       // Current flows only while the bridge is driven; stopped boards
       // read a few hundred mA of sensor offset.  The undriven modes
@@ -422,9 +432,30 @@ class BldcServo::Impl : public BldcServoControl<BldcServo::Impl> {
       const float i_squared_A2 = driven ? (d_A * d_A + q_A * q_A) : 0.0f;
       const float estimate_C =
           thermal_model_.Update(i_squared_A2, status_.filt_fet_temp_C);
+      const float thermistor_C = status_.filt_motor_temp_C;
+      // Copper loss at the thermistor's reading (its tempco term is small).
+      const float power_W = thermal_heat_W_per_A2_ *
+          (1.0f + MotorThermalParams().resistance_tempco * (thermistor_C - 25.0f)) *
+          i_squared_A2;
+      const float corrected_C =
+          thermistor_C + (1.0f - thermal_coupling_) * winding_rise_.Update(power_W);
+      // A thermistor disabled in config reads 0: the estimate protects at
+      // once, warm-up or not.  The monitor is held reset meanwhile so that
+      // the filter's ramp up from 0 when the thermistor is re-enabled falls
+      // in its warm-up instead of tripping the lead check.
+      bool fallback = true;
+      if (!config_.enable_motor_temperature) {
+        thermistor_monitor_.Reset();
+      } else {
+        fallback = thermistor_monitor_.Update(thermistor_C, corrected_C,
+                                              estimate_C, thermal_coupling_,
+                                              driven);
+      }
       status_.motor_temp_est_C = estimate_C;
+      status_.motor_thermal_fallback = fallback ? 1 : 0;
       motor_thermal_offset_C_ =
-          MotorThermalOffset(estimate_C, status_.filt_motor_temp_C);
+          MotorThermalOffset(thermistor_C, corrected_C, estimate_C, fallback);
+      status_.motor_thermal_offset_C = motor_thermal_offset_C_;
     }
     ApplyMotorThermalOffset();
   }
@@ -1391,6 +1422,10 @@ class BldcServo::Impl : public BldcServoControl<BldcServo::Impl> {
   static constexpr float kMotorThermalPeriodS = 0.001f;
   MotorThermalConfig thermal_config_;
   MotorThermalModel thermal_model_;
+  WindingRise winding_rise_;
+  ThermistorMonitor thermistor_monitor_;
+  float thermal_heat_W_per_A2_ = 0.0f;
+  float thermal_coupling_ = 1.0f;
   float motor_derate_base_C_ = 0.0f;
   float motor_thermal_offset_C_ = 0.0f;
 

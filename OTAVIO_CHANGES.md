@@ -313,8 +313,10 @@ Measurements and reasoning: `docs/latency.md`.
 
 ## 9. Motor winding temperature estimate
 
-`fw/motor_thermal_model.h`, config `motor_thermal.mode`, register 0x008,
-telemetry `servo_stats.motor_temp_est_C`.
+`fw/motor_thermal_model.h`, config `motor_thermal.mode` and
+`motor_thermal.thermistor_coupling`, register 0x008, telemetry
+`servo_stats.motor_temp_est_C` / `motor_thermal_offset_C` /
+`motor_thermal_fallback`.
 
 - **Why.** The humanoid3 actuators' thermistors vary a lot, and some are
   intermittent.  In a 10 A, 5 s pulse the copper rose 11-17 C (measured
@@ -328,13 +330,52 @@ telemetry `servo_stats.motor_temp_est_C`.
   states are rises, the estimate equals the FET reading from its first
   reading, at power-up and on a mode change.  The current counts only while the bridge is
   driven (stopped boards read a few hundred mA of sensor offset).
-- **Modes.** Per board: 0 off (stock); 1 the hotter of the motor
-  thermistor and the estimate.  A faulty thermistor reads low, so the
-  estimate covers it; with `servo.enable_motor_temperature 0` (a dead
-  thermistor, or one reading high) the estimate alone protects.
-  `docs/reference/configuration.md`.  Register 0x008 is computed on read,
-  `fmax(filt_motor_temp_C, motor_temp_est_C)` (the thermistor alone
-  while the estimate is NaN).  (An earlier build had
+- **Protection (2026-10-09 design).** Per board, mode 1: the thermistor
+  plus a per-motor correction, `(1 - thermistor_coupling)` times the
+  modelled winding-over-housing rise (one node, 11.9 J/°C, 1.26 °C/W,
+  fed by the copper loss), for sensors that sit partly on the housing;
+  and a plausibility monitor that switches protection to the hotter of
+  the corrected thermistor and the estimate only while the thermistor is
+  implausible: the raw thermistor (not the corrected value, which would
+  make a stuck sensor look responsive) rising less than 30 % of its share
+  (coupling × the estimate's 20 s rise) for 3 s while the estimate rises
+  > 4 °C, skipped below a coupling of 0.6 because housing-mounted
+  sensors show ~0 fast rise (robot: 0.4–0.5 coupling sensors measured
+  −0.04–0.07 of the estimate's rise over the first 8 s, healthy winding
+  sensors ≥ 0.36); dropping > 4 °C in 20 s while driven; or > 25 °C below
+  the estimate.  Known gap: a sensor below coupling 0.6 that freezes at a
+  plausible value is caught by the lead check alone, i.e. once the motor
+  sustains ≈ 4.7–5.1 A (steady state with the board's own 2.1–2.7 °C/A
+  heating; 6.3–7.1 A if the FET did not heat); below that the winding
+  sits at most ~25 °C over the board's idle temperature while protection
+  reads ~7 °C over it.  No follow-type check can close it: over 60–120 s
+  windows the healthy right butt twist and left hip sensors rise −0.18 to
+  0.10 of the estimate's rise, indistinguishable from a frozen sensor,
+  and their healthy lead reached 18.4 °C in the walk, so the 25 °C
+  threshold cannot come down much either.  The fix for those two is
+  mechanical (re-seat the thermistor).  Two review cases left as is: a
+  thermistor re-enabled at runtime is unprotected by the fallback for the
+  2 s warm-up (only matters if it is re-enabled hot and under load), and a
+  config write every < 2 s before the monitor has primed would keep
+  re-arming the warm-up (nothing writes config periodically).  A trip holds 120 s and then stays latched until the lead
+  is < 15 °C, so a sensor that never recovers stays covered.  The
+  monitor ignores the first 2 s after a reset (the thermistor reads 0 for
+  a moment), keeps its state across unrelated config updates (a `conf
+  set` of anything re-runs `UpdateConfig`), and
+  `servo.enable_motor_temperature 0` forces the fallback outright and
+  holds the monitor reset, so re-enabling the thermistor (its filter
+  ramps up from 0 over ~10 ms, which read as a 25 °C lead on the bench
+  and latched the fallback for 120 s) starts with the warm-up.  The
+  earlier build took the hotter of thermistor and estimate permanently,
+  which derated well-cooled motors by the estimate's error (up to 15–20 °C
+  on the humanoid3 robot): the mounts' cooling differs 2× between mirror
+  joints, so no single estimate is both safe on the hottest and accurate
+  on the coolest.  Replayed on 24 robot walk+squat runs, the monitor
+  trips on none of the 22 healthy sensors (the six low-coupling ones
+  included), on a sensor that lost contact mid-run (right femur twist,
+  drop), and once at onset on the intermittent right knee.
+  Register 0x008 = `filt_motor_temp_C + motor_thermal_offset_C`.
+  (An earlier build had
   the rise ride on the thermistor and a separate FET-only mode; both are
   covered by this one: the thermistor-based rise counted the heating
   twice whenever the thermistor worked.)

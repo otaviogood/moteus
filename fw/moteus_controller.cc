@@ -239,8 +239,8 @@ enum class Register {
   kDCurrent = 0x005,
   kAbsPosition = 0x006,
   kPower = 0x007,
-  // Fork: what the motor derate and fault act on: the hotter of the
-  // filtered motor thermistor and the motor thermal estimate
+  // Fork: what the motor derate and fault act on: the filtered motor
+  // thermistor plus the motor thermal protection's offset
   // (fw/motor_thermal_model.h).
   kProtectMotorTemperature = 0x008,
 
@@ -997,9 +997,8 @@ class MoteusController::Impl : public multiplex::MicroServer::Server {
         return ScaleTemperature(bldc_.status().motor_temp_C, type);
       }
       case Register::kProtectMotorTemperature: {
-        // fmaxf: the thermistor alone while the estimate is NaN (off).
-        return ScaleTemperature(std::fmax(bldc_.status().filt_motor_temp_C,
-                                          bldc_.status().motor_temp_est_C),
+        return ScaleTemperature(bldc_.status().filt_motor_temp_C +
+                                bldc_.status().motor_thermal_offset_C,
                                 type);
       }
       case Register::kTemperature: {

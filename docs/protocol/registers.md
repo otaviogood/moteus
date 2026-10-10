@@ -153,9 +153,11 @@ Fork-specific.  The motor temperature that the motor derate
 (`servo.motor_fault_temperature` minus `servo.motor_temperature_margin`)
 and the motor over-temperature fault act on, in degrees celsius.  With
 `motor_thermal.mode` 0 (the default) it is the motor thermistor after
-the board's ~10 ms filter.  With mode 1 it is the hotter of that and the
-board's winding estimate (see `OTAVIO_CHANGES.md`, "Motor winding
-temperature estimate").  Updated every millisecond.
+the board's ~10 ms filter.  With mode 1 it is that reading plus the
+thermistor correction, or the hotter of the corrected reading and the
+board's winding estimate while the thermistor is judged implausible (see
+`OTAVIO_CHANGES.md`, "Motor winding temperature estimate").  Updated every
+millisecond.
 
 ### 0x00a - Motor temperature
 
