@@ -20,6 +20,9 @@
 #include "fw/broadcast_reply_filter.h"
 #include "fw/command_update.h"
 #include "fw/fdcan.h"
+#include "fw/gyro_audio.h"
+#include "fw/idle_sleep.h"
+#include "fw/imu_fusion_storage.h"
 #include "fw/telemetry_block.h"
 
 namespace moteus {
@@ -70,7 +73,21 @@ class FDCanMicroServer : public mjlib::multiplex::MicroDatagramServer {
     // zero-length frame (RoundUpDlc returns 0 above 64).
     MJ_ASSERT(data.size() <= sizeof(buf_));
     std::string_view payload = data;
-    const bool block = block_pending_;
+    const bool audio = audio_pending_;
+    audio_pending_ = false;
+    if (audio) {
+      // The reply to a gyro audio request (fw/gyro_audio.h) is only the
+      // codes; nothing else in the frame is answered.
+      auto* const source = ActiveGyroAudio();
+      if (source == nullptr) {
+        callback(mjlib::micro::error_code(), data.size());
+        return;
+      }
+      const size_t n = source->WriteReply(
+          reinterpret_cast<uint8_t*>(block_buf_), sizeof(block_buf_));
+      payload = std::string_view(block_buf_, n);
+    }
+    const bool block = block_pending_ && !audio;
     if (block) {
       // The block goes first, then as much of the normal reply as fits.
       // This runs inside the request's frame (mjlib writes the response
@@ -90,9 +107,11 @@ class FDCanMicroServer : public mjlib::multiplex::MicroDatagramServer {
       payload = std::string_view(block_buf_, n + keep);
     }
     const auto actual_dlc = RoundUpDlc(payload.size());
-    // A block reply always carries an 11-bit ID (fw/telemetry_block.h).
-    const uint32_t id = block ?
-        TelemetryBlockReplyId(header.source) :
+    // Block and gyro audio replies always carry an 11-bit ID
+    // (fw/telemetry_block.h, fw/gyro_audio.h).
+    const uint32_t id =
+        audio ? GyroAudioReplyId(header.source) :
+        block ? TelemetryBlockReplyId(header.source) :
         (((header.source & 0xff) << 8) |
          (header.destination & 0xff) |
          (can_prefix_ << 16));
@@ -116,6 +135,15 @@ class FDCanMicroServer : public mjlib::multiplex::MicroDatagramServer {
     }
 
     callback(mjlib::micro::error_code(), data.size());
+  }
+
+  /// True once for each sleep request received (fw/idle_sleep.h).
+  bool TakeSleepRequest(uint8_t* max_seconds, uint8_t* bench_flags) {
+    if (!sleep_request_) { return false; }
+    sleep_request_ = false;
+    *max_seconds = sleep_seconds_;
+    *bench_flags = sleep_flags_;
+    return true;
   }
 
   Properties properties() const override {
@@ -155,15 +183,27 @@ class FDCanMicroServer : public mjlib::multiplex::MicroDatagramServer {
 
     size_t bytes = current_read_header_->size;
     auto* frame = reinterpret_cast<uint8_t*>(current_read_data_.data());
+    if (ParseIdleSleepRequest(frame, bytes, &sleep_seconds_,
+                              &sleep_flags_)) {
+      // A sleep request (fw/idle_sleep.h) is its own frame with no
+      // reply: the main loop acts on it, and the read stays armed.
+      sleep_request_ = true;
+      return;
+    }
     // Set for every delivered frame, so a block request that got no
     // response (no reply flag) cannot leak into the next frame's reply.
     block_pending_ =
         block_server_ && StripTelemetryBlockRequest(frame, &bytes);
+    // A gyro audio request (fw/gyro_audio.h) is its own frame: a board
+    // with no fusion running does not answer it.
+    audio_pending_ =
+        !block_pending_ && StripGyroAudioRequest(frame, &bytes) &&
+        ActiveGyroAudio() != nullptr;
     command_update_ = StripCommandUpdate(frame, &bytes);
-    if (block_pending_) {
-      // A block request is answered even without the reply-request bit
+    if (block_pending_ || audio_pending_) {
+      // These requests are answered even without the reply-request bit
       // (0x8000 of the ID, the source's 0x80 here), so the host can send
-      // it as the 11-bit ID 0x07F.
+      // them as the 11-bit ID 0x07F.
       current_read_header_->source |= 0x80;
     }
     if (broadcast_reads_begin_ &&
@@ -172,7 +212,7 @@ class FDCanMicroServer : public mjlib::multiplex::MicroDatagramServer {
           broadcast_reads_begin_, broadcast_reads_end_, frame, bytes);
       // Nothing this board answers: no reply at all, and the read
       // stays armed for the next frame.
-      if (bytes == 0 && !block_pending_) { return; }
+      if (bytes == 0 && !block_pending_ && !audio_pending_) { return; }
     }
     if (bytes == 0) {
       // A request that was only the block marker: hand mjlib one no-op
@@ -233,6 +273,10 @@ class FDCanMicroServer : public mjlib::multiplex::MicroDatagramServer {
   mjlib::multiplex::MicroServer::Server* block_server_ = nullptr;
   bool block_sensor_ = false;
   bool block_pending_ = false;
+  bool audio_pending_ = false;
+  bool sleep_request_ = false;
+  uint8_t sleep_seconds_ = 0;
+  uint8_t sleep_flags_ = 0;
   bool command_update_ = false;
   char block_buf_[64] = {};
 

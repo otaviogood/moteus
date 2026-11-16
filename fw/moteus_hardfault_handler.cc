@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include "fw/measured_hw_rev.h"
 #include "fw/millisecond_timer.h"
 #include "fw/moteus_hw.h"
 #include "fw/stm32.h"
@@ -51,7 +52,12 @@ void hard_fault_handler_c (unsigned int * hardfault_args)
   // here.
   moteus::MoteusEnsureOff();
 
-  const auto debug_led = moteus::g_hw_pins.debug_led1;
+  // Blink the red LED.  On a sensor board that is power_led (PF0, lit
+  // when high, see moteus_hw.cc); on a motor board debug_led1 (lit
+  // when low).
+  const bool sensor_board = (moteus::g_otavio_flags & 1) != 0;
+  const auto debug_led = sensor_board ?
+      moteus::g_hw_pins.power_led : moteus::g_hw_pins.debug_led1;
   volatile GPIO_TypeDef* io_port =
       (debug_led == PF_0) ? GPIOF :
       (debug_led == PB_15) ? GPIOB :
@@ -60,18 +66,26 @@ void hard_fault_handler_c (unsigned int * hardfault_args)
       (debug_led == PF_0) ? (1 << 0) :
       (debug_led == PB_15) ? (1 << 15) :
       (1 << 0);
+  const auto led_on = [&]() {
+    if (sensor_board) { io_port->ODR |= bitmask; }
+    else { io_port->ODR &= ~bitmask; }
+  };
+  const auto led_off = [&]() {
+    if (sensor_board) { io_port->ODR &= ~bitmask; }
+    else { io_port->ODR |= bitmask; }
+  };
 
   moteus::MillisecondTimer timer;
 
   while (1) {
-    io_port->ODR &= ~bitmask;
+    led_on();
     timer.wait_ms(200);
-    io_port->ODR |= bitmask;
+    led_off();
     timer.wait_ms(200);
 
-    io_port->ODR &= ~bitmask;
+    led_on();
     timer.wait_ms(200);
-    io_port->ODR |= bitmask;
+    led_off();
     timer.wait_ms(500);
   }
 }

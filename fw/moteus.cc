@@ -30,6 +30,7 @@
 #include "fw/clock_manager.h"
 #include "fw/firmware_info.h"
 #include "fw/git_info.h"
+#include "fw/idle_sleep.h"
 #include "fw/millisecond_timer.h"
 #include "fw/moteus_controller.h"
 #include "fw/moteus_hw.h"
@@ -375,6 +376,18 @@ int main(void) {
     }
 
     if (delta_us >= 1000) {
+      // A sleep request from the host (fw/idle_sleep.h) is obeyed only
+      // while the motor is stopped; a faulted board stays awake so its
+      // fault can still be read.  Checked once a millisecond, not on
+      // every pass: it keeps the main loop's pass as it was.
+      uint8_t sleep_seconds = 0;
+      uint8_t sleep_flags = 0;
+      if (fdcan_micro_server.TakeSleepRequest(&sleep_seconds, &sleep_flags) &&
+          moteus_controller.bldc_servo()->status().mode ==
+          BldcServo::Mode::kStopped) {
+        EnterIdleSleep(sleep_seconds, sleep_flags);
+      }
+
       telemetry_manager.PollMillisecond();
       system_info.PollMillisecond();
       moteus_controller.PollMillisecond();

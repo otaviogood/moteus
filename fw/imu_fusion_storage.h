@@ -34,6 +34,10 @@ FusionStorage* ClaimFusionStorage(uint8_t owner);
 void ReleaseFusionStorage(uint8_t owner);
 uint8_t FusionStorageOwner();
 
+/// The gyro audio ring of the running fusion (fw/gyro_audio.h), or
+/// nullptr while no aux port runs one.
+GyroAudio* ActiveGyroAudio();
+
 /// Hardware timer ownership (docs §5.4).  TIM3 is shared between aux
 /// pin modes (PWM output, hardware quadrature), BiSS-C and the fusion
 /// time base / FDCAN timestamp counter.  Claim returns false if the

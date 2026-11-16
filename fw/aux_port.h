@@ -1253,7 +1253,8 @@ class AuxPort {
         storage->mailbox.Reset();
         storage->control.Reset();
         storage->fusion.Attach(&storage->mailbox, &storage->control,
-                               &storage->history, &fusion_status_);
+                               &storage->history, &fusion_status_,
+                               &storage->audio);
         CopyImuCal();
         *storage->fusion.params() = fusion_params_;
         fusion_status_.storage_owner = fusion_owner_id_;

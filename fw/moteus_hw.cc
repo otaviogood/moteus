@@ -302,9 +302,14 @@ MoteusHwPins FindHardwarePins(FamilyAndVersion fv) {
     result.drv8323_fault = PB_6;
 
     if (fv.otavio_flags & 1) {
-      result.debug_led1 = PF_1;  // red
+      // Sensor board.  Its LEDs are lit when high, and the names are
+      // the other way round from the colours: PF0 is red, PF1 green,
+      // as on a motor board.  So "power_led" here is the red LED,
+      // driven low (off) at boot, and debug_led1 the green one, lit
+      // by board_debug while the board runs.
+      result.debug_led1 = PF_1;  // green
       result.debug_led2 = PC_13;  // yellow
-      result.power_led = PF_0;  // green
+      result.power_led = PF_0;  // red
       result.otavio_pin = PC_11; // I2C_SDA pin on side of board
     } else {
       result.debug_led1 = PF_0;  // red

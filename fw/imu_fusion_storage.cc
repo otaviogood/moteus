@@ -41,6 +41,10 @@ void ReleaseFusionStorage(uint8_t owner) {
 
 uint8_t FusionStorageOwner() { return g_fusion_owner; }
 
+GyroAudio* ActiveGyroAudio() {
+  return g_fusion_owner != 0 ? &g_fusion_storage.audio : nullptr;
+}
+
 bool ClaimTimer(TIM_TypeDef* timer, const char* owner) {
   TimerClaim* free_slot = nullptr;
   for (auto& claim : g_timer_claims) {

@@ -833,6 +833,113 @@ float, value x scale, so read it back as a float to compare exactly).
 Example, pure torque control after a verified full command: `64 0d 22
 <float>`, a 7-byte frame.
 
+### Gyro audio (fork-specific)
+
+Not a register: a frame whose first two bytes are `0x66 0x02`
+(`fw/gyro_audio.h`) asks a board for its "gyro audio", the IMU gyro used
+as a vibration pickup to find knocks and clicks in a joint.  It is a
+signed waveform that can be played back.
+
+The gyro measures angular velocity, so the change from one sample to the
+next is the angular acceleration: what a contact microphone on the joint
+would pick up.  Every 960 Hz gyro sample of the aux IMU fusion (I2C
+device type 3) becomes three signed bytes, one per axis (x, y, z): that
+change in raw gyro counts (70 mdps per count), compressed.
+
+| Size of the change | Code | Step |
+|---|---|---|
+| 0 .. 31 | 0 .. 31 | 1 (exact) |
+| 32 .. 62 | 32 .. 47 | 2 |
+| 64 .. 124 | 48 .. 63 | 4 |
+| 128 .. 248 | 64 .. 79 | 8 |
+| 256 .. 496 | 80 .. 95 | 16 |
+| 512 .. 992 | 96 .. 111 | 32 |
+| 1024 .. 1984 | 112 .. 127 | 64 |
+
+The byte is the code with the sign of the change (int8, -127 .. 127);
+for a code `c` of 16 or more the size is `(16 + (c & 15)) << ((c >> 4) - 1)`.
+
+Each code is the change from the value the receiver has rebuilt so far
+(the running sum of the decoded codes), not from the previous raw sample.
+Rounding therefore does not add up: the running sum follows the gyro to
+within half a step, and a change beyond +-1984 counts (139 deg/s in one
+sample) is caught up over the following samples instead of lost.  A
+board at rest reads about 1 count rms per axis.
+
+A sample with nothing before it reads 0 on every axis, and the running
+sum starts over there: the first sample after the stream (re)starts, the
+first after samples the board lost.  The lost samples themselves read 0.
+
+The board keeps the newest 64 samples.  The reply carries the samples
+since the previous reply, oldest first:
+
+| Byte | Meaning |
+|---|---|
+| 0 | format, `0x02` |
+| 1 | n, the number of samples that follow (at most 20) |
+| 2-3 | sample number of the first one: uint16, little-endian; counts every gyro sample, lost ones included, and wraps |
+| 4.. | n samples, 3 bytes each: x, y, z |
+
+Polled at 120 Hz a reply holds 7-9 samples: a 32-byte frame.  If more
+than 64 samples passed since the previous reply, the oldest are dropped
+and the sample number jumps by that many.
+
+Like the telemetry block, the request is answered without the
+reply-request bit, so it can be broadcast with the 11-bit ID `0x07F`.
+The reply's 11-bit ID is `0x780 | board id`: above every command ID (the
+board address), the block request (`0x07F`) and the block replies
+(`0x700 | id`), so it loses arbitration to all of them.  A board that
+runs no IMU fusion does not answer, and firmware that does not know the
+format byte ignores the request (format `0x01`, one unsigned byte per
+sample, existed on one bench board only and is no longer answered).  A
+request frame is either a telemetry block request or a gyro audio
+request, not both, and nothing else in a gyro audio request frame is
+answered.
+
+The samples are consumed by the reply: with two hosts polling one board,
+each gets part of the stream.
+
+### Idle sleep (fork-specific, bench prototype)
+
+Not a register: a frame whose first three bytes are `0x68 0x01 ss`
+(`fw/idle_sleep.h`) asks a board to sleep.  It is meant to be broadcast
+(11-bit ID `0x07F`) by the host when a run is over.  There is no reply.
+
+A board obeys only while its motor is stopped (mode 0).  In any other
+mode, a fault included, the frame is ignored, so a faulted board stays
+awake and its fault can still be read.  A sensor board is always in
+mode 0 and always obeys.
+
+Asleep, the processor's clocks are off (STM32 Stop 1 mode), the gate
+driver is disabled, the ADCs and the LEDs are off.  A sensor board lights
+its yellow LED to show that it sleeps.  The board goes to sleep between
+two I2C transfers, so no I2C line is held low while it sleeps.  The CAN
+transceiver, the IMU and the encoders stay powered.
+
+The next falling edge on the CAN bus wakes the board: any frame, from
+anyone, to any board, so every sleeping board on a bus wakes together.
+The board then restarts exactly as from power-on: it answers about 35 ms
+after the first frame, and its orientation is valid a few hundred ms
+later.  Whatever a power cycle loses, sleep loses: the rotor turn count,
+the orientation's heading, the winding temperature estimate, a fault
+record, anything set but not saved.  The saved configuration and
+calibration are not touched.  The frame that woke the board is not
+received by it; a sender with nobody else awake on the bus keeps
+retrying that frame until a board is up and acknowledges it, so the
+first frame after a sleep should be a harmless one.
+
+`ss` is 0 on the robot: sleep until the bus wakes the board.  1..32 is
+for bench tests: the board also wakes by itself after that many seconds
+(the independent watchdog), so a board whose bus wake does not work
+comes back.  An optional fourth byte holds bench flags: bit 0 = the bus
+does not wake the board, only the watchdog does; it is refused with
+`ss` = 0.
+
+Measured on one r4.11 board (bench board 2, 2026-11-13): 12 of 12 sleeps
+held until the first frame (2 to 30 s), first answer 33-37 ms after it,
+configuration identical afterwards.  The supply current asleep has not
+been measured.
+
 ### 0x070 - Millisecond Counter
 
 Mode: Read only

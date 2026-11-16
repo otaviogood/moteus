@@ -25,7 +25,7 @@ git status --short                # plus new files
 | Sensor boards | A board with no gate driver boots as a "sensor board": `otavio_flags` bit 0, its own LED pins, a filtered broadcast reply |
 | IMU | LSM6DSV16X on aux I2C with on-board orientation fusion (I2C device type 3), a persistent `imu_cal` config group, and an `aux2_fusion` telemetry record |
 | Registers | 0x065–0x067 gyro rate and 0x06d–0x06f quaternion (both fork-only) |
-| CAN protocol | A fixed-layout "telemetry block" request (`0x60 0x02`) with 11-bit replies; "command update" frames (`0x64`) that change only some registers of the current command; hardware receive timestamps |
+| CAN protocol | A fixed-layout "telemetry block" request (`0x60 0x02`) with 11-bit replies; "command update" frames (`0x64`) that change only some registers of the current command; a "gyro audio" request (`0x66 0x02`) for the gyro's vibration waveform, three signed bytes per gyro sample; an "idle sleep" request (`0x68 0x01`, bench prototype); hardware receive timestamps |
 | Upstream bug fix | Encoder PLL gains are now computed on boards with no motor configured |
 | Motor protection | A per-board winding temperature estimate for motors whose thermistor is slow, misplaced or dead (`motor_thermal` config group, register 0x008) |
 | Latency / CPU | Non-blocking DRV8323 status poll on r4.x, IMU interrupt path in CCM, interrupt profiler, logic-analyzer markers |
@@ -42,8 +42,16 @@ Files: `fw/moteus_hw.cc`, `fw/moteus_hw.h`, `fw/measured_hw_rev.h`,
   the DRV8323 to answer.  The fork gives up after 10 attempts and marks the
   board as a sensor board with `g_otavio_flags = 1`.  The flag is exposed as
   `firmware.otavio_flags` in telemetry.
-- **LEDs.** Sensor boards use different LED pins: red PF1, yellow PC13 and
-  green PF0.
+- **LEDs.** Sensor boards add a yellow LED on PC13 (`debug_led2`).  Red
+  is PF0 and green PF1, as on a motor board, but the code names them
+  the other way round: `power_led` is PF0 (red, off) and `debug_led1`
+  PF1 (green, lit while running).  The LEDs are lit when the pin is
+  high (a motor board's when low).
+  - A crash blinks red on both board types: `mbed_die` (asserts) and
+    the hard-fault handler pick `power_led` and its polarity on a sensor
+    board, `debug_led1` on a motor board.  Before, a sensor board
+    blinked green on an assert, and red with the pattern inverted on a
+    hard fault.
   - `d led` swaps the two LEDs and inverts their state on these boards,
     because of how those boards were built.
   - `FDCan::Send` lights the yellow LED for the duration of every CAN send.
@@ -192,6 +200,133 @@ subframe (`0x17 0x65`, `0x17 0x6d`) so all three words come from one sample.
   then sends only the registers its control mode changes every tick (torque
   mode: a 7-byte frame instead of 48).
 
+**Gyro audio** (`fw/gyro_audio.h`, 2026-11-13).
+- **Purpose.** The joints sometimes click; this uses each board's IMU gyro
+  as a vibration pickup, to see which joint, when and how hard, and to
+  listen to it.
+- **Signal.** Three signed bytes per 960 Hz gyro sample, one per axis: the
+  change of the raw gyro reading since the previous sample (the angular
+  acceleration, what a contact microphone would give), compressed like
+  telephone audio: exact up to +-31 counts, steps of 1/16 of the value
+  above that, +-1984 counts at most per sample (1 count = 70 mdps).  Each
+  code is the change from what the receiver has rebuilt so far, so the
+  running sum of the decoded codes follows the gyro to within half a step
+  and a larger jump is caught up, not lost.  At rest a board reads about
+  1 count rms per axis.
+- **Where it runs.** `ImuFusion::ProcessGyro` (main loop) pushes each
+  sample's codes into a 64-sample ring in the static fusion storage;
+  nothing is added to the control interrupt or to the IMU's I2C traffic,
+  and the fusion's own inputs and timing are untouched.  The unsent count
+  is held at most 64 as each sample is pushed, so a board nobody polls
+  for 65,536 samples (68 s) still returns the whole ring (2026-11-15
+  fix: before, that looked empty or short).  Attaching the fusion again
+  (aux reconfiguration) drops the unsent samples of the old sensor.
+- **Request and reply.** A frame starting `0x66 0x02` is answered with the
+  samples since the previous reply (4-byte header: format, count, 16-bit
+  sample number), 11-bit ID `0x780 | board id`, the lowest priority on the
+  bus.  At 120 Hz that is a 32-byte frame.  `FDCanMicroServer` handles it
+  like a block request; a board with no fusion does not answer.
+- **Use.** The humanoid3 runner's `--gyro-audio` broadcasts the request
+  right after it has parsed the telemetry replies, reads the replies after
+  the command write, and writes `gyro_audio.npz` to the `--diag` directory
+  (`orin/gyro_audio.py`; `--wav DIR` there writes one sound file per
+  board).  Bench: `utils/imu_fusion_bench/gyro_audio.py <id> --wav FILE`.
+- **On the robot** since 2026-11-13: all 48 boards run
+  `moteus-audio-sleep-57210b68.elf` (7d23663f + this working tree; git
+  record 7d23663f dirty).  48/48 first attempt, every motor board's 327
+  calibration values bit-identical, every sensor board's 293 IMU/encoder
+  values identical, full config text unchanged except one added key on
+  the sensor boards (`motor_thermal.thermistor_coupling 1`, they came
+  from the 2026-10-08 image), IMUs 48/48.  Rehearsed first on bench
+  boards 2 and 3 (board 3 through the sensor boards' exact step).  The
+  Orin code on the robot does not send the request yet.  Image, rollback
+  images, source patch and run records:
+  `robot_diagnostics/fw_update/20261113_audio_sleep/`.
+- **Cost.** 1.5 kB of flash, 212 bytes of RAM (static), no config.
+  Compute, bench board 2 against the same commit without gyro audio and
+  idle sleep (2026-11-13; main-loop passes per 10 ms from
+  `system_info.idle_rate`, 12 readings per case):
+  - Control interrupt: the same code (the CCM section differs only in
+    addresses), peak 2581 -> 2579 cycles stopped, 3999-4003 both ways in
+    zero-torque position mode.
+  - Main loop with nothing asked: 726 -> 717 passes stopped (13.8 ->
+    13.95 us per pass), 380 -> 372 in position mode (26.3 -> 26.9 us).
+    No new work per pass: the compiler lays the loop out with three more
+    instructions, and the code sits elsewhere in flash.  Per gyro sample
+    (941 per second) `GyroAudio::Push` is 60-130 cycles (counted in the
+    disassembly, under 1 us).
+  - Answering the request at 120 Hz: 708 -> 703 passes stopped, 365 ->
+    360 in position mode, about 50 and 110 us of main-loop time per tick
+    (the telemetry block request costs 717 -> 708 and 372 -> 365).
+  - Not measured (needs the logic analyzer): the telemetry reply
+    turnaround and command frame -> in use.  A received frame runs ~15
+    more cycles of checks.
+  - Sensor board (bench board 3, same day): interrupt peak 2201 cycles
+    on all three images.  Main loop, nothing asked: 863 passes per 10 ms
+    on the image the robot's sensor boards ran (2026-10-08, before the
+    motor-protection code), 824 on 7d23663f (what the motor boards ran),
+    813 with gyro audio and idle sleep: 11.6 -> 12.1 -> 12.3 us per
+    pass.  So a sensor board loses 5.8 % of its passes going to this
+    image, 4.5 of them from the motor-protection commits and 1.3 from
+    this change.  Not explained in detail: the protection code adds no
+    per-pass work either, so this is again code layout.
+- **History.** The first format (`0x66 0x01`, bench board 2 only, same
+  day) sent one unsigned byte per sample, the log of the size of the
+  gyro's second difference.  It could not be played back and is gone.
+- **Tests.** `fw/test/gyro_audio_test.cc`; the code vectors are mirrored in
+  humanoid3 `orin/tests/test_gyro_audio.py`.
+
+**Idle sleep** (`fw/idle_sleep.h`, `fw/idle_sleep.cc`, 2026-11-13; BENCH
+PROTOTYPE: the code is in the image on the robot since 2026-11-13, but
+nothing on the robot sends the request, and it was only tried on the two
+bench boards).
+- **Purpose.** A powered robot with no policy running still feeds 48
+  processors.  The host broadcasts a sleep request when a run is over.
+- **Request.** A frame starting `0x68 0x01 ss`, no reply.  A board obeys
+  only in mode 0 (stopped, no fault): `FDCanMicroServer` notes the request,
+  the main loop in `moteus.cc` checks the mode and calls `EnterIdleSleep`.
+- **Asleep.** Gate driver disabled, LEDs off, ADC/DAC/op-amp/comparator
+  reset, CAN controller reset with its transmit pin held idle, then STM32
+  Stop 1 (all clocks off).
+- **LEDs asleep.** A motor board is dark.  A sensor board lights only
+  yellow (PC13, `debug_led2`); green means running, red error.  On these
+  boards the LEDs are lit when high (a motor board's when low) and red
+  and green sit the other way round from the pin names: red is PF0
+  (`power_led`), green PF1 (`debug_led1`).  The image on the robot
+  (57210b68) drives every LED pin high instead, so there a sleeping
+  sensor board shows all three LEDs.
+- **I2C idle before sleeping.** The control interrupt steps an I2C
+  transfer one byte at a time, and the IMU's bus is busy about half the
+  time; stopping in the middle of a transfer left the clock (or the
+  data line) low, with current in its pull-up, for the whole sleep.
+  The board now waits, with the interrupt still running, until every
+  enabled I2C peripheral is idle (at most 5 ms), then masks interrupts;
+  the I2C peripherals are reset too.  The robot's image (57210b68) does
+  not wait.
+- **Wake.** A falling edge on the CAN receive pin (any frame on the bus)
+  ends the Stop mode and the firmware resets the processor: a wake is a
+  normal boot, so everything a power cycle loses is lost.  First answer
+  33-37 ms after the first frame (12 of 12 on bench board 2).
+- **Bench options.** `ss` = 1..32 also wakes the board by watchdog after
+  that many seconds; a fourth byte with bit 0 set turns the bus wake off
+  (watchdog only).  `utils/imu_fusion_bench/idle_sleep.py`.
+- **Found on the way.** Switching the CAN transmit pin to a plain output
+  that starts low puts a dominant glitch on the bus; the adapter answers
+  it with an error frame, which woke the board at once.  The pin now
+  starts high, and the wake is armed only after 2 ms of idle bus.
+- **Not done.** The supply current asleep is not measured.  Tried on
+  bench boards 2 (r4.11 motor) and 3 (sensor), alone and together on one
+  bus (both slept 6 s and woke on the first frame; the sensor board
+  answered 81 ms after it): no other board family, no full robot bus.
+  The host does not send the request, wake the boards before a run, or
+  drop what it remembers about a board that slept.
+- **Cost.** 0.8 kB of flash, no config.  The main loop looks for a
+  pending request once a millisecond, not on every pass (on every pass
+  it cost 1.7 % of the passes: 717 -> 705 per 10 ms stopped); a received
+  frame is checked for the request in a few cycles.  Measured together
+  with gyro audio, see its cost above.
+- **Tests.** `fw/test/idle_sleep_test.cc` (the request format only).
+
 **Receive timestamps.**
 - `FDCan` enables the external timestamp counter and records each frame's
   start-of-frame stamp.
@@ -271,8 +406,8 @@ Measurements and reasoning: `docs/latency.md`.
   and a build task.
 - **Firmware tests** (host, `tools/bazel test --config=host //fw:test`):
   `quat48_test`, `imu_fusion_test`, `imu_cal_test`,
-  `broadcast_reply_filter_test` and `telemetry_block_test`, plus the new PLL
-  case in `motor_position_test`.
+  `broadcast_reply_filter_test`, `telemetry_block_test`,
+  `gyro_audio_test` and `idle_sleep_test`, plus the new PLL case in `motor_position_test`.
 
 ## 7. Client libraries and scripts
 
@@ -455,8 +590,10 @@ and are untracked.
 - **Registers.** Fork-only registers sit in gaps of upstream's map.  When
   merging, check that upstream hasn't claimed 0x065–0x067 or 0x06d–0x06f; it
   already took 0x072–0x074 once.
-- **Subframe 0x60.** The telemetry block uses subframe type 0x60, which
-  upstream mjlib doesn't use today.
+- **Subframes 0x60, 0x64, 0x66, 0x68.** The telemetry block, the command
+  update, the gyro audio request and the idle sleep request use these
+  subframe types, which upstream
+  mjlib doesn't use today.
 - **Merge conflicts.** Upstream changes to `aux_port.h`, `fdcan_micro_server.h`,
   `moteus_controller.cc`, `drv8323.cc` or `motor_position.h` are the likely
   conflict points.

@@ -19,6 +19,7 @@
 
 #include "hal/gpio_api.h"
 
+#include "fw/measured_hw_rev.h"
 #include "fw/moteus_hw.h"
 
 namespace mjlib {
@@ -100,19 +101,26 @@ void mbed_die(void) {
   // gpio_init_out with NC leaves the gpio_t's mask/reg_set/reg_clr
   // uninitialized, and the subsequent gpio_write would dereference a
   // garbage stack pointer.  Just spin in that case.
-  const auto led_pin = moteus::g_hw_pins.debug_led1;
+  //
+  // The LED is the red one: on a sensor board that is power_led (PF0,
+  // lit when high, see moteus_hw.cc), on a motor board debug_led1 (lit
+  // when low).
+  const bool sensor_board = (moteus::g_otavio_flags & 1) != 0;
+  const auto led_pin = sensor_board ?
+      moteus::g_hw_pins.power_led : moteus::g_hw_pins.debug_led1;
   if (led_pin == NC) {
     for (;;) {}
   }
+  const int on = sensor_board ? 1 : 0;
 
   gpio_t led;
   gpio_init_out(&led, led_pin);
 
   // Now flash an actual LED.
   for (;;) {
-    gpio_write(&led, 0);
+    gpio_write(&led, on);
     wait_ms(200);
-    gpio_write(&led, 1);
+    gpio_write(&led, !on);
     wait_ms(200);
   }
 }

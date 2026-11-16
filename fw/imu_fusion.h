@@ -22,6 +22,7 @@
 #include <limits>
 
 #include "fw/aux_common.h"
+#include "fw/gyro_audio.h"
 #include "fw/quat48.h"
 
 /// On-board orientation fusion for the LSM6DSV16X.  Design:
@@ -361,12 +362,17 @@ class ImuFusion {
 
   ImuFusion() {}
 
+  /// audio: where every gyro sample's vibration code goes
+  /// (fw/gyro_audio.h), or nullptr.
   void Attach(FusionMailbox* mailbox, FusionControl* control,
-              History* history, aux::ImuFusionStatus* status) {
+              History* history, aux::ImuFusionStatus* status,
+              GyroAudio* audio = nullptr) {
     mailbox_ = mailbox;
     control_ = control;
     history_ = history;
     status_ = status;
+    audio_ = audio;
+    if (audio_) { audio_->Restart(); }
     Reset();
   }
 
@@ -727,11 +733,13 @@ class ImuFusion {
       last_seq_ = w.seq;
       model_t_ = static_cast<float>(w.t);
       ResetTrackerWindow(true);
+      if (audio_) { audio_->ResetHistory(); }
     } else {
       const uint16_t gap = static_cast<uint16_t>(w.seq - last_seq_);
       if (gap == 0) { return; }
       if (gap > 1) {
         const uint16_t lost = static_cast<uint16_t>(gap - 1);
+        if (audio_) { audio_->Skip(lost); }
         if (lost > params_.gap_max_words) {
           ReInit(kReinitGap);
           model_t_ = static_cast<float>(w.t);
@@ -747,6 +755,7 @@ class ImuFusion {
       model_t_ += T_ticks_ + dT_;
     }
     WrapModel();
+    if (audio_) { audio_->Push(w.v); }
 
     // Arrival-floor tracker (docs §5.3).  The residual of each arrival
     // against the model has a positive floor (the transfer time) plus
@@ -1300,6 +1309,10 @@ class ImuFusion {
   uint32_t stationary_words_ = 0;
 
   Counters counters_;
+
+  // Last, like FusionStorage::audio: nothing above moves, so the code
+  // that does not touch gyro audio is the same as without it.
+  GyroAudio* audio_ = nullptr;
 };
 
 /// Everything the fusion needs that must not live in the pool or in
@@ -1310,6 +1323,7 @@ struct FusionStorage {
   FusionControl control;
   ImuFusion::History history;
   ImuFusion fusion;
+  GyroAudio audio;
 };
 
 }
